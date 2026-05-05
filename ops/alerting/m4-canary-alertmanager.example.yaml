@@ -1,0 +1,92 @@
+# Alertmanager routing config — M4 canary observability §6 deliverable.
+#
+# Wires the five `parallax_m4_canary` Prometheus alerts (defined in
+# prometheus/rules/parallax-m4-canary.rules.yml) to PagerDuty (P0/P1) and
+# Slack (#m4-canary). Drop-in fragment for the existing prod Alertmanager
+# config; merge under `route:` and `receivers:` rather than wholesale-replacing.
+#
+# Routing logic:
+#   - severity: critical                    -> page oncall via PagerDuty
+#   - severity: warning  + trigger: T5      -> Slack #m4-canary only
+#                                              (T5 is a gate, not a rollback)
+#   - rollback_class: auto                  -> append PagerDuty incident_key
+#                                              prefix `m4-canary-auto-` so
+#                                              auto-rollbacks group separately
+#                                              from operator manual pages
+#
+# Secrets (PAGERDUTY_M4_CANARY_KEY, SLACK_WEBHOOK_M4_CANARY) MUST be sourced
+# from a secret manager (Vault / k8s Secret / SOPS-encrypted file) — never
+# checked into git. Keys here are placeholder env-var references.
+#
+# Verification (per stage-0-preflight-checklist.md §6):
+#   $ amtool check-config /etc/alertmanager/alertmanager.yml
+#   $ amtool config routes test --tree --config.file=/etc/alertmanager/alertmanager.yml \
+#         severity=critical component=parallax_m4_canary trigger=T1
+
+route:
+  # Top-level route is owned by your existing prod config; the block below
+  # belongs nested under `route.routes:` so canary alerts split off before
+  # falling through to default receivers.
+  routes:
+    - matchers:
+        - component = "parallax_m4_canary"
+        - severity = "critical"
+      receiver: m4-canary-pagerduty
+      group_by: ["trigger"]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+      continue: true   # also notify Slack for critical (see next route)
+
+    - matchers:
+        - component = "parallax_m4_canary"
+        - severity = "critical"
+      receiver: m4-canary-slack
+      group_by: ["trigger"]
+      group_wait: 10s
+      group_interval: 1m
+      repeat_interval: 30m
+
+    - matchers:
+        - component = "parallax_m4_canary"
+        - severity = "warning"
+        - trigger = "T5"
+      receiver: m4-canary-slack
+      group_by: ["trigger"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+
+receivers:
+  - name: m4-canary-pagerduty
+    pagerduty_configs:
+      - routing_key: ${PAGERDUTY_M4_CANARY_KEY}
+        severity: '{{ .CommonLabels.severity }}'
+        client: parallax-prometheus
+        client_url: 'https://grafana.internal/d/parallax-m4-canary-stage-1'
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          trigger: '{{ .CommonLabels.trigger }}'
+          rollback_class: '{{ .CommonLabels.rollback_class }}'
+          firing_count: '{{ len .Alerts.Firing }}'
+          runbook: 'docs/m4-prep/canary-stage-runbook.md §6.4'
+        send_resolved: true
+
+  - name: m4-canary-slack
+    slack_configs:
+      - api_url: ${SLACK_WEBHOOK_M4_CANARY}
+        channel: '#m4-canary'
+        username: parallax-canary-bot
+        icon_emoji: ':rotating_light:'
+        title: |
+          [{{ .Status | toUpper }}] M4 Canary {{ .CommonLabels.trigger }} — {{ .CommonLabels.severity }}
+        text: |
+          {{ range .Alerts -}}
+          *{{ .Annotations.summary }}*
+          {{ .Annotations.description }}
+          Trigger: `{{ .Labels.trigger }}` | Class: `{{ .Labels.rollback_class }}`
+          Dashboard: <https://grafana.internal/d/parallax-m4-canary-stage-1|m4-canary-stage-1>
+          Runbook: docs/m4-prep/canary-stage-runbook.md §6.4
+          {{ end }}
+        send_resolved: true
+        short_fields: true

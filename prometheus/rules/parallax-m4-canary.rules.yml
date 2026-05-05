@@ -1,0 +1,113 @@
+groups:
+  - name: parallax_m4_canary
+    interval: 30s
+    rules:
+      # T1 — error_rate ≥ 0.5% over 5-min sliding window
+      # Pin to parallax/canary/triggers.py::T1_THRESHOLD (0.005) + WINDOW_T1_SECONDS (300s).
+      # The trigger evaluates internal sliding windows; this alert mirrors the same
+      # threshold/window in PromQL for parity with the operator-facing T1 verdict.
+      # Denominator guarded with `> 0` so the alert silently no-ops during
+      # zero-traffic windows; matches the `insufficient_data` semantics guarded by T5.
+      - alert: M4CanaryErrorRateBreach
+        expr: |
+          (sum(rate(parallax_canary_event_errors_total[5m]))
+           /
+           (sum(rate(parallax_canary_events_total[5m])) > 0)) >= 0.005
+        for: 5m
+        labels:
+          severity: critical
+          component: parallax_m4_canary
+          trigger: T1
+          rollback_class: auto
+        annotations:
+          summary: M4 canary T1 — error rate ≥ 0.5% for 5min (auto-rollback gate)
+          description: |
+            T1 trigger breached: canary event error_rate has stayed at or above
+            0.5% for 5 minutes. Per US-009.1 §3.3 / AC-1.9, RollbackController
+            should auto-trip and acknowledge within the configured window.
+            Verify rollback state via `parallax canary --status` and consult
+            docs/m4-prep/canary-stage-runbook.md §6.4.
+
+      # T2 — discrepancy_rate ≥ 0.5% over 3-min sliding window
+      - alert: M4CanaryDiscrepancyRateBreach
+        expr: |
+          (sum(rate(parallax_canary_discrepancy_total[3m]))
+           /
+           (sum(rate(parallax_canary_events_total[3m])) > 0)) >= 0.005
+        for: 3m
+        labels:
+          severity: critical
+          component: parallax_m4_canary
+          trigger: T2
+          rollback_class: auto
+        annotations:
+          summary: M4 canary T2 — discrepancy rate ≥ 0.5% for 3min (auto-rollback gate)
+          description: |
+            T2 trigger breached: canary discrepancy_rate has stayed at or above
+            0.5% for 3 minutes. This indicates canonical vs M4 router divergence
+            beyond the §3.3 hard ceiling.
+            Runbook: docs/m4-prep/canary-stage-runbook.md §6.4.
+
+      # T3 — p99 latency ≥ 100 ms over 5-min sliding window
+      # The histogram quantile uses `parallax_canary_request_duration_ms_bucket`
+      # which the canary metrics layer must expose with le-buckets compatible
+      # with histogram_quantile. WINDOW_T3_SECONDS = 300s.
+      - alert: M4CanaryP99LatencyBreach
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(parallax_canary_request_duration_ms_bucket[5m]))) >= 100
+        for: 5m
+        labels:
+          severity: critical
+          component: parallax_m4_canary
+          trigger: T3
+          rollback_class: auto
+        annotations:
+          summary: M4 canary T3 — p99 latency ≥ 100ms for 5min (auto-rollback gate)
+          description: |
+            T3 trigger breached: canary p99 request latency has stayed at or
+            above 100ms for 5 minutes. Investigate M4 router upstream blocks
+            or queue saturation.
+            Runbook: docs/m4-prep/canary-stage-runbook.md §6.4.
+
+      # T4 — any data-loss event (cumulative threshold > 0).
+      # Uses `increase()` over a 1h window so a single event triggers the
+      # alert and stays alarmed until the increase resets, surfacing the
+      # incident even after the originating event scrolls out of short windows.
+      - alert: M4CanaryDataLossDetected
+        expr: increase(parallax_canary_data_loss_events_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: parallax_m4_canary
+          trigger: T4
+          rollback_class: auto
+        annotations:
+          summary: M4 canary T4 — data loss event detected (immediate rollback)
+          description: |
+            T4 trigger breached: at least one data_loss event was recorded in
+            the last hour. Per US-009.1 AC-1.13 this is a hard rollback
+            condition with no hysteresis — investigate immediately.
+            Runbook: docs/m4-prep/canary-stage-runbook.md §6.4.
+
+      # T5 — insufficient sample size (hits < 50 over 5-min window).
+      # T5 is a *gate*, not a trigger: when active, T1-T4 verdicts are
+      # downgraded to `insufficient_data`. This alert surfaces gate
+      # activation so oncall can extend stage observation rather than
+      # interpreting "all green" as healthy on a thin sample.
+      - alert: M4CanaryInsufficientSampleSize
+        expr: sum(increase(parallax_canary_events_total[5m])) < 50
+        for: 5m
+        labels:
+          severity: warning
+          component: parallax_m4_canary
+          trigger: T5
+          rollback_class: gate
+        annotations:
+          summary: M4 canary T5 gate active — sample size < 50 hits / 5min (extend stage)
+          description: |
+            T5 minimum-hits gate active: canary saw fewer than 50 events in
+            the last 5 minutes. T1-T4 verdicts will report `insufficient_data`
+            until traffic recovers. Do NOT promote stage on green-from-T1-T4
+            while this alert is firing.
+            Runbook: docs/m4-prep/canary-stage-runbook.md §6.4.

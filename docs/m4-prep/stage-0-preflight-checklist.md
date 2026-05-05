@@ -218,30 +218,39 @@ sqlite3 parallax_canary.db \
 
 ### Checklist
 
-- [ ] **Grafana panel `m4-canary-stage-1`** 已加入 dashboard
-- [ ] **Prometheus alert rule `m4-canary-rules.yml`** 已部署（5 個 triggers）
-- [ ] **PagerDuty / Slack webhook** 已設定（P0/P1 alerts）
-- [ ] **runbook (`canary-stage-runbook.md`)** 已分享給 oncall 團隊
+- [ ] **Grafana dashboard `parallax-m4-canary-stage-1`** 已從 `grafana/dashboards/parallax-m4-canary-stage-1.json` import 並 publish (UID `parallax-m4-canary-stage-1`，7 個 panels：T1/T2/T3 gauges + T4/T5 stats + outcome timeseries + rollback state)
+- [ ] **Prometheus alert rules `parallax-m4-canary.rules.yml`** 已部署到 `/etc/prometheus/rules/`（來源：`prometheus/rules/parallax-m4-canary.rules.yml`，5 個 triggers：T1/T2/T3/T4 critical + T5 warning gate）
+- [ ] **Alertmanager routing** 已合併 `ops/alerting/m4-canary-alertmanager.example.yaml` 對應 fragment（PagerDuty + Slack #m4-canary，secrets 從 secret manager 注入）
+- [ ] **runbook (`docs/m4-prep/canary-stage-runbook.md`)** 已分享給 oncall 團隊
 
 ### 驗證命令
 
 ```bash
-# 確認 Grafana dashboard 存在
+# 確認 Grafana dashboard 存在（UID 比對最穩，title 偶爾會 i18n 化）
 curl -s -H "Authorization: Bearer ${GRAFANA_TOKEN}" \
-  "http://grafana:3000/api/search?query=m4-canary-stage-1" \
-  | jq '.[].title'
-# 預期：包含 "m4-canary-stage-1"
+  "http://grafana:3000/api/dashboards/uid/parallax-m4-canary-stage-1" \
+  | jq -r '.dashboard.title'
+# 預期：包含 "M4 Canary Stage 1"（中英皆可，視 publish 時 title）
 
-# 確認 Prometheus alert rules 已載入
+# 確認 Prometheus alert rules 已載入（5 條 rules）
 curl -s "http://prometheus:9090/api/v1/rules" \
-  | jq '.data.groups[] | select(.name | contains("m4-canary")) | .rules | length'
-# 預期：>= 5
+  | jq '.data.groups[] | select(.name == "parallax_m4_canary") | .rules | length'
+# 預期：== 5
 
 # 確認 alert rule 檔案存在
-ls -la /etc/prometheus/rules/m4-canary-rules.yml
+ls -la /etc/prometheus/rules/parallax-m4-canary.rules.yml
 # 預期：檔案存在且非空
 
-# 確認 PagerDuty / Slack webhook
+# 本地 promtool lint（CI 自動跑 .github/workflows/prometheus-rules-check.yml）
+promtool check rules prometheus/rules/parallax-m4-canary.rules.yml
+# 預期：SUCCESS — 5 rules
+
+# 確認 Alertmanager 路由匹配 m4-canary 標籤
+amtool config routes test --config.file=/etc/alertmanager/alertmanager.yml \
+    severity=critical component=parallax_m4_canary trigger=T1
+# 預期：m4-canary-pagerduty + m4-canary-slack 兩個 receiver 都 match
+
+# 確認 PagerDuty / Slack webhook（傳一次 dry-run 通知；US-009.3 deliverable）
 parallax canary --check-alerting
 # 預期：PagerDuty + Slack 均回 200 OK
 

@@ -39,6 +39,7 @@ def post_event(
         "schema_version": body.schema_version,
         "run_id": body.run_id,
         "record_id": body.record_id,
+        "created_at": body.created_at,
         "commit_sha": body.commit_sha,
         "payload_hash": body.payload_hash,
         "judge_metadata": body.judge_metadata,

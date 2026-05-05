@@ -200,6 +200,34 @@ def test_post_event_payload_round_trip(auth_app, db_path: pathlib.Path):
 
 
 @pytest.mark.integration
+def test_post_event_persists_client_created_at(auth_app, db_path: pathlib.Path):
+    """Client envelope ``created_at`` must round-trip into ``payload_json``."""
+    client_ts = "2026-04-30T03:54:54.123456+00:00"
+    env = _envelope(created_at=client_ts)
+
+    with TestClient(auth_app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/event",
+            json=env,
+            headers={"Authorization": f"Bearer {_TOKEN}"},
+        )
+    assert resp.status_code == 201, resp.text
+    event_id = resp.json()["event_id"]
+
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT payload_json FROM events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    payload = json.loads(row[0])
+    assert payload["created_at"] == client_ts
+
+
+@pytest.mark.integration
 def test_post_event_extra_field_rejected(auth_app):
     """_StrictModel rejects unknown fields (extra='forbid')."""
     bad = _envelope()

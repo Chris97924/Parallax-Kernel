@@ -66,24 +66,30 @@ WinningSource = Literal["parallax", "aphelion", "tie", "fallback"]
 
 @dataclass(frozen=True)
 class LiveArbitrationDecision:
-    """Immutable verdict for a single live cross-store query.
+    """單次即時跨儲存查詢的不可變仲裁判決。
 
-    Field semantics:
-      - ``winning_source`` — "parallax" | "aphelion" | "tie" | "fallback".
-      - ``tie_breaker_rule`` — short string identifying the rule applied
-        (e.g. ``"source-level"`` for the Q1 Option A table).
-      - ``conflict_event_id`` — when set, points at a row in the
-        conflict-event log (Story 5).  None when no conflict event was
-        emitted.
-      - ``policy_version`` — version string of the rule table that
-        produced this verdict.  Always non-null.
-      - ``correlation_id`` — ties this decision to the originating
-        DualReadRouter dispatch.
-      - ``query_type`` — the QueryType that drove the rule selection.
-      - ``reason_code`` — stable, machine-grep-able string. Format
-        ``"source-level/{query_type}/{outcome}"``.
-      - ``decided_at_us_utc`` — microsecond UTC timestamp at decision
-        time. Set by ``arbitrate``; integer for byte-deterministic JSON.
+    封裝 DualReadRouter 派送後的仲裁結果，記錄哪個儲存端勝出
+    以及相關的元資料資訊。
+
+    Attributes
+    ----------
+    winning_source : WinningSource
+        勝出的資料來源，為 "parallax"、"aphelion"、"tie" 或 "fallback" 其一。
+    tie_breaker_rule : str
+        所套用規則的簡短識別碼（例如 "source-level" 代表 Q1 Option A 規則表）。
+    conflict_event_id : str or None
+        衝突事件紀錄的識別碼（對應 Story 5），無衝突事件時為 None。
+    policy_version : str
+        產生此判決的規則表版本字串，恆為非 null。
+    correlation_id : str
+        關聯至觸發本次仲裁的 DualReadRouter 派送識別碼。
+    query_type : QueryType
+        驅動規則選擇的查詢類型。
+    reason_code : str
+        穩定且可供機器搜尋的字串，格式為 "source-level/{query_type}/{outcome}"。
+    decided_at_us_utc : int
+        判決時的微秒級 UTC 時間戳記，由 ``arbitrate`` 設定，採整數以確保
+        JSON 序列化的位元組確定性。
     """
 
     winning_source: WinningSource
@@ -97,15 +103,25 @@ class LiveArbitrationDecision:
 
     @property
     def requires_manual_review(self) -> bool:
-        """True when human inspection is warranted (tie or fallback)."""
+        """判斷此判決是否需要人工審查。
+
+        Returns
+        -------
+        bool
+            當 ``winning_source`` 為 "tie" 或 "fallback" 時回傳 True。
+        """
         return self.winning_source in ("tie", "fallback")
 
     def to_json_line(self) -> str:
-        """Serialize to a single JSON line with deterministic key order.
+        """序列化為單行 JSON，鍵順序固定。
 
-        Invariant: ``policy_version`` is always emitted as a non-null
-        string. Callers that round-trip through this method get
-        byte-equal output for byte-equal inputs.
+        相同輸入會產生位元組完全相等的輸出。
+        ``policy_version`` 恆以非 null 字串輸出。
+
+        Returns
+        -------
+        str
+            具有確定性鍵順序的 JSON 字串。
         """
         payload = {
             "winning_source": self.winning_source,
@@ -121,11 +137,20 @@ class LiveArbitrationDecision:
 
     @classmethod
     def from_json_line(cls, line: str) -> LiveArbitrationDecision:
-        """Decode a JSON line.
+        """從 JSON 字串解碼為 LiveArbitrationDecision 實例。
 
-        Reader robustness: if the serialized dict is missing the
-        ``policy_version`` key (pre-RC writers), coerce to
-        :data:`POLICY_VERSION_PRE_RC` instead of raising.
+        若序列化資料缺少 ``policy_version`` 鍵（舊版寫入器產出），
+        會自動補上 :data:`POLICY_VERSION_PRE_RC` 而非拋出異常。
+
+        Args
+        ----
+        line : str
+            待解碼的 JSON 字串。
+
+        Returns
+        -------
+        LiveArbitrationDecision
+            解碼後的不可變仲裁判決物件。
         """
         data = json.loads(line)
         return cls(
@@ -141,7 +166,7 @@ class LiveArbitrationDecision:
 
 
 def _is_empty(evidence: RetrievalEvidence | None) -> bool:
-    """Return True if ``evidence`` is None or has no hits."""
+    """判斷 evidence 為 None 或無命中結果時回傳 True。"""
     return evidence is None or len(evidence.hits) == 0
 
 
@@ -151,22 +176,31 @@ def arbitrate(
     query_type: QueryType,
     correlation_id: str,
 ) -> LiveArbitrationDecision:
-    """Apply the Q1 Option A source-level rule table.
+    """套用 Q1 Option A 來源層級規則表進行跨儲存仲裁。
 
-    Rules (in order):
-      1. If ``secondary`` is None or empty → ``winning_source="fallback"``
-         (crosswalk-miss). This applies regardless of ``query_type``.
-      2. Else, if ``primary`` is empty → still ``"fallback"`` (we cannot
-         claim a parallax win without parallax data).
-      3. Else, lookup ``_QT_OWNERSHIP.get(query_type, "fallback")`` and
-         return that.  Unknown QueryType values resolve to ``"fallback"``
-         rather than raising KeyError — this preserves the fail-closed
-         invariant: a forward-compat caller passing a freshly added
-         QueryType not yet in the ownership table can still arbitrate
-         without crashing the request path.
+    規則依序判定：
+      1. 若 ``secondary`` 為 None 或無命中結果 → ``winning_source="fallback"``。
+      2. 若 ``primary`` 無命中結果 → 同樣為 ``"fallback"``。
+      3. 否則查閱 ``_QT_OWNERSHIP`` 取得對應的勝出來源；
+         未知的 QueryType 解析為 ``"fallback"``。
 
-    Pure function: no I/O, no logging, no global state.  ``arbitrate``
-    constructs a fresh ``LiveArbitrationDecision`` and returns it.
+    此為純函式：無 I/O、無副作用、不修改全域狀態。
+
+    Args
+    ----
+    primary : RetrievalEvidence
+        主要資料來源（Parallax）的檢索結果。
+    secondary : RetrievalEvidence or None
+        次要資料來源（Aphelion）的檢索結果，可能為 None。
+    query_type : QueryType
+        驅動規則選擇的查詢類型。
+    correlation_id : str
+        關聯至本次 DualReadRouter 派送的識別碼。
+
+    Returns
+    -------
+    LiveArbitrationDecision
+        包含仲裁結果的不可變判決物件。
     """
     if _is_empty(secondary) or _is_empty(primary):
         winning_source: WinningSource = "fallback"

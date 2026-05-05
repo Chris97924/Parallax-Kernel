@@ -107,6 +107,16 @@ class DualReadRouter:
         secondary_timeout_ms: float = 100.0,
         events_conn: sqlite3.Connection | None = None,
     ) -> None:
+        """初始化雙讀取路由器，設定主要與次要查詢埠及相關參數。
+
+        Args:
+            primary: 主要查詢埠（正規來源，例如 RealMemoryRouter）。
+            secondary: 次要查詢埠（Aphelion 適配器）。
+            live_counter: 即時差異計數器，為 None 時停用計數功能。
+            executor: 執行緒池，預設使用 max_workers=2 的 ThreadPoolExecutor。
+            secondary_timeout_ms: 次要查詢的逾時時間（毫秒）。
+            events_conn: 事件資料庫連線，用於記錄仲裁衝突事件；為 None 時停用。
+        """
         self._primary = primary
         self._secondary = secondary
         self._live_counter = live_counter

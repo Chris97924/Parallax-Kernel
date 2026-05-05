@@ -82,6 +82,7 @@ class BreakerState:
     """
 
     def __init__(self) -> None:
+        """初始化斷路器狀態，建立觀察窗口佇列與執行緒鎖。"""
         self.tripped: bool = False
         self.tripped_at: datetime | None = None
         # (monotonic_ts, observed_unreachable) — evicted on each append

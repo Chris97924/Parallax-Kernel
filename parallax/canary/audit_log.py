@@ -175,12 +175,24 @@ class AuditLog:
         """
         try:
             conn = self._connect()
+            # ON CONFLICT DO UPDATE preserves created_at (which is set by the
+            # SQLite default on the original INSERT). INSERT OR REPLACE would
+            # delete-and-reinsert and silently reset created_at on every
+            # idempotency cache hit (criterion 1.7 writes a row on every hit).
             conn.execute(
                 """
-                INSERT OR REPLACE INTO audit_log (
+                INSERT INTO audit_log (
                     event_id, request_at_iso, response_status,
                     latency_ms, idempotency_hit, response_body, ack_by, ack_at
                 ) VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    request_at_iso  = excluded.request_at_iso,
+                    response_status = excluded.response_status,
+                    latency_ms      = excluded.latency_ms,
+                    idempotency_hit = excluded.idempotency_hit,
+                    response_body   = COALESCE(excluded.response_body, response_body),
+                    ack_by          = COALESCE(excluded.ack_by, ack_by),
+                    ack_at          = COALESCE(excluded.ack_at, ack_at)
                 """,
                 (
                     record.event_id,
@@ -236,14 +248,27 @@ class AuditLog:
         )
 
     def lookup_response(self, event_id: str) -> str | None:
-        """Return the cached response body for ``event_id`` or None."""
+        """Return the cached response body for ``event_id`` or None.
+
+        A SQLite error returns None — same shape as cache-miss — but emits
+        a WARNING so the failure is observable. Without this log, a
+        transient DB read failure causes silent re-execution downstream
+        (idempotency.py treats None as "row not found").
+        """
         try:
             conn = self._connect()
             row = conn.execute(
                 "SELECT response_body FROM audit_log WHERE event_id = ?",
                 (event_id,),
             ).fetchone()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
+            _log.warning(
+                "audit_log.lookup_response_failed",
+                extra={
+                    "event": "audit_log.lookup_response_failed",
+                    "error": str(exc),
+                },
+            )
             return None
         if row is None:
             return None

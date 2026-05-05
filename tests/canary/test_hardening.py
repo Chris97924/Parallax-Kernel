@@ -68,6 +68,20 @@ def test_audit_log_can_record_after_close_and_reopen(tmp_path: Path) -> None:
 
 
 def test_concurrent_duplicate_event_ids_run_worker_once(tmp_path: Path) -> None:
+    """Criterion 1.2 — under contention the worker runs exactly once.
+
+    The worker sleeps for 50 ms so all 8 threads sit inside ``handle()``
+    simultaneously before any of them completes. Without this delay, the
+    first thread might race through cache-miss → worker → cache-write
+    fast enough that subsequent threads always find the cache populated
+    — which would let the test pass even if the per-event lock were
+    completely broken.
+
+    Do NOT reduce the sleep below 30 ms: at lower values the test no
+    longer reliably proves the lock prevents double-execution.
+    """
+    import time as _time
+
     log = AuditLog(tmp_path / "audit.db")
     try:
         handler = IdempotencyHandler(audit_log=log)
@@ -76,9 +90,11 @@ def test_concurrent_duplicate_event_ids_run_worker_once(tmp_path: Path) -> None:
         run_lock = threading.Lock()
 
         def worker(_req: object) -> CachedResponse:
-            # Hold long enough that all concurrent threads contend on the lock
             with run_lock:
                 run_count[0] += 1
+            # Block long enough for all 8 threads to land inside handle()
+            # and contend on the per-event idempotency lock.
+            _time.sleep(0.05)
             return CachedResponse(status=200, body="ok")
 
         def run_one() -> None:

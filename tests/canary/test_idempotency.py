@@ -197,9 +197,7 @@ def test_worker_exception_releases_per_event_lock(audit: AuditLog) -> None:
     with pytest.raises(_BoomError):
         h.handle(event_id=eid, request="x", worker=boom)
 
-    assert eid not in h._event_locks, (
-        "per-event lock must be released even when worker raises"
-    )
+    assert eid not in h._event_locks, "per-event lock must be released even when worker raises"
 
     out = h.handle(event_id=eid, request="x", worker=_ok_worker)
     assert out.status == 200

@@ -31,6 +31,7 @@ controller does NOT trip.
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 import enum
 import logging
 import threading
@@ -209,10 +210,25 @@ class RollbackController:
             )
 
     def _evaluate_triggers(self, ts: float, gate_active: bool) -> list[TriggerEvaluation]:
-        # Per spec §3.3 table + criterion 1.14: when T5 gate is active
-        # ALL T1-T4 verdicts get downgraded to INSUFFICIENT_DATA. We
-        # apply the rule uniformly — including T4 — to match the spec
-        # table verbatim.
+        # SPEC AMBIGUITY (us-009-acceptance-criteria.md §3.3):
+        #   - The §3.3 table row for T5 says "gate active 時，T1-T4 判定標記為
+        #     `insufficient_data`" — i.e. ALL of T1-T4 get downgraded.
+        #   - Criterion 1.13 says T4 "trips immediately regardless of window
+        #     size" — referring to T4 having no window of its own, not to
+        #     T5's gate.
+        #   - Criterion 1.14 says "T1-T4 trigger 不執行 trip 也不執行 clear"
+        #     when the gate is active — i.e. T4 IS gated.
+        #
+        # Council escalation: this implementation follows the spec table
+        # + criterion 1.14 verbatim (gate downgrades all four, including
+        # T4). The operational consequence is that during low-traffic
+        # warmup (< 50 hits in 5 min) a single data-loss event surfaces
+        # as INSUFFICIENT_DATA rather than an immediate auto-rollback.
+        # The operator still sees the signal in the snapshot — but
+        # auto-rollback does not fire. If council prefers the safer
+        # "T4 bypasses gate" semantics (zero-tolerance for data loss),
+        # this loop should skip T4 in the gate downgrade. Per §7 O.3
+        # the implementation does not improvise that change.
         results: list[TriggerEvaluation] = []
         for trig in (self._t1, self._t2, self._t3, self._t4):
             ev = trig.evaluate(ts)
@@ -250,13 +266,19 @@ class RollbackController:
         Criterion 1.16: cooldown elapsed → ``awaiting_ack`` (NOT auto
         re-promote). The caller MUST exec this method explicitly.
 
-        Criterion 1.17: identity + timestamp recorded in audit log.
+        Criterion 1.17: identity + timestamp recorded in audit log. If
+        the audit write fails, the state transition still succeeds (per
+        the fire-and-forget invariant of criterion 1.8) but a WARNING
+        is logged so operators see the missing ACK trail.
 
         Returns True on transition; False when the controller is not in
         ``awaiting_ack`` or ``ack_by`` is empty.
         """
         if not ack_by:
             return False
+        # Resolve ack_at once so the snapshot, the audit row, and the
+        # state machine all observe the same timestamp.
+        resolved_at = ack_at or _dt.datetime.now(_dt.UTC).isoformat()
         with self._lock:
             if self._state is not CanaryState.AWAITING_ACK:
                 return False
@@ -264,14 +286,23 @@ class RollbackController:
             self._tripped_at = None
             self._tripped_by = None
             self._last_ack_by = ack_by
-            self._last_ack_at = ack_at
+            self._last_ack_at = resolved_at
             for trig in (self._t1, self._t2, self._t3, self._t4):
                 trig.reset()
             # T5 is intentionally NOT reset — sample window survives
             # the rollback so the gate continues to gate.
-        if self._audit is not None:
-            event_id = str(uuid7())
-            self._audit.record_ack(event_id, ack_by=ack_by, ack_at=ack_at)
+            if self._audit is not None:
+                event_id = str(uuid7())
+                ok = self._audit.record_ack(event_id, ack_by=ack_by, ack_at=resolved_at)
+                if not ok:
+                    _log.warning(
+                        "canary.rollback.ack_audit_failed",
+                        extra={
+                            "event": "canary.rollback.ack_audit_failed",
+                            "ack_by": ack_by,
+                            "ack_at": resolved_at,
+                        },
+                    )
         return True
 
     # ------------------------------------------------------------------

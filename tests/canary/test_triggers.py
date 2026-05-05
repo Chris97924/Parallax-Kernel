@@ -24,7 +24,6 @@ from parallax.canary.triggers import (
     T3P99LatencyTrigger,
     T4DataLossTrigger,
     T5MinHitsGate,
-    TriggerEvaluation,
     TriggerVerdict,
 )
 
@@ -237,13 +236,20 @@ def test_t5_inactive_above_min() -> None:
 
 def test_t5_window_evicts_old_hits() -> None:
     g = T5MinHitsGate()
-    # 100 hits outside the 5-min window — should evict
+    # 100 hits at ts=0 (will fall outside the 5-min window when we evaluate)
     for _ in range(100):
         g.record(0.0)
-    # Only 10 hits inside the window
+    # 10 recent hits placed INSIDE the window relative to `now` so they
+    # survive eviction. Earlier version of this test placed them at
+    # WINDOW + 1 + i and evaluated at WINDOW + 1000, which evicted BOTH
+    # batches and still returned active=True for the wrong reason.
+    inside_base = WINDOW_T5_SECONDS + 100.0
     for i in range(10):
-        g.record(WINDOW_T5_SECONDS + 1 + i)
-    assert g.is_active(now=WINDOW_T5_SECONDS + 1_000.0) is True
+        g.record(inside_base + i * 0.001)
+    now = inside_base + 1.0
+    # Old batch is evicted (now - WINDOW > 0); new batch survives.
+    assert g.hits(now=now) == 10, "only the recent 10 hits must survive eviction"
+    assert g.is_active(now=now) is True, "10 < 50 → gate active on recent batch"
 
 
 # ---------------------------------------------------------------------------
@@ -252,19 +258,41 @@ def test_t5_window_evicts_old_hits() -> None:
 
 
 def test_triggers_are_independent() -> None:
+    """Criterion 1.9 — recording on one trigger MUST NOT change another's metric.
+
+    Earlier version of this test only checked that each ``evaluate()``
+    returned a ``TriggerEvaluation`` instance, which would have passed
+    even if the four triggers shared a counter. This version asserts
+    that observation counts and metric values stay isolated.
+    """
     t1 = T1ErrorRateTrigger()
     t2 = T2DiscrepancyRateTrigger()
     t3 = T3P99LatencyTrigger()
     t4 = T4DataLossTrigger()
-    t1.record(0.0, is_error=True)
-    t2.record(0.0, is_mismatch=False)
-    t3.record(0.0, latency_ms=10.0)
+
+    # Step 1: record a BREACH-level error rate on T1 only.
+    for i in range(200):
+        t1.record(i * 0.001, is_error=i < 5)  # 5/200 = 2.5% > 0.5% → BREACH
+    ev_t1 = t1.evaluate(now=1.0)
+    ev_t2 = t2.evaluate(now=1.0)
+    ev_t3 = t3.evaluate(now=1.0)
+    ev_t4 = t4.evaluate()
+    assert ev_t1.verdict is TriggerVerdict.BREACH
+    assert ev_t1.observations == 200
+    assert ev_t2.observations == 0, "T2 must not see T1 observations"
+    assert ev_t3.observations == 0, "T3 must not see T1 observations"
+    assert ev_t4.metric_value == 0.0, "T4 must not see T1 observations"
+
+    # Step 2: record a data-loss event on T4 only — must not bleed back.
     t4.record()
-    # Each evaluates only its own state
-    assert isinstance(t1.evaluate(0.0), TriggerEvaluation)
-    assert isinstance(t2.evaluate(0.0), TriggerEvaluation)
-    assert isinstance(t3.evaluate(0.0), TriggerEvaluation)
-    assert isinstance(t4.evaluate(), TriggerEvaluation)
+    ev_t1 = t1.evaluate(now=1.0)
+    ev_t2 = t2.evaluate(now=1.0)
+    ev_t3 = t3.evaluate(now=1.0)
+    ev_t4 = t4.evaluate()
+    assert ev_t4.verdict is TriggerVerdict.BREACH
+    assert ev_t1.observations == 200, "T1 must not lose observations from T4 record"
+    assert ev_t2.observations == 0
+    assert ev_t3.observations == 0
 
 
 # ---------------------------------------------------------------------------

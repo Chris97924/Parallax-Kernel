@@ -324,3 +324,36 @@ def test_acknowledge_rejects_blank_operator(audit: AuditLog) -> None:
     c.evaluate()
     assert c.acknowledge(ack_by="") is False
     assert c.state is CanaryState.AWAITING_ACK
+
+
+# ---------------------------------------------------------------------------
+# Team-review FIX-002 — ACK audit failure logs WARNING but state still flips
+# ---------------------------------------------------------------------------
+
+
+def test_acknowledge_logs_warning_when_audit_record_fails(
+    audit: AuditLog, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If record_ack returns False, state still transitions but a WARNING fires."""
+    import logging as _logging
+
+    clock = _FakeClock()
+    c = RollbackController(audit_log=audit, clock=clock)
+    for i in range(10_000):
+        c.observe_request(is_error=i < 100, latency_ms=10.0)
+    c.evaluate()
+    clock.advance(COOLDOWN_SECONDS + 60)
+    c.evaluate()
+    assert c.state is CanaryState.AWAITING_ACK
+
+    monkeypatch.setattr(audit, "record_ack", lambda *a, **kw: False)
+
+    with caplog.at_level(_logging.WARNING, logger="parallax.canary.rollback"):
+        ok = c.acknowledge(ack_by="oncall@parallax")
+
+    # Per criterion 1.8 fire-and-forget: state still flips even when audit fails.
+    assert ok is True
+    assert c.state is CanaryState.RUNNING
+    # And the failure must be observable.
+    events = [r.message for r in caplog.records if "ack_audit_failed" in r.message]
+    assert events, "ack_audit_failed warning must be emitted on record_ack failure"

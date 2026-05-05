@@ -192,3 +192,66 @@ def test_record_ack_rejects_blank_operator(tmp_path: Path) -> None:
         assert log.record_ack("rollback-2", ack_by="") is False
     finally:
         log.close()
+
+
+# ---------------------------------------------------------------------------
+# Team-review FIX-001 — created_at survives cache-hit re-record
+# ---------------------------------------------------------------------------
+
+
+def test_created_at_preserved_on_cache_hit_rewrite(tmp_path: Path) -> None:
+    """Idempotency cache hits MUST NOT reset the original created_at.
+
+    Pre-fix: ``INSERT OR REPLACE`` deleted-and-reinserted the row on
+    every duplicate, silently re-running the SQLite ``DEFAULT
+    (strftime(...))`` clause and overwriting the original timestamp.
+    """
+    import time as _time
+
+    db = tmp_path / "audit.db"
+    log = AuditLog(db)
+    try:
+        # First write: row gets a created_at from the SQLite default
+        log.record(_record("evt-cz"), response_body="first")
+        first = log.lookup("evt-cz")
+        assert first is not None
+        original_created_at = first.created_at
+        assert original_created_at  # SQLite default produced a non-empty stamp
+
+        # Sleep enough that strftime would produce a different ms-resolution
+        # value if it ran again on the second write.
+        _time.sleep(0.05)
+
+        # Cache-hit re-record (criterion 1.7 says we still write a row)
+        log.record(_record("evt-cz", idempotency_hit=True), response_body="first")
+        second = log.lookup("evt-cz")
+        assert second is not None
+        assert second.idempotency_hit is True, "hit flag must be updated"
+        assert second.created_at == original_created_at, (
+            "created_at must be preserved across idempotency-hit rewrites"
+        )
+    finally:
+        log.close()
+
+
+# ---------------------------------------------------------------------------
+# Team-review FIX-003 — lookup_response logs WARNING on sqlite3.Error
+# ---------------------------------------------------------------------------
+
+
+def test_lookup_response_logs_warning_on_sqlite_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Silent DB errors caused unobservable re-execution downstream."""
+    import logging as _logging
+
+    log = AuditLog(tmp_path / "audit.db")
+    try:
+        with mock.patch.object(log, "_connect", side_effect=sqlite3.Error("boom")):
+            with caplog.at_level(_logging.WARNING, logger="parallax.canary.audit_log"):
+                result = log.lookup_response("evt-doesnt-matter")
+        assert result is None
+        events = [r.message for r in caplog.records if "lookup_response_failed" in r.message]
+        assert events, "lookup_response_failed warning must be emitted"
+    finally:
+        log.close()

@@ -197,21 +197,23 @@ class IdempotencyHandler(Generic[_RequestT]):
     ) -> IdempotencyResult:
         started = self._clock()
         request_at = _dt.datetime.now(_dt.UTC).isoformat()
-        response = worker(request)
-        latency_ms = (self._clock() - started) * 1000.0
-        record = make_record(
-            event_id=event_id,
-            response_status=response.status,
-            latency_ms=latency_ms,
-            idempotency_hit=False,
-            request_at_iso=request_at,
-        )
-        ok = self._audit.record(record, response_body=response.body)
-        # Lock kept for the duration of worker — release once cached.
-        self._release_lock(event_id)
-        return IdempotencyResult(
-            status=response.status,
-            body=response.body,
-            hit=False,
-            audit_persisted=ok,
-        )
+        # Lock kept for the duration of worker so concurrent dups serialise; finally guarantees cleanup even if worker raises (Codex P2 PR #41).
+        try:
+            response = worker(request)
+            latency_ms = (self._clock() - started) * 1000.0
+            record = make_record(
+                event_id=event_id,
+                response_status=response.status,
+                latency_ms=latency_ms,
+                idempotency_hit=False,
+                request_at_iso=request_at,
+            )
+            ok = self._audit.record(record, response_body=response.body)
+            return IdempotencyResult(
+                status=response.status,
+                body=response.body,
+                hit=False,
+                audit_persisted=ok,
+            )
+        finally:
+            self._release_lock(event_id)

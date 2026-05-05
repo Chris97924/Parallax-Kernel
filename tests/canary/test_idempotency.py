@@ -173,3 +173,40 @@ def test_audit_write_failure_does_not_fail_request(
     out = h.handle(event_id=eid, request="x", worker=_ok_worker)
     assert out.status == 200, "request must succeed even when audit write fails"
     assert out.audit_persisted is False
+
+
+# ---------------------------------------------------------------------------
+# Codex P2 (PR #41) — worker exception must release the per-event lock
+# ---------------------------------------------------------------------------
+
+
+class _BoomError(RuntimeError):
+    """Custom exception used to verify exception propagation + cleanup."""
+
+
+def test_worker_exception_releases_per_event_lock(audit: AuditLog) -> None:
+    """If worker raises, _event_locks must not retain the event_id.
+
+    Pre-fix: cleanup ran after worker(), so any worker exception leaked
+    the lock entry forever and unbounded growth of _event_locks could
+    degrade long-running processes (Codex P2 PR #41).
+    """
+    h = IdempotencyHandler(audit_log=audit)
+    eid = str(uuid7())
+
+    def boom(_: object) -> CachedResponse:
+        raise _BoomError("downstream blew up")
+
+    with pytest.raises(_BoomError):
+        h.handle(event_id=eid, request="x", worker=boom)
+
+    assert eid not in h._event_locks, (
+        "per-event lock must be released even when worker raises"
+    )
+
+    # Sanity: a retry with the same event_id and a non-raising worker
+    # must succeed. If the lock were stuck, this would deadlock or hit
+    # a stale lock object.
+    out = h.handle(event_id=eid, request="x", worker=_ok_worker)
+    assert out.status == 200
+    assert out.hit is False

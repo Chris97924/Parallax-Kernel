@@ -119,7 +119,7 @@
 | # | Criteria | 驗證方式 |
 |---|---|---|
 | 2.7 | Stub return shape stability：連續呼叫 100 次，回傳物件的 schema（欄位名稱、型別）必須完全一致 | 單元測試：loop 100 次，assert schema 不變 |
-| 2.8 | 跨 query type 行為一致：無論 query type 為 `text`、`structured`、`multimodal`，stub 回傳的 `status` 均為 `'secondary_unavailable'` | 參數化測試：`@pytest.mark.parametrize("query_type", [...])`，assert status 一致 |
+| 2.8 | 跨 query type 行為一致：對 `QueryType` enum 全部 5 值（`recent_context` / `artifact_context` / `entity_profile` / `change_trace` / `temporal_context`），stub raise `AphelionUnreachableError` 後 `DualReadRouter` 標記的 `outcome` 均為 `'aphelion_unreachable'` | 參數化測試：`@pytest.mark.parametrize("query_type", list(QueryType))`，assert outcome 一致（已由 PR #39 / `tests/router/test_aphelion_stub.py::test_dual_read_outcome_aphelion_unreachable_for_every_query_type` 驗證） |
 
 ---
 

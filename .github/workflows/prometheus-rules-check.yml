@@ -17,4 +17,15 @@ jobs:
           sudo apt-get install -y prometheus
 
       - name: Check Prometheus rules
-        run: promtool check rules prometheus/rules/parallax-dual-read.rules.yml
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(prometheus/rules/*.yml prometheus/rules/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No Prometheus rule files found under prometheus/rules/ — workflow trigger and rule directory are out of sync."
+            exit 1
+          fi
+          echo "Checking ${#files[@]} rule file(s):"
+          printf '  %s\n' "${files[@]}"
+          promtool check rules "${files[@]}"

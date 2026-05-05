@@ -35,7 +35,7 @@ import enum
 import logging
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Final
 
 from parallax.canary.audit_log import AuditLog
@@ -102,7 +102,7 @@ class RollbackController:
         self,
         *,
         audit_log: AuditLog | None = None,
-        clock: callable = time.monotonic,  # type: ignore[type-arg]
+        clock: Callable[[], float] = time.monotonic,
         cooldown_seconds: float = COOLDOWN_SECONDS,
     ) -> None:
         self._audit = audit_log

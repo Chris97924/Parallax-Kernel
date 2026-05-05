@@ -247,7 +247,8 @@ class AuditLog:
             return None
         if row is None:
             return None
-        return row["response_body"]
+        body = row["response_body"]
+        return body if isinstance(body, str) else None
 
     # ------------------------------------------------------------------
     # Manual ACK helper — criterion 1.17 (operator + timestamp recorded)

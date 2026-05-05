@@ -257,26 +257,59 @@ class TestExportPrivacyFilterBeltAndBraces:
         assert "creds.md" not in body["companion_files"]
 
 
+# Synthetic MEMORY.md modelled on Chris's real layout: 4 categories, multiple
+# entries each, plus a decorative code fence (ignored by parse_memory_md).
+# Decoupling from the host file keeps the round-trip invariant test
+# deterministic regardless of unrelated edits to the live MEMORY.md.
+_REAL_SHAPED_MEMORY_MD = """\
+# User
+- [Chris Profile](chris_profile.md) — identity sketch
+
+# Projects (Active)
+- [Parallax Status](project_parallax.md) — current snapshot
+- [Orbit Current](project_orbit.md) — current snapshot
+- [Aphelion v0.5](project_aphelion.md) — shipped
+
+```text
+decorative fence: ignored by parse_memory_md
+```
+
+# Feedback
+- [No Phantom Done](feedback_phantom_done.md) — verify before claim
+- [Notion Sync](feedback_notion_sync.md) — dual-write
+
+# Reference
+- [ZenBook Host](reference_zenbook_host.md) — host on local LAN
+- [Notion DB](reference_notion_db.md) — devlog DB pointer
+"""
+
+_REAL_SHAPED_COMPANIONS: dict[str, str] = {
+    "chris_profile.md": "Chris is the project owner.",
+    "project_parallax.md": "Parallax is the kernel project.",
+    "project_orbit.md": "Orbit is the agent harness project.",
+    "project_aphelion.md": "Aphelion is the public knowledge layer.",
+    "feedback_phantom_done.md": "Verify tool result before claiming done.",
+    "feedback_notion_sync.md": "Always update Notion devlog and roadmap.",
+    "reference_zenbook_host.md": "ssh chris at the LAN host for ZenBook.",
+    "reference_notion_db.md": "Devlog DB pointer lives in shared notes.",
+}
+
+
 class TestRoundTripRealMemoryMd:
-    @pytest.mark.skipif(
-        not pathlib.Path(
-            "C:/Users/user/.claude/projects/C--Users-user/memory/MEMORY.md"
-        ).exists(),
-        reason="only on Chris host",
-    )
     def test_round_trip_real_memory_md(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Ingest real MEMORY.md, export, assert 8 non-secret entries survive."""
-        real_mem = pathlib.Path(
-            "C:/Users/user/.claude/projects/C--Users-user/memory/MEMORY.md"
-        )
+        """Round-trip invariant on a real-shaped synthetic MEMORY.md."""
+        mem_path = tmp_path / "MEMORY.md"
+        mem_path.write_text(_REAL_SHAPED_MEMORY_MD, encoding="utf-8")
+        _write_companions(tmp_path, _REAL_SHAPED_COMPANIONS)
+
         app = _make_app(tmp_path, monkeypatch)
         db_p = tmp_path / "export_test.db"
 
         conn = connect(db_p)
         try:
-            ingest_memory_md(conn, memory_md_path=real_mem, user_id="chris")
+            ingest_memory_md(conn, memory_md_path=mem_path, user_id="chris")
         finally:
             conn.close()
 
@@ -287,9 +320,8 @@ class TestRoundTripRealMemoryMd:
         body = resp.json()
         exported_entries = parse_memory_md(body["memory_md"])
 
-        # MEMORY.md grows over time — assert round-trip invariant:
-        # every entry parsed from the input file must survive ingest + export.
-        expected_count = len(parse_memory_md(real_mem.read_text(encoding="utf-8")))
+        # Round-trip invariant: every entry parsed from input survives ingest + export.
+        expected_count = len(parse_memory_md(_REAL_SHAPED_MEMORY_MD))
         assert len(exported_entries) == expected_count
 
         # Category breakdown (all 4 categories populated).

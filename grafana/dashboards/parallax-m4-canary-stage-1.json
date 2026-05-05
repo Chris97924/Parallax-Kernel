@@ -268,7 +268,7 @@
         },
         "overrides": []
       },
-      "gridPos": {"h": 8, "w": 16, "x": 16, "y": 8},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
       "id": 6,
       "options": {
         "legend": {"calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true},

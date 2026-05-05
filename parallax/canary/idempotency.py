@@ -197,7 +197,8 @@ class IdempotencyHandler(Generic[_RequestT]):
     ) -> IdempotencyResult:
         started = self._clock()
         request_at = _dt.datetime.now(_dt.UTC).isoformat()
-        # Lock kept for the duration of worker so concurrent dups serialise; finally guarantees cleanup even if worker raises (Codex P2 PR #41).
+        # Lock entry kept for worker duration so concurrent dups serialise;
+        # finally guarantees cleanup even if worker raises.
         try:
             response = worker(request)
             latency_ms = (self._clock() - started) * 1000.0

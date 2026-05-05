@@ -1,0 +1,31 @@
+name: prometheus-rules-check
+
+on:
+  pull_request:
+    paths:
+      - "prometheus/rules/**"
+
+jobs:
+  promtool:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Prometheus tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y prometheus
+
+      - name: Check Prometheus rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          files=(prometheus/rules/**/*.yml prometheus/rules/**/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No Prometheus rule files found under prometheus/rules/ — workflow trigger and rule directory are out of sync."
+            exit 1
+          fi
+          echo "Checking ${#files[@]} rule file(s):"
+          printf '  %s\n' "${files[@]}"
+          promtool check rules "${files[@]}"

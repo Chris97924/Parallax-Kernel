@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Parallax Kernel CLI — backup / restore / inspect the canonical store.",
     )
     sub = parser.add_subparsers(
-        dest="command", metavar="{backup,restore,serve,inspect,token,router}"
+        dest="command", metavar="{backup,restore,serve,inspect,token,router,canary}"
     )
 
     p_backup = sub.add_parser("backup", help="Write a tar.gz backup archive.")
@@ -303,6 +303,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip the stdin CONFIRM gate and proceed immediately",
     )
+
+    # ----- canary -----------------------------------------------------------
+    # Imported lazily so canary side-effects (sqlite3 imports, etc.) only
+    # land when the user actually invokes `parallax canary ...`.
+    from parallax.canary.cli import register_canary_subparser
+
+    register_canary_subparser(sub)
 
     return parser
 
@@ -1003,6 +1010,10 @@ def _dispatch(argv: Sequence[str] | None) -> int:
             return _EXIT_USAGE
         parser.parse_args(["router", "--help"])
         return _EXIT_USAGE
+    if args.command == "canary":
+        from parallax.canary.cli import cmd_canary
+
+        return cmd_canary(args)
     if args.command == "inspect":
         user_id = args.user_id if args.user_id is not None else _default_user()
         if args.inspect_cmd == "events":

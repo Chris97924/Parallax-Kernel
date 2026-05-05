@@ -23,7 +23,6 @@ CLI invocation.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import os
 import sys
@@ -360,6 +359,3 @@ def _cmd_check_alerting(args: argparse.Namespace) -> int:
 
     return 0 if pd_url and slack_url else 1
 
-
-# Re-export for tests that want to assert dataclass shape without re-importing.
-DodReportT = dataclasses.dataclass  # type: ignore[misc]

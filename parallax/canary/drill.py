@@ -328,7 +328,7 @@ def run_reemit_drill(
         for eid in event_ids
     )
     # Confirm row count did not double.
-    conn = audit_log._connect()  # type: ignore[attr-defined]
+    conn = audit_log._connect()
     placeholders = ",".join("?" * len(event_ids))
     row = conn.execute(
         f"SELECT COUNT(*) AS n FROM audit_log WHERE event_id IN ({placeholders})",
@@ -415,7 +415,7 @@ def run_idempotency_drill(
         assert audit_log is not None  # narrow for type-checker
         local_audit = audit_log
 
-    handler = IdempotencyHandler(audit_log=local_audit)
+    handler: IdempotencyHandler[object] = IdempotencyHandler(audit_log=local_audit)
     event_id = str(uuid7())
     invocations = 0
     invocation_lock = threading.Lock()

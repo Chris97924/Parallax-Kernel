@@ -30,9 +30,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as _dt
 import enum
-import sqlite3
 from collections.abc import Iterable
-from pathlib import Path
 from typing import Final
 
 from parallax.canary.audit_log import AuditLog
@@ -49,7 +47,7 @@ __all__ = [
 ]
 
 
-class DodMetric(str, enum.Enum):
+class DodMetric(enum.StrEnum):
     """The five DoD metric identifiers (AC-3.1)."""
 
     ERROR_RATE = "error_rate"
@@ -59,7 +57,7 @@ class DodMetric(str, enum.Enum):
     MIN_HITS = "min_hits"
 
 
-class DodVerdict(str, enum.Enum):
+class DodVerdict(enum.StrEnum):
     """Outcome of a single metric evaluation."""
 
     PASS = "pass"
@@ -147,10 +145,19 @@ def _quantile(sorted_values: list[float], q: float) -> float:
 
 
 def _verdict_for(metric: DodMetric, observed: float, sample_size: int) -> DodVerdict:
-    """Compute pass/fail/insufficient_data for one metric."""
+    """Compute pass/fail/insufficient_data for one metric.
+
+    MIN_HITS semantics mirror the T5 gate from PR #41 — when sample size
+    is below the floor, we report INSUFFICIENT_DATA rather than FAIL.
+    Extending the observation window is the correct response; T5 in
+    triggers.py is also a *gate*, not a *trigger*.
+    """
     if metric == DodMetric.MIN_HITS:
-        # Min-hits is its own pass criterion: hits >= 50 → PASS, else FAIL.
-        return DodVerdict.PASS if observed >= DOD_THRESHOLD[metric] else DodVerdict.FAIL
+        return (
+            DodVerdict.PASS
+            if observed >= DOD_THRESHOLD[metric]
+            else DodVerdict.INSUFFICIENT_DATA
+        )
 
     # All other metrics depend on sample size — fewer than 50 hits means
     # we cannot trust the rate / quantile, so report INSUFFICIENT_DATA.
@@ -210,8 +217,8 @@ def compute_dod(
     since_iso = _iso(since)
     until_iso = _iso(until_dt)
 
-    conn_audit = audit_log._connect()  # type: ignore[attr-defined]  # share thread-local cache
-    conn_out = outcomes._connect()  # type: ignore[attr-defined]
+    conn_audit = audit_log._connect()
+    conn_out = outcomes._connect()
 
     # Step 1 — collect audit_log rows joined to canary_outcomes for this
     # stage in the window. The JOIN restricts the row set to events that

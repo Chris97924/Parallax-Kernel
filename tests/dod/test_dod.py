@@ -30,6 +30,7 @@ from parallax.canary.dod import (
     DOD_THRESHOLD,
     DodMetric,
     DodVerdict,
+    _iso,
     compute_dod,
 )
 from parallax.canary.outcomes import KNOWN_STAGES, OutcomeStore
@@ -95,7 +96,7 @@ def _populate(
     are 200 / outcome='ok'. Latencies are ``p99_latency_ms`` for the LAST
     event and 10ms for the rest, so the p99 is exactly the requested value.
     """
-    when_iso = when.strftime("%Y-%m-%dT%H:%M:%fZ")
+    when_iso = _iso(when)
     for i in range(count):
         eid = _eid(seed_offset + i)
         if i < error_count:
@@ -360,7 +361,7 @@ def test_audit_thin_outcomes_full_does_not_pass_audit_metrics(
     never PASS/FAIL on the outcome-side count alone.
     """
     audit, outcomes = stores
-    when_iso = _FIXED_NOW.strftime("%Y-%m-%dT%H:%M:%fZ")
+    when_iso = _iso(_FIXED_NOW)
     # 5 audit rows (audit-side thin)
     for i in range(5):
         eid = _eid(i)
@@ -394,6 +395,60 @@ def test_audit_thin_outcomes_full_does_not_pass_audit_metrics(
                 f"audit-thin metric {m.metric.value} should report "
                 f"INSUFFICIENT_DATA when audit sample < 50, got {m.verdict.value}"
             )
+
+
+def test_p99_latency_gates_on_non_null_latency_count(
+    stores: tuple[AuditLog, OutcomeStore],
+) -> None:
+    """Regression for Codex P1 (PR #45 dod.py:305).
+
+    100 audit rows but only 10 carry a latency_ms value; remaining 90
+    have ``latency_ms=NULL``. p99 verdict MUST report INSUFFICIENT_DATA
+    (latency sample < 50), not PASS based on the joined-row count alone.
+    """
+    audit, outcomes = stores
+    when_iso = _iso(_FIXED_NOW)
+    for i in range(100):
+        eid = _eid(i)
+        audit.record(
+            make_record(
+                event_id=eid,
+                response_status=200,
+                # First 10 rows have latency, rest are NULL.
+                latency_ms=10.0 if i < 10 else None,
+                idempotency_hit=False,
+            )
+        )
+        outcomes.record(
+            event_id=eid, stage="m4_1pct", outcome="ok", recorded_at=when_iso
+        )
+
+    report = compute_dod(
+        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
+    )
+    p99 = next(m for m in report.metrics if m.metric == DodMetric.P99_LATENCY_MS)
+    assert p99.verdict == DodVerdict.INSUFFICIENT_DATA, (
+        f"p99 should be INSUFFICIENT_DATA when only 10/100 rows have latency, "
+        f"got verdict={p99.verdict.value} sample_size={p99.sample_size}"
+    )
+    assert p99.sample_size == 10
+
+
+def test_iso_format_matches_sqlite_strftime() -> None:
+    """Regression for Codex P1 (PR #45 dod.py:126).
+
+    ``_iso()`` MUST produce a string lexically comparable to SQLite's
+    ``strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`` default — i.e. with
+    explicit seconds and 3-digit millisecond fraction.
+    """
+    sample = _dt.datetime(2026, 5, 5, 12, 0, 0, 123_456, tzinfo=_dt.UTC)
+    out = _iso(sample)
+    # Expected SQLite-style format: SS.SSS (millis truncated from micros).
+    assert out == "2026-05-05T12:00:00.123Z", out
+    # Boundary check: equal-second comparison must be lexically correct.
+    earlier = _dt.datetime(2026, 5, 5, 12, 0, 0, 0, tzinfo=_dt.UTC)
+    later = _dt.datetime(2026, 5, 5, 12, 0, 0, 999_999, tzinfo=_dt.UTC)
+    assert _iso(earlier) < out < _iso(later)
 
 
 # ----------------------------------------------------------------------

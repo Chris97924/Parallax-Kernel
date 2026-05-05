@@ -122,8 +122,19 @@ def _resolve_window(
 
 
 def _iso(ts: _dt.datetime) -> str:
-    """Format datetime as ISO-8601 with millisecond precision (matches schema default)."""
-    return ts.astimezone(_dt.UTC).strftime("%Y-%m-%dT%H:%M:%fZ")
+    """Format datetime to match SQLite's ``strftime('%Y-%m-%dT%H:%M:%fZ', 'now')``.
+
+    SQLite's ``%f`` produces ``SS.SSS`` (seconds + millisecond fraction);
+    Python's ``strftime('%f')`` produces 6-digit microseconds and omits
+    seconds entirely when the format string lacks ``%S``. The two
+    representations don't sort identically in lexical comparison, so the
+    DoD window predicates (``recorded_at >= since AND <= until``) can
+    misclassify boundary rows. We format explicitly with ``%S`` plus a
+    3-digit millisecond suffix to mirror SQLite exactly.
+    """
+    utc = ts.astimezone(_dt.UTC)
+    millis = utc.microsecond // 1000
+    return f"{utc.strftime('%Y-%m-%dT%H:%M:%S')}.{millis:03d}Z"
 
 
 def _quantile(sorted_values: list[float], q: float) -> float:
@@ -301,8 +312,13 @@ def compute_dod(
             metric=DodMetric.P99_LATENCY_MS,
             observed=p99_latency,
             threshold=DOD_THRESHOLD[DodMetric.P99_LATENCY_MS],
+            # Gate on the count of rows with a non-null latency_ms,
+            # NOT on sample_size (joined audit rows). A corpus where
+            # half the rows have NULL latency would otherwise return
+            # PASS/FAIL on too few latency observations instead of
+            # INSUFFICIENT_DATA.
             verdict=_verdict_for(
-                DodMetric.P99_LATENCY_MS, p99_latency, sample_size
+                DodMetric.P99_LATENCY_MS, p99_latency, len(latencies)
             ),
             sample_size=len(latencies),
         ),

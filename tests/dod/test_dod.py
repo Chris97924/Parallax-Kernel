@@ -350,6 +350,52 @@ def test_zero_data_returns_insufficient_data(
     assert report.overall == DodVerdict.INSUFFICIENT_DATA
 
 
+def test_audit_thin_outcomes_full_does_not_pass_audit_metrics(
+    stores: tuple[AuditLog, OutcomeStore],
+) -> None:
+    """Regression for Codex P1 (PR #45 dod.py:279).
+
+    With audit_log < 50 rows and canary_outcomes >= 50 rows, audit-backed
+    metrics (error_rate / p99_latency) must report INSUFFICIENT_DATA —
+    never PASS/FAIL on the outcome-side count alone.
+    """
+    audit, outcomes = stores
+    when_iso = _FIXED_NOW.strftime("%Y-%m-%dT%H:%M:%fZ")
+    # 5 audit rows (audit-side thin)
+    for i in range(5):
+        eid = _eid(i)
+        audit.record(
+            make_record(
+                event_id=eid,
+                response_status=500,  # 100% error rate IF rate were trusted
+                latency_ms=500.0,  # 500ms p99 IF rate were trusted
+                idempotency_hit=False,
+            )
+        )
+        outcomes.record(
+            event_id=eid, stage="m4_1pct", outcome="ok", recorded_at=when_iso
+        )
+    # 200 extra outcome rows with no audit row (outcome-side full)
+    for i in range(200):
+        outcomes.record(
+            event_id=_eid(10_000 + i),
+            stage="m4_1pct",
+            outcome="ok",
+            recorded_at=when_iso,
+        )
+
+    report = compute_dod(
+        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
+    )
+    audit_metrics = {DodMetric.ERROR_RATE, DodMetric.P99_LATENCY_MS}
+    for m in report.metrics:
+        if m.metric in audit_metrics:
+            assert m.verdict == DodVerdict.INSUFFICIENT_DATA, (
+                f"audit-thin metric {m.metric.value} should report "
+                f"INSUFFICIENT_DATA when audit sample < 50, got {m.verdict.value}"
+            )
+
+
 # ----------------------------------------------------------------------
 # CLI JSON output contract
 # ----------------------------------------------------------------------

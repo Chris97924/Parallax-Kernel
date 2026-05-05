@@ -172,3 +172,53 @@ def test_run_full_drill_with_real_audit_log_passes(audit_log: AuditLog) -> None:
         dry_run=False,
     )
     assert all(r.overall == DrillStatus.PASS for r in (drain, reemit, idem))
+
+
+# ----------------------------------------------------------------------
+# CLI gating regression (Codex P1 on PR #45 cli.py:230)
+# ----------------------------------------------------------------------
+
+
+def test_cli_rollback_drill_real_mode_uses_audit_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Regression: ``--rollback-drill`` without ``--dry-run`` MUST hit a real
+    AuditLog, even when ``--audit-db`` is omitted.
+
+    Old code only constructed AuditLog when ``--audit-db`` was explicit,
+    so default-path real-mode drills silently fell back to the no-audit
+    dry-run branch and reported PASS without exercising the production
+    store.
+    """
+    from parallax.canary import cli as canary_cli
+
+    db_path = tmp_path / "drill_audit.db"
+    monkeypatch.setenv("PARALLAX_CANARY_AUDIT_DB", str(db_path))
+
+    constructed: list[pathlib.Path] = []
+    real_init = canary_cli.AuditLog.__init__
+
+    def spy_init(self: object, db_path: object = None, **kw: object) -> None:
+        constructed.append(pathlib.Path(str(db_path)) if db_path else db_path)  # type: ignore[arg-type]
+        real_init(self, db_path=db_path, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(canary_cli.AuditLog, "__init__", spy_init)
+
+    parser = __import__(
+        "parallax.cli", fromlist=["build_parser"]
+    ).build_parser()
+    args = parser.parse_args(
+        [
+            "canary",
+            "--rollback-drill",
+            "--in-flight", "2",
+            "--reemit-count", "2",
+            "--concurrency", "2",
+        ]
+    )
+    rc = canary_cli.cmd_canary(args)
+    assert rc == 0
+    # AuditLog was constructed at least once in real mode (no --dry-run).
+    assert len(constructed) >= 1, (
+        "expected real-mode rollback-drill to construct AuditLog; got 0 calls"
+    )

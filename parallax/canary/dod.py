@@ -273,9 +273,11 @@ def compute_dod(
         discrepancy_count / total_outcomes if total_outcomes else 0.0
     )
 
-    # Use the larger of the two corpora as the canonical sample-size
-    # signal — both should converge in steady state, but during partial
-    # backfills one side may briefly lead the other.
+    # Each metric is gated on the sample size of the corpus IT reads from.
+    # Mixing the two would let an outcome-heavy / audit-light corpus return
+    # confident error_rate / p99_latency verdicts on too few audit rows
+    # (and vice versa for discrepancy_rate / data_loss). MIN_HITS keeps
+    # the union signal so "either side has enough data" promotes the gate.
     canonical_sample = max(sample_size, total_outcomes)
 
     metrics = (
@@ -283,7 +285,7 @@ def compute_dod(
             metric=DodMetric.ERROR_RATE,
             observed=error_rate,
             threshold=DOD_THRESHOLD[DodMetric.ERROR_RATE],
-            verdict=_verdict_for(DodMetric.ERROR_RATE, error_rate, canonical_sample),
+            verdict=_verdict_for(DodMetric.ERROR_RATE, error_rate, sample_size),
             sample_size=sample_size,
         ),
         MetricResult(
@@ -291,7 +293,7 @@ def compute_dod(
             observed=discrepancy_rate,
             threshold=DOD_THRESHOLD[DodMetric.DISCREPANCY_RATE],
             verdict=_verdict_for(
-                DodMetric.DISCREPANCY_RATE, discrepancy_rate, canonical_sample
+                DodMetric.DISCREPANCY_RATE, discrepancy_rate, total_outcomes
             ),
             sample_size=total_outcomes,
         ),
@@ -300,7 +302,7 @@ def compute_dod(
             observed=p99_latency,
             threshold=DOD_THRESHOLD[DodMetric.P99_LATENCY_MS],
             verdict=_verdict_for(
-                DodMetric.P99_LATENCY_MS, p99_latency, canonical_sample
+                DodMetric.P99_LATENCY_MS, p99_latency, sample_size
             ),
             sample_size=len(latencies),
         ),
@@ -309,7 +311,7 @@ def compute_dod(
             observed=float(data_loss_count),
             threshold=DOD_THRESHOLD[DodMetric.DATA_LOSS_COUNT],
             verdict=_verdict_for(
-                DodMetric.DATA_LOSS_COUNT, data_loss_count, canonical_sample
+                DodMetric.DATA_LOSS_COUNT, data_loss_count, total_outcomes
             ),
             sample_size=total_outcomes,
         ),

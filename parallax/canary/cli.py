@@ -226,7 +226,12 @@ def _print_dod(report: DodReport, *, fmt: str) -> None:
 def _cmd_rollback_drill(args: argparse.Namespace) -> int:
     audit: AuditLog | None = None
     try:
-        if args.audit_db is not None and not args.dry_run:
+        # Real-mode drills MUST exercise the configured audit store —
+        # falling back to None silently routes the drill back into dry-run
+        # simulation (run_reemit_drill takes its no-audit branch and
+        # run_idempotency_drill spins up an isolated temp DB), defeating
+        # the production-path verification this command exists for.
+        if not args.dry_run:
             audit = AuditLog(db_path=args.audit_db)
         drain, reemit, idem = run_full_drill(
             audit_log=audit,
@@ -259,7 +264,10 @@ def _cmd_drain_test(args: argparse.Namespace) -> int:
 def _cmd_reemit_test(args: argparse.Namespace) -> int:
     audit: AuditLog | None = None
     try:
-        if args.audit_db is not None and not args.dry_run:
+        # Same gating as _cmd_rollback_drill — real mode must hit the
+        # configured audit store, never None (which silently falls back
+        # to the no-audit dry-run branch in run_reemit_drill).
+        if not args.dry_run:
             audit = AuditLog(db_path=args.audit_db)
         report = run_reemit_drill(
             audit_log=audit,

@@ -21,7 +21,7 @@ M5 replaces the M3-era null-stub `AphelionReadAdapter` (raise-only) with a real 
 
 | # | Condition | Evidence |
 |---|---|---|
-| E.1 | M4 DoD signed off — Stage @1% / @10% / @50% / @100% all green per `canary-stage-runbook.md` §3–§6 | DoD verifier JSON `overall: pass` for all 4 stages × 7-day window; Chris ACK in `#m4-canary` for each promotion |
+| E.1 | M4 DoD signed off — Stage @1% / @10% / @50% / @100% all green per `canary-stage-runbook.md` §3–§6 | DoD verifier JSON `overall: pass` at each stage promotion gate, scoped to that stage's runbook observation window: @1% = 24h (§3), @10% = 48h (§4), @50% = 72h (§5), @100% = 1 week (§6); Chris ACK in `#m4-canary` for each promotion |
 | E.2 | M4 P×A Dashboard row ticked | Notion `343f3661...` M4 row checkboxes all set |
 | E.3 | M3 dual-read corpus stayed green throughout M4 rollout — `dual_read_discrepancy_rate < 0.1%` continuously for **≥ 72h covering each M4 stage transition** (per `stage-0-preflight-checklist.md` §2) | `dual_read_continuity_check --since=72h --metric=discrepancy` exit 0 at every Stage @1%/@10%/@50%/@100% promotion gate |
 | E.4 | Aphelion v0.6 retrieval API spec drafted (separate Aphelion repo deliverable) | `Chris97924/Aphelion-Graph` has v0.6 PR open or merged with retrieval contract |
@@ -51,8 +51,15 @@ Per security review 2026-05-06 — these are not negotiable and must be enforced
 | Error reason sanitisation | `AphelionUnreachableError(reason)` carries only an enum-like tag (`http_5xx`, `timeout`, `tls_fail`); never raw response body or URLs/tokens |
 | Retry policy | Exponential backoff with **hard cap ≤ 3 retries** + jitter; connect / read timeouts configured separately |
 | Audit `response_body` PII | Cap size at 16 KB; PII-tagged retrievals MUST be redacted before audit-log write; SQLite audit DB file mode `0600` on creation |
-| Edge rate-limit | Per-source-IP rate limit on `event_id` ingestion to prevent denial-of-cache via UUID flood (out of M5 scope but must be documented as upstream assumption) |
 | Audit-write failure observability | Wire `parallax_audit_write_failures_total` Prom counter; alert on > 0 / 5 min (closes audit-evasion vector identified in security review) |
+
+### 3.1b Upstream Assumptions (deferred — non-blocking for M5)
+
+These items came out of the same 2026-05-06 security review but are **not** M5 lint/test gates. They are documented here so reviewers do not mistake their absence for an oversight; ownership and target milestone are listed.
+
+| Assumption | Rationale | Owner / Target |
+|---|---|---|
+| Edge rate-limit on `event_id` ingestion | Per-source-IP rate limit prevents denial-of-cache via UUID flood. Ingestion edge sits upstream of `parallax/router/`; controlling it inside M5 scope would require touching ingest-tier infra not in the M5 module map. | Edge / ingest-tier ticket; target M6 (or earlier if ingest infra work lands first). M5 PR review MUST NOT block on this row. |
 
 ### 3.2 In-scope ops
 

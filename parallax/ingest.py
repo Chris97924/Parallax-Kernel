@@ -78,6 +78,51 @@ def _ensure_direct_source(conn: sqlite3.Connection, user_id: str) -> str:
     return source_id
 
 
+def _ensure_external_source(
+    conn: sqlite3.Connection,
+    user_id: str,
+    source_id: str,
+) -> str:
+    # Lazy-create a sources row for a client-supplied ``source_id`` so the
+    # FK ``memories.source_id REFERENCES sources(source_id)`` (and the
+    # equivalent on ``claims``) always points to a row that already exists.
+    # Idempotent via INSERT OR IGNORE on the source_id PK -- second writes
+    # for the same id silently no-op without overwriting the original
+    # ``user_id`` / ``ingested_at`` of the registering caller.
+    #
+    # Reserved-namespace handling: ``direct:<user>`` is the canonical
+    # synthetic source for direct input (see ``_ensure_direct_source``). If
+    # the client supplies their own synthetic id (``direct:<self>``), route
+    # to the canonical helper so the row is created with ``kind='chat'`` /
+    # ``uri='parallax://direct/...'`` -- never as kind='external'. Cross-user
+    # ``direct:<other>`` is rejected: without this guard a malicious caller
+    # could pre-empt another user's synthetic row with external metadata,
+    # and a later ingest for that user with ``source_id=None`` would no-op
+    # via INSERT OR IGNORE and leave the direct: row permanently mislabeled.
+    if source_id.startswith("direct:"):
+        own = synthetic_direct_source_id(user_id)
+        if source_id != own:
+            raise ValueError(
+                f"source_id {source_id!r} targets reserved direct: namespace "
+                f"of another user; only {own!r} is permitted for user_id "
+                f"{user_id!r}"
+            )
+        return _ensure_direct_source(conn, user_id)
+    insert_source(
+        conn,
+        Source(
+            source_id=source_id,
+            uri=f"parallax://external/{source_id}",
+            kind="external",
+            content_hash=content_hash(source_id),
+            user_id=user_id,
+            ingested_at=now_iso(),
+            state="ingested",
+        ),
+    )
+    return source_id
+
+
 def ingest_memory(
     conn: sqlite3.Connection,
     *,
@@ -130,6 +175,8 @@ def ingest_memory_with_status(
     try:
         if source_id is None:
             source_id = _ensure_direct_source(conn, user_id)
+        else:
+            source_id = _ensure_external_source(conn, user_id, source_id)
 
         # v0.4.0: hashing.normalize encodes None with a distinct sentinel,
         # so title/summary flow straight through — no boundary conversion,
@@ -256,6 +303,8 @@ def ingest_claim_with_status(
     try:
         if source_id is None:
             source_id = _ensure_direct_source(conn, user_id)
+        else:
+            source_id = _ensure_external_source(conn, user_id, source_id)
 
         # v0.5.0-pre1 / ADR-005: user_id is part of the hash so cross-user
         # same-source same-triple claims stay distinct.

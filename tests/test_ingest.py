@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from parallax.hashing import content_hash
 from parallax.ingest import ingest_claim, ingest_memory, synthetic_direct_source_id
 from parallax.sqlite_store import query
@@ -104,6 +106,145 @@ class TestIngestMemoryUpsert:
         assert mid != mid3
         rows2 = query(conn, "SELECT COUNT(*) AS n FROM memories", ())
         assert rows2[0]["n"] == 2
+
+
+class TestExternalSourceLazyCreate:
+    """Client-supplied source_id must lazy-create its sources row.
+
+    Regression for the FK gap surfaced by the Orbit warm-boot adapter
+    (`orbit-warmboot:<user>:summary`): the server previously skipped
+    source creation when ``source_id is not None`` and tripped FOREIGN
+    KEY constraint failed on memories.source_id. The fix mirrors the
+    direct-source pattern via ``_ensure_external_source``.
+    """
+
+    def test_memory_with_novel_source_id_creates_sources_row(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        rows = query(conn, "SELECT * FROM sources WHERE source_id = ?", (sid,))
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "external"
+        assert rows[0]["uri"] == f"parallax://external/{sid}"
+        assert rows[0]["user_id"] == "chris"
+
+    def test_memory_with_novel_source_id_persists_memory_row(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        mid = ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        assert isinstance(mid, str) and len(mid) > 0
+        memory_rows = query(
+            conn, "SELECT source_id FROM memories WHERE memory_id = ?", (mid,)
+        )
+        assert len(memory_rows) == 1
+        assert memory_rows[0]["source_id"] == sid
+
+    def test_lazy_external_source_is_idempotent(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        ingest_memory(
+            conn, user_id="chris", title="a", summary="x", vault_path="p1.md", source_id=sid
+        )
+        ingest_memory(
+            conn, user_id="chris", title="b", summary="y", vault_path="p2.md", source_id=sid
+        )
+        rows = query(
+            conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", (sid,)
+        )
+        assert rows[0]["n"] == 1
+
+    def test_content_hash_dedup_still_works_with_external_source(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        m1 = ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        m2 = ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        assert m1 == m2
+        rows = query(conn, "SELECT COUNT(*) AS n FROM memories", ())
+        assert rows[0]["n"] == 1
+
+    def test_claim_with_novel_source_id_creates_sources_row(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:claim"
+        ingest_claim(
+            conn,
+            user_id="chris",
+            subject="chris",
+            predicate="likes",
+            object_="coffee",
+            source_id=sid,
+        )
+        rows = query(conn, "SELECT * FROM sources WHERE source_id = ?", (sid,))
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "external"
+
+    def test_own_direct_namespace_routes_to_canonical_helper(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        # source_id="direct:<self>" is the legitimate synthetic id for the
+        # caller's own direct source. It must route to _ensure_direct_source
+        # (kind='chat', uri='parallax://direct/...') -- never get tagged
+        # kind='external' which would mislabel the canonical row.
+        ingest_memory(
+            conn,
+            user_id="chris",
+            title="t",
+            summary="s",
+            vault_path="v.md",
+            source_id="direct:chris",
+        )
+        rows = query(
+            conn, "SELECT * FROM sources WHERE source_id = ?", ("direct:chris",)
+        )
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "chat"
+        assert rows[0]["uri"] == "parallax://direct/chris"
+
+    def test_rejects_cross_user_direct_namespace(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        # alice cannot supply source_id="direct:bob" to pre-empt bob's
+        # synthetic direct row. Without this guard, bob's later ingest
+        # with source_id=None would no-op via INSERT OR IGNORE and leave
+        # the direct: row permanently mislabeled with alice's metadata.
+        with pytest.raises(ValueError, match="reserved direct: namespace"):
+            ingest_memory(
+                conn,
+                user_id="alice",
+                title="t",
+                summary="s",
+                vault_path="v.md",
+                source_id="direct:bob",
+            )
+        rows = query(
+            conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", ("direct:bob",)
+        )
+        assert rows[0]["n"] == 0
+
+    def test_rejects_cross_user_direct_namespace_on_claim_path(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        with pytest.raises(ValueError, match="reserved direct: namespace"):
+            ingest_claim(
+                conn,
+                user_id="alice",
+                subject="alice",
+                predicate="claims",
+                object_="bob",
+                source_id="direct:bob",
+            )
 
 
 class TestIngestClaimUpsert:

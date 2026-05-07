@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from parallax.hashing import content_hash
 from parallax.ingest import ingest_claim, ingest_memory, synthetic_direct_source_id
 from parallax.sqlite_store import query
@@ -187,6 +189,62 @@ class TestExternalSourceLazyCreate:
         rows = query(conn, "SELECT * FROM sources WHERE source_id = ?", (sid,))
         assert len(rows) == 1
         assert rows[0]["kind"] == "external"
+
+    def test_own_direct_namespace_routes_to_canonical_helper(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        # source_id="direct:<self>" is the legitimate synthetic id for the
+        # caller's own direct source. It must route to _ensure_direct_source
+        # (kind='chat', uri='parallax://direct/...') -- never get tagged
+        # kind='external' which would mislabel the canonical row.
+        ingest_memory(
+            conn,
+            user_id="chris",
+            title="t",
+            summary="s",
+            vault_path="v.md",
+            source_id="direct:chris",
+        )
+        rows = query(
+            conn, "SELECT * FROM sources WHERE source_id = ?", ("direct:chris",)
+        )
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "chat"
+        assert rows[0]["uri"] == "parallax://direct/chris"
+
+    def test_rejects_cross_user_direct_namespace(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        # alice cannot supply source_id="direct:bob" to pre-empt bob's
+        # synthetic direct row. Without this guard, bob's later ingest
+        # with source_id=None would no-op via INSERT OR IGNORE and leave
+        # the direct: row permanently mislabeled with alice's metadata.
+        with pytest.raises(ValueError, match="reserved direct: namespace"):
+            ingest_memory(
+                conn,
+                user_id="alice",
+                title="t",
+                summary="s",
+                vault_path="v.md",
+                source_id="direct:bob",
+            )
+        rows = query(
+            conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", ("direct:bob",)
+        )
+        assert rows[0]["n"] == 0
+
+    def test_rejects_cross_user_direct_namespace_on_claim_path(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        with pytest.raises(ValueError, match="reserved direct: namespace"):
+            ingest_claim(
+                conn,
+                user_id="alice",
+                subject="alice",
+                predicate="claims",
+                object_="bob",
+                source_id="direct:bob",
+            )
 
 
 class TestIngestClaimUpsert:

@@ -89,6 +89,25 @@ def _ensure_external_source(
     # Idempotent via INSERT OR IGNORE on the source_id PK -- second writes
     # for the same id silently no-op without overwriting the original
     # ``user_id`` / ``ingested_at`` of the registering caller.
+    #
+    # Reserved-namespace handling: ``direct:<user>`` is the canonical
+    # synthetic source for direct input (see ``_ensure_direct_source``). If
+    # the client supplies their own synthetic id (``direct:<self>``), route
+    # to the canonical helper so the row is created with ``kind='chat'`` /
+    # ``uri='parallax://direct/...'`` -- never as kind='external'. Cross-user
+    # ``direct:<other>`` is rejected: without this guard a malicious caller
+    # could pre-empt another user's synthetic row with external metadata,
+    # and a later ingest for that user with ``source_id=None`` would no-op
+    # via INSERT OR IGNORE and leave the direct: row permanently mislabeled.
+    if source_id.startswith("direct:"):
+        own = synthetic_direct_source_id(user_id)
+        if source_id != own:
+            raise ValueError(
+                f"source_id {source_id!r} targets reserved direct: namespace "
+                f"of another user; only {own!r} is permitted for user_id "
+                f"{user_id!r}"
+            )
+        return _ensure_direct_source(conn, user_id)
     insert_source(
         conn,
         Source(

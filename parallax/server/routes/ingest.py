@@ -69,14 +69,22 @@ def post_ingest_memory(
             user_id=user_id,
             deduped=result.deduped,
         )
-    memory_id = ingest_memory(
-        conn,
-        user_id=user_id,
-        title=body.title,
-        summary=body.summary,
-        vault_path=body.vault_path,
-        source_id=body.source_id,
-    )
+    try:
+        memory_id = ingest_memory(
+            conn,
+            user_id=user_id,
+            title=body.title,
+            summary=body.summary,
+            vault_path=body.vault_path,
+            source_id=body.source_id,
+        )
+    except ValueError as exc:
+        # ingest_memory rejects reserved-namespace source_id (e.g. cross-user
+        # ``direct:<other>``) at the boundary; surface as 400 to stay symmetric
+        # with the claim path and the router-enabled branch above.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
     return IngestResponse(kind="memory", id=memory_id, user_id=user_id)
 
 

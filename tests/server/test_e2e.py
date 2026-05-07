@@ -80,6 +80,22 @@ class TestIngestMemory:
         assert resp.status_code == 422
         assert resp.json()["error"] == "validation_error"
 
+    def test_cross_user_direct_namespace_400(self, client: TestClient) -> None:
+        # alice cannot write to bob's reserved direct: namespace; must surface
+        # as 400 (input rejection) not 500 (uncaught ValueError).
+        resp = client.post(
+            "/ingest/memory",
+            json={
+                "user_id": "alice",
+                "title": "t",
+                "summary": "s",
+                "vault_path": "notes/t.md",
+                "source_id": "direct:bob",
+            },
+        )
+        assert resp.status_code == 400
+        assert "reserved direct: namespace" in resp.json()["detail"]
+
 
 class TestIngestClaim:
     def test_201_returns_claim_id(self, client: TestClient) -> None:

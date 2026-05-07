@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from parallax.retrieval.contracts import RetrievalEvidence
-from parallax.router.aphelion_stub import AphelionReadAdapter, AphelionUnreachableError
+from parallax.router.aphelion_adapter import AphelionReadAdapter, AphelionUnreachableError
 from parallax.router.contracts import QueryRequest
 from parallax.router.dual_read import DualReadRouter
 from parallax.router.ports import QueryPort

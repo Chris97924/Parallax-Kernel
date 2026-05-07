@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 
 from parallax.events.conflict_writer import write_conflict_event
 from parallax.obs.log import get_logger
-from parallax.router.aphelion_stub import AphelionUnreachableError
+from parallax.router.aphelion_adapter import AphelionUnreachableError
 from parallax.router.circuit_breaker import get_breaker_state
 from parallax.router.config import is_dual_read_enabled
 from parallax.router.contracts import DualReadResult, QueryRequest

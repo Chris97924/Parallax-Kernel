@@ -78,6 +78,32 @@ def _ensure_direct_source(conn: sqlite3.Connection, user_id: str) -> str:
     return source_id
 
 
+def _ensure_external_source(
+    conn: sqlite3.Connection,
+    user_id: str,
+    source_id: str,
+) -> str:
+    # Lazy-create a sources row for a client-supplied ``source_id`` so the
+    # FK ``memories.source_id REFERENCES sources(source_id)`` (and the
+    # equivalent on ``claims``) always points to a row that already exists.
+    # Idempotent via INSERT OR IGNORE on the source_id PK -- second writes
+    # for the same id silently no-op without overwriting the original
+    # ``user_id`` / ``ingested_at`` of the registering caller.
+    insert_source(
+        conn,
+        Source(
+            source_id=source_id,
+            uri=f"parallax://external/{source_id}",
+            kind="external",
+            content_hash=content_hash(source_id),
+            user_id=user_id,
+            ingested_at=now_iso(),
+            state="ingested",
+        ),
+    )
+    return source_id
+
+
 def ingest_memory(
     conn: sqlite3.Connection,
     *,
@@ -130,6 +156,8 @@ def ingest_memory_with_status(
     try:
         if source_id is None:
             source_id = _ensure_direct_source(conn, user_id)
+        else:
+            source_id = _ensure_external_source(conn, user_id, source_id)
 
         # v0.4.0: hashing.normalize encodes None with a distinct sentinel,
         # so title/summary flow straight through — no boundary conversion,
@@ -256,6 +284,8 @@ def ingest_claim_with_status(
     try:
         if source_id is None:
             source_id = _ensure_direct_source(conn, user_id)
+        else:
+            source_id = _ensure_external_source(conn, user_id, source_id)
 
         # v0.5.0-pre1 / ADR-005: user_id is part of the hash so cross-user
         # same-source same-triple claims stay distinct.

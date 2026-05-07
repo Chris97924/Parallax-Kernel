@@ -106,6 +106,89 @@ class TestIngestMemoryUpsert:
         assert rows2[0]["n"] == 2
 
 
+class TestExternalSourceLazyCreate:
+    """Client-supplied source_id must lazy-create its sources row.
+
+    Regression for the FK gap surfaced by the Orbit warm-boot adapter
+    (`orbit-warmboot:<user>:summary`): the server previously skipped
+    source creation when ``source_id is not None`` and tripped FOREIGN
+    KEY constraint failed on memories.source_id. The fix mirrors the
+    direct-source pattern via ``_ensure_external_source``.
+    """
+
+    def test_memory_with_novel_source_id_creates_sources_row(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        rows = query(conn, "SELECT * FROM sources WHERE source_id = ?", (sid,))
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "external"
+        assert rows[0]["uri"] == f"parallax://external/{sid}"
+        assert rows[0]["user_id"] == "chris"
+
+    def test_memory_with_novel_source_id_persists_memory_row(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        mid = ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        assert isinstance(mid, str) and len(mid) > 0
+        memory_rows = query(
+            conn, "SELECT source_id FROM memories WHERE memory_id = ?", (mid,)
+        )
+        assert len(memory_rows) == 1
+        assert memory_rows[0]["source_id"] == sid
+
+    def test_lazy_external_source_is_idempotent(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        ingest_memory(
+            conn, user_id="chris", title="a", summary="x", vault_path="p1.md", source_id=sid
+        )
+        ingest_memory(
+            conn, user_id="chris", title="b", summary="y", vault_path="p2.md", source_id=sid
+        )
+        rows = query(
+            conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", (sid,)
+        )
+        assert rows[0]["n"] == 1
+
+    def test_content_hash_dedup_still_works_with_external_source(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:summary"
+        m1 = ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        m2 = ingest_memory(
+            conn, user_id="chris", title="t", summary="s", vault_path="v.md", source_id=sid
+        )
+        assert m1 == m2
+        rows = query(conn, "SELECT COUNT(*) AS n FROM memories", ())
+        assert rows[0]["n"] == 1
+
+    def test_claim_with_novel_source_id_creates_sources_row(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        sid = "orbit-warmboot:chris:claim"
+        ingest_claim(
+            conn,
+            user_id="chris",
+            subject="chris",
+            predicate="likes",
+            object_="coffee",
+            source_id=sid,
+        )
+        rows = query(conn, "SELECT * FROM sources WHERE source_id = ?", (sid,))
+        assert len(rows) == 1
+        assert rows[0]["kind"] == "external"
+
+
 class TestIngestClaimUpsert:
     def test_returns_non_empty_id(self, conn: sqlite3.Connection) -> None:
         cid = ingest_claim(conn, user_id="chris", subject="chris", predicate="likes", object_="coffee")

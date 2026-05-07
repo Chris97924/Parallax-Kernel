@@ -87,6 +87,7 @@ Per OQ4 + OQ5 council resolution + Chris-pinned numbers (2026-05-07), the follow
 
 - New retrieval-side observability: `aphelion_request_latency_ms` (p50/p99), `aphelion_unreachable_total` (error budget), `retrieval_evidence_size_bytes`.
 - Update Grafana dashboard with retrieval panels (separate from M4 canary dashboard).
+- `parallax canary --check-state` CLI inspection mode — exits 0 with state name on stdout when `RollbackController.state == CanaryState.RUNNING`; exits non-zero with state name on stderr for `TRIPPED` / `AWAITING_ACK` / pending-hysteresis. Required for E.5 entry-gate verification (replaces interim REPL workaround).
 
 ### 3.3 In-scope docs
 

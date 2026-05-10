@@ -405,3 +405,156 @@ def test_three_consecutive_503_trips_5xx_budget():
     assert result == 75, (
         f"expected 75 (3 consecutive 503s exhaust error_budget=3), got {result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P2 (round-7): 5xx and transport exceptions reset consecutive_client_errors
+# ---------------------------------------------------------------------------
+
+
+def test_interleaved_401_503_does_not_trip_4xx_budget():
+    """Sequence [401, 503, 401, 503, 401, 503] must NOT trip the 4xx budget.
+
+    Each 503 resets consecutive_client_errors to 0, so the 4xx streak
+    never reaches client_error_budget=3. With iterations=6, exits 0.
+    Also must NOT trip 5xx budget (each 401 already resets that, per round-6).
+    """
+    loader = _load_module()
+
+    responses = [
+        _make_response(401),
+        _make_response(503),
+        _make_response(401),
+        _make_response(503),
+        _make_response(401),
+        _make_response(503),
+    ]
+
+    mock_client = _mock_client_factory(responses)
+
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1"],
+            user_id="test-user",
+            interval_seconds=0,
+            error_budget=3,
+            client_error_budget=3,
+            iterations=6,
+        )
+
+    assert result == 0, (
+        f"expected 0 (5xx resets 4xx streak; no budget tripped), got {result}"
+    )
+
+
+def test_503_resets_4xx_streak_allowing_continued_401s():
+    """Sequence [401, 401, 503, 401] must NOT trip the 4xx budget.
+
+    After 2 consecutive 401s (streak=2), the 503 resets consecutive_client_errors
+    to 0. The trailing 401 then counts as 1, never reaching client_error_budget=3.
+    With iterations=4, exits 0.
+    """
+    loader = _load_module()
+
+    responses = [
+        _make_response(401),
+        _make_response(401),
+        _make_response(503),
+        _make_response(401),
+    ]
+
+    mock_client = _mock_client_factory(responses)
+
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1"],
+            user_id="test-user",
+            interval_seconds=0,
+            error_budget=30,
+            client_error_budget=3,
+            iterations=4,
+        )
+
+    assert result == 0, (
+        f"expected 0 (503 resets 4xx counter; trailing 401 is streak=1), got {result}"
+    )
+
+
+def test_three_consecutive_401_still_trips_4xx_budget():
+    """Sequence [401, 401, 401] with client_error_budget=3 MUST trip exit 75.
+
+    Confirms the reset only fires on 5xx/transport — a genuine unbroken
+    4xx streak still exhausts the budget.
+    """
+    loader = _load_module()
+
+    responses = [_make_response(401)] * 10
+
+    mock_client = _mock_client_factory(responses)
+
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1"],
+            user_id="test-user",
+            interval_seconds=0,
+            error_budget=30,
+            client_error_budget=3,
+            iterations=10,
+        )
+
+    assert result == 75, (
+        f"expected 75 (3 consecutive 401s exhaust client_error_budget=3), got {result}"
+    )
+
+
+def test_transport_error_resets_4xx_streak():
+    """Sequence [401, 401, ConnectError, 401] must NOT trip the 4xx budget.
+
+    The ConnectError (httpx.HTTPError) resets consecutive_client_errors to 0.
+    The trailing 401 then counts as streak=1, never reaching client_error_budget=3.
+    With iterations=4, exits 0 (error_budget=30 is not tripped by 1 transport error).
+    """
+    loader = _load_module()
+
+    connect_error = httpx.ConnectError("connection refused")
+    responses_or_exc = [
+        _make_response(401),
+        _make_response(401),
+        connect_error,  # transport exception — resets 4xx streak
+        _make_response(401),
+    ]
+
+    mock_client = MagicMock()
+    mock_client.__enter__ = lambda s: s
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client.close = MagicMock()
+    call_count = [0]
+
+    def _get(url, **kwargs):
+        idx = call_count[0] % len(responses_or_exc)
+        call_count[0] += 1
+        item = responses_or_exc[idx]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    mock_client.get.side_effect = _get
+
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1"],
+            user_id="test-user",
+            interval_seconds=0,
+            error_budget=30,
+            client_error_budget=3,
+            iterations=4,
+        )
+
+    assert result == 0, (
+        f"expected 0 (ConnectError resets 4xx streak; trailing 401 is streak=1), "
+        f"got {result}"
+    )

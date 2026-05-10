@@ -167,6 +167,7 @@ def run_loader(
                 status = response.status_code
                 if status >= 500:
                     consecutive_errors += 1
+                    consecutive_client_errors = 0  # 5xx breaks any 4xx streak
                     LOG.warning(
                         "synth_qry key=%s status=%d consecutive_5xx=%d",
                         key, status, consecutive_errors,
@@ -218,6 +219,7 @@ def run_loader(
                         return 75
             except httpx.HTTPError as exc:
                 consecutive_errors += 1
+                consecutive_client_errors = 0  # transport error breaks any 4xx streak
                 LOG.error(
                     "synth_qry key=%s exc=%s msg=%s consecutive=%d",
                     key,

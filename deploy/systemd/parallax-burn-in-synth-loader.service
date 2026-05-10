@@ -13,6 +13,9 @@ Description=Parallax Apex M4 burn-in synthetic loader (1 qps, localhost)
 After=network-online.target
 Wants=network-online.target
 Documentation=https://github.com/Chris97924/Parallax-Kernel/blob/main-next/docs/m4-prep/traffic-gap-resolution.md
+# Cap restart storms so a wedged endpoint does not loop fast.
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 Type=simple
@@ -31,9 +34,6 @@ StandardError=journal
 # exhaustion invites systemd to re-launch.
 Restart=always
 RestartSec=10s
-# Cap restart storms so a wedged endpoint does not loop fast.
-StartLimitIntervalSec=300
-StartLimitBurst=20
 
 [Install]
 WantedBy=default.target

@@ -160,7 +160,10 @@ def run_loader(
             key = sample_keys[idx % len(sample_keys)]
             idx += 1
             try:
-                response = client.get(f"{endpoint}?kind=recent&q={key}&user_id={user_id}")
+                response = client.get(
+                    endpoint,
+                    params={"kind": "recent", "q": key, "user_id": user_id},
+                )
                 status = response.status_code
                 if status >= 500:
                     consecutive_errors += 1
@@ -176,6 +179,7 @@ def run_loader(
                         )
                         return 75
                 elif response.is_error:
+                    consecutive_errors = 0
                     consecutive_client_errors += 1
                     LOG.warning(
                         "synth_qry key=%s status=%d consecutive_4xx=%d",
@@ -194,8 +198,9 @@ def run_loader(
                     consecutive_errors = 0
                     consecutive_client_errors = 0
                 else:
-                    # 3xx redirect — treat as misconfiguration (counters NOT
-                    # reset); surfaces as client error to trip the budget.
+                    # 3xx redirect — resets 5xx streak but increments
+                    # client-error counter (treated as misconfiguration).
+                    consecutive_errors = 0
                     consecutive_client_errors += 1
                     LOG.warning(
                         "synth_qry key=%s status=%d (redirect; endpoint "

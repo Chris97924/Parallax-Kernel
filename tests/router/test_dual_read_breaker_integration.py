@@ -16,7 +16,7 @@ import threading
 import pytest
 
 from parallax.retrieval.contracts import RetrievalEvidence
-from parallax.router.aphelion_stub import AphelionUnreachableError
+from parallax.router.aphelion_adapter import AphelionUnreachableError
 from parallax.router.circuit_breaker import get_breaker_state
 from parallax.router.contracts import DualReadResult, QueryRequest
 from parallax.router.dual_read import DualReadRouter

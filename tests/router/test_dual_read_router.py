@@ -24,7 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from parallax.retrieval.contracts import RetrievalEvidence
-from parallax.router.aphelion_stub import AphelionReadAdapter, AphelionUnreachableError
+from parallax.router.aphelion_adapter import AphelionReadAdapter, AphelionUnreachableError
 from parallax.router.contracts import DualReadResult, QueryRequest
 from parallax.router.discrepancy_live import LiveDiscrepancyCounter
 from parallax.router.dual_read import DualReadRouter

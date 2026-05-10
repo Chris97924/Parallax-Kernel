@@ -277,6 +277,35 @@ def test_schema_error_surfaces_as_unreachable() -> None:
     assert excinfo.value.reason == "claim_schema_error"
 
 
+def test_loader_runtime_error_surfaces_as_unreachable() -> None:
+    """A claim_loader that raises a non-contract exception must be wrapped.
+
+    Without wrapping, DualReadRouter classifies the failure as ``primary_only``
+    and loses the ``aphelion_unreachable`` signal expected for secondary
+    outages (filesystem/network errors once M6/M7 ingest lands).
+    """
+
+    def crashing_loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
+        raise RuntimeError("synthetic loader I/O failure")
+
+    adapter = AphelionReadAdapter(claim_loader=crashing_loader)
+    with pytest.raises(AphelionUnreachableError) as excinfo:
+        adapter.query(_request())
+    assert excinfo.value.reason == "claim_loader_error"
+
+
+def test_loader_unreachable_passthrough_preserves_reason() -> None:
+    """Loader-side AphelionUnreachableError keeps its reason verbatim."""
+
+    def precise_loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
+        raise AphelionUnreachableError("unsafe_archive")
+
+    adapter = AphelionReadAdapter(claim_loader=precise_loader)
+    with pytest.raises(AphelionUnreachableError) as excinfo:
+        adapter.query(_request())
+    assert excinfo.value.reason == "unsafe_archive"
+
+
 def test_failed_query_clears_last_envelope_and_last_audit_row() -> None:
     """A failing query MUST reset cached envelope/audit state.
 

@@ -61,6 +61,7 @@ class AphelionUnreachableError(Exception):
     ``reason`` is a short tag used for outcome classification in DualReadRouter:
       - ``"timeout"`` — secondary exceeded secondary_timeout_ms
       - ``"connection_error"`` — network/transport failure (reserved for future)
+      - ``"claim_loader_error"`` — claim_loader raised before R4 detection ran
       - ``"claim_schema_error"`` — v0.3 validator rejected a candidate frontmatter
       - ``"envelope_checksum_mismatch"`` — envelope round-trip failed
       - ``"audit_row_invalid"`` — canonicalize_row rejected the row
@@ -168,7 +169,17 @@ class AphelionReadAdapter:
         self.last_audit_row = None
 
         subject = _resolve_subject(request)
-        candidates = tuple(self._claim_loader(request))
+        try:
+            candidates = tuple(self._claim_loader(request))
+        except AphelionUnreachableError:
+            # Loader pre-raised the contract error (e.g. unsafe_archive,
+            # unsigned_package) — let it propagate verbatim without remapping.
+            raise
+        except Exception as exc:
+            # Wrap arbitrary loader failures (filesystem / unpack / network
+            # once M6/M7 lands) so DualReadRouter classifies them as
+            # ``aphelion_unreachable`` rather than ``primary_only``.
+            raise AphelionUnreachableError("claim_loader_error") from exc
 
         for claim in candidates:
             try:

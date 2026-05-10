@@ -137,6 +137,8 @@ def _validate_optional_pairing(row: Mapping[str, Any]) -> None:
 
     ``aphelion_hash`` + ``local_hash`` only on ``divergence``.
     ``reason_code`` only on ``error`` or ``divergence``.
+    Both checks are bidirectional: present-without-correct-outcome is rejected
+    AND correct-outcome-without-required-field is rejected.
     """
     outcome = row.get("outcome")
     has_diff_hashes = "aphelion_hash" in row or "local_hash" in row
@@ -144,9 +146,18 @@ def _validate_optional_pairing(row: Mapping[str, Any]) -> None:
         raise AuditRowValidationError(
             "aphelion_hash/local_hash present without outcome='divergence'"
         )
+    if outcome == "divergence":
+        if "aphelion_hash" not in row or "local_hash" not in row:
+            raise AuditRowValidationError(
+                "outcome='divergence' requires both aphelion_hash and local_hash"
+            )
     if "reason_code" in row and outcome not in ("error", "divergence"):
         raise AuditRowValidationError(
             "reason_code present without outcome in {error, divergence}"
+        )
+    if outcome in ("error", "divergence") and "reason_code" not in row:
+        raise AuditRowValidationError(
+            f"outcome={outcome!r} requires reason_code to be present"
         )
 
 

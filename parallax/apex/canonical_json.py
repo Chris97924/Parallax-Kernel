@@ -8,7 +8,7 @@ Same rules as ``aphelion-graph/spec/canonical-serialization.md`` Rule 1
   3. UTF-8 with NFC normalization on **keys AND string values**
   4. No floats — confidence and other numerics serialize via the
      audit-row schema as strings or ints
-  5. Optional fields serialized only when present (never as ``null``)
+  5. Null values preserved verbatim; callers omit optional fields before hashing
 
 This module is small enough to live alongside the envelope code rather
 than carry a runtime dep on ``aphelion-graph``. Both halves of the wire
@@ -41,15 +41,13 @@ def _nfc(value: Any) -> Any:
 def canonical_dumps(obj: Any) -> bytes:
     """Serialize ``obj`` as canonical UTF-8 JSON bytes.
 
-    Drops ``None`` values from top-level mappings — optional audit-row
-    fields are absent rather than serialized as ``null`` (spec §6.4
-    rule 4). Nested dict ``None`` values are preserved (the caller is
-    responsible for cleaning).
+    Null values are preserved verbatim so that ``{"k": null}`` and ``{}``
+    produce different digests — required for cross-implementation byte-match
+    interop. Callers that want to omit optional fields must exclude them from
+    the dict before calling this function (``canonicalize_row`` does this via
+    its own None-filter before hashing).
     """
-    cleaned = obj
-    if isinstance(obj, dict):
-        cleaned = {k: v for k, v in obj.items() if v is not None}
-    cleaned = _nfc(cleaned)
+    cleaned = _nfc(obj)
     # ``allow_nan=False`` enforces no NaN/Infinity. ``sort_keys=True`` +
     # ``separators=(',', ':')`` enforce keys-sorted + no-whitespace.
     return json.dumps(

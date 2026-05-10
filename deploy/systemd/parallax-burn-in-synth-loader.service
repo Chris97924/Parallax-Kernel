@@ -1,0 +1,38 @@
+[Unit]
+# Apex M4 burn-in synthetic loader — keeps B1/B2 metric series alive
+# during the 14-day burn-in when natural production traffic is zero.
+# Spec: docs/m4-prep/traffic-gap-resolution.md §3.1, §4.6, §5.
+#
+# This is a USER unit. Install as:
+#   mkdir -p ~/.config/systemd/user/
+#   cp deploy/systemd/parallax-burn-in-synth-loader.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now parallax-burn-in-synth-loader.service
+#   loginctl enable-linger chris    # so user services survive logout
+Description=Parallax Apex M4 burn-in synthetic loader (1 qps, localhost)
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/Chris97924/Parallax-Kernel/blob/main-next/docs/m4-prep/traffic-gap-resolution.md
+
+[Service]
+Type=simple
+# Endpoint + fixture are env-driven so the unit file is environment-
+# agnostic. Operator overrides via:
+#   ~/.config/systemd/user/parallax-burn-in-synth-loader.service.d/override.conf
+Environment=PARALLAX_BURN_IN_ENDPOINT=http://127.0.0.1:8000/v1/dual-read
+# PARALLAX_BURN_IN_FIXTURE MUST be set in an override.conf — there is no
+# safe default. The script aborts loudly if it is unset.
+ExecStart=/usr/bin/env python3 %h/parallax-kernel/scripts/burn-in-synth-loader.py
+WorkingDirectory=%h/parallax-kernel
+StandardOutput=journal
+StandardError=journal
+# Restart policy from spec §5: exit 75 (EX_TEMPFAIL) on error-budget
+# exhaustion invites systemd to re-launch.
+Restart=always
+RestartSec=10s
+# Cap restart storms so a wedged endpoint does not loop fast.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Install]
+WantedBy=default.target

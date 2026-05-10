@@ -63,6 +63,11 @@ class DodVerdict(enum.StrEnum):
     PASS = "pass"
     FAIL = "fail"
     INSUFFICIENT_DATA = "insufficient_data"
+    # Spec ``docs/m4-prep/traffic-gap-resolution.md`` §3.4: returned by
+    # B1/B2 evaluators when synthetic/natural split logic has not yet
+    # landed end-to-end. Distinct from FAIL — the metric cannot be
+    # evaluated, period; not a known regression.
+    PENDING_IMPLEMENTATION = "pending_implementation"
 
 
 # Spec §3.3 — single source of truth for DoD thresholds. Mirrors the
@@ -185,20 +190,31 @@ def _verdict_for(metric: DodMetric, observed: float, sample_size: int) -> DodVer
 
 
 def _aggregate(verdicts: Iterable[DodVerdict]) -> DodVerdict:
-    """PASS if all PASS; FAIL if any FAIL; otherwise INSUFFICIENT_DATA."""
+    """Aggregate per-metric verdicts into an overall stage verdict.
+
+    Order of precedence: FAIL > PENDING_IMPLEMENTATION > INSUFFICIENT_DATA > PASS.
+    PENDING_IMPLEMENTATION trumps INSUFFICIENT_DATA because a metric we
+    cannot evaluate is a sharper signal than a metric with too few
+    observations — extending the window helps the latter, not the former.
+    """
     seen_fail = False
+    seen_pending = False
     seen_insufficient = False
     seen_any = False
     for v in verdicts:
         seen_any = True
         if v == DodVerdict.FAIL:
             seen_fail = True
+        elif v == DodVerdict.PENDING_IMPLEMENTATION:
+            seen_pending = True
         elif v == DodVerdict.INSUFFICIENT_DATA:
             seen_insufficient = True
     if not seen_any:
         return DodVerdict.INSUFFICIENT_DATA
     if seen_fail:
         return DodVerdict.FAIL
+    if seen_pending:
+        return DodVerdict.PENDING_IMPLEMENTATION
     if seen_insufficient:
         return DodVerdict.INSUFFICIENT_DATA
     return DodVerdict.PASS

@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, Final
 
 from parallax.apex.canonical_json import canonical_dumps, sha256_hex
@@ -239,6 +240,10 @@ def parse_envelope(raw: Mapping[str, Any]) -> Envelope:
             f"checksum mismatch: header={checksum} computed={expected}"
         )
 
+    # Freeze the top-level payload mapping so callers cannot mutate
+    # env.payload post-validation while env.checksum still reflects the
+    # old bytes. dict(payload) breaks aliasing with the caller's input;
+    # MappingProxyType blocks __setitem__/__delitem__ on env.payload.
     return Envelope(
         envelope_version=envelope_version,
         schema_version=schema_version,
@@ -247,6 +252,6 @@ def parse_envelope(raw: Mapping[str, Any]) -> Envelope:
         source=source,
         audit_db_ref=audit_db_ref,
         payload_type=payload_type,
-        payload=dict(payload),
+        payload=MappingProxyType(dict(payload)),
         checksum=checksum,
     )

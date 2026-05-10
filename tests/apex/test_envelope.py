@@ -234,6 +234,37 @@ class TestChecksumSerializationTaxonomy:
                 parse_envelope(env)
 
 
+# ---- Envelope.payload immutability (round-7 P2) -----------------------------
+
+
+@pytest.mark.unit
+class TestEnvelopePayloadImmutability:
+    def test_payload_is_immutable_after_parse(self) -> None:
+        # Regression: round-7 P2 — parse_envelope used to return Envelope
+        # backed by a plain dict; callers could mutate env.payload while
+        # env.checksum still reflected the old bytes. Top-level payload
+        # mapping must be read-only.
+        env = parse_envelope(_valid_envelope())
+
+        with pytest.raises(TypeError):
+            env.payload["claim_id"] = "tampered"  # type: ignore[index]
+
+        with pytest.raises(TypeError):
+            env.payload["new_key"] = "x"  # type: ignore[index]
+
+        with pytest.raises(TypeError):
+            del env.payload["claim_id"]  # type: ignore[attr-defined]
+
+    def test_payload_unaliased_from_caller_input(self) -> None:
+        # dict() copy + MappingProxyType wrap means mutating the original
+        # raw['payload'] post-parse must NOT change env.payload top-level.
+        raw = _valid_envelope()
+        env = parse_envelope(raw)
+        original_keys = set(env.payload.keys())
+        raw["payload"]["injected"] = "x"
+        assert set(env.payload.keys()) == original_keys
+
+
 # ---- created_at semantic validation (round-3 P2) ----------------------------
 
 

@@ -189,10 +189,28 @@ def run_loader(
                             client_error_budget,
                         )
                         return 75
-                else:
+                elif status < 300:
                     LOG.info("synth_qry key=%s status=%d", key, status)
                     consecutive_errors = 0
                     consecutive_client_errors = 0
+                else:
+                    # 3xx redirect — treat as misconfiguration (counters NOT
+                    # reset); surfaces as client error to trip the budget.
+                    consecutive_client_errors += 1
+                    LOG.warning(
+                        "synth_qry key=%s status=%d (redirect; endpoint "
+                        "misconfigured?) consecutive_4xx=%d",
+                        key, status, consecutive_client_errors,
+                    )
+                    if consecutive_client_errors >= client_error_budget:
+                        LOG.critical(
+                            "synth loader exhausted 4xx budget=%d "
+                            "(persistent redirect, e.g. trailing-slash "
+                            "misconfig); exiting so systemd Restart=always "
+                            "re-launches",
+                            client_error_budget,
+                        )
+                        return 75
             except httpx.HTTPError as exc:
                 consecutive_errors += 1
                 LOG.error(

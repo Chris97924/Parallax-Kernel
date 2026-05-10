@@ -228,7 +228,12 @@ def parse_envelope(raw: Mapping[str, Any]) -> Envelope:
             f"checksum must be 64-char lowercase sha256 hex, got {checksum!r}"
         )
 
-    expected = compute_checksum(payload)
+    try:
+        expected = compute_checksum(payload)
+    except (ValueError, TypeError) as exc:
+        raise EnvelopeValidationError(
+            f"payload is not canonically serializable: {exc}"
+        ) from exc
     if expected != checksum:
         raise EnvelopeChecksumError(
             f"checksum mismatch: header={checksum} computed={expected}"

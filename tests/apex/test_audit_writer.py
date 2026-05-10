@@ -191,6 +191,13 @@ class TestFieldFormatValidation:
             with pytest.raises(AuditRowValidationError, match="signer_id"):
                 canonicalize_row(_valid_row(signer_id=bad))
 
+    def test_session_id_non_string_rejected(self) -> None:
+        # Regression: round-4 P2 — session_id symmetric gap to signer_id;
+        # REQUIRED_FIELDS only checks presence, not type.
+        for bad in (0, False, {}, []):
+            with pytest.raises(AuditRowValidationError, match="session_id"):
+                canonicalize_row(_valid_row(session_id=bad))
+
     # P2: Divergence hash format -------------------------------------------------
 
     def test_aphelion_hash_non_hex_rejected(self) -> None:

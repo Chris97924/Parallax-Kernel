@@ -200,6 +200,26 @@ class TestChecksum:
             parse_envelope(env)
 
 
+# ---- Checksum serialisation error taxonomy (round-4 P1) ---------------------
+
+
+@pytest.mark.unit
+class TestChecksumSerializationTaxonomy:
+    def test_payload_non_serializable_raises_envelope_validation_error(self) -> None:
+        # Regression: round-4 P1 — compute_checksum(payload) can raise raw
+        # ValueError/TypeError on NaN/Infinity/non-serializable objects;
+        # parse_envelope must map these to EnvelopeValidationError.
+        for bad_payload in (
+            {"value": float("nan")},
+            {"value": float("inf")},
+            {"value": float("-inf")},
+            {"value": {1, 2, 3}},  # set is not JSON-serialisable
+        ):
+            env = _valid_envelope(payload=bad_payload)
+            with pytest.raises(EnvelopeValidationError, match="canonically serializable"):
+                parse_envelope(env)
+
+
 # ---- created_at semantic validation (round-3 P2) ----------------------------
 
 

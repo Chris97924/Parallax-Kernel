@@ -156,6 +156,13 @@ def _validate_reason_code(row: Mapping[str, Any]) -> None:
 
 def _validate_field_formats(row: Mapping[str, Any]) -> None:
     """Validate field formats for fields with structural constraints (spec §6.1)."""
+    # session_id: required string, may be empty (no UUID/hex constraint per spec §6.1).
+    session_id = row.get("session_id", "")
+    if not isinstance(session_id, str):
+        raise AuditRowValidationError(
+            f"'session_id' must be a string, got {type(session_id).__name__}"
+        )
+
     # signer_id: required string, may be empty (no UUID/hex constraint per spec §6.1).
     signer_id = row.get("signer_id", "")
     if not isinstance(signer_id, str):

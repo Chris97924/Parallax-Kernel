@@ -19,11 +19,29 @@ plain ``assert`` (asserts are stripped under ``python -O``). The
 
 from __future__ import annotations
 
+import re
+import uuid as _uuid_mod
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final
 
 from parallax.apex.canonical_json import canonical_dumps, sha256_hex
+
+# Compiled once — SHA-256 hex: exactly 64 lowercase hex chars.
+_SHA256_HEX_RE: Final = re.compile(r"^[0-9a-f]{64}$")
+
+# Exact format: YYYY-MM-DDTHH:MM:SSZ (20 chars, Z suffix, second precision).
+_TS_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
+_TS_LENGTH: Final = 20
+
+
+def _validate_sha256_hex(value: str, field_name: str) -> None:
+    """Raise AuditRowValidationError if *value* is not a 64-char lowercase SHA-256 hex."""
+    if not _SHA256_HEX_RE.match(value):
+        raise AuditRowValidationError(
+            f"{field_name!r} must be a 64-char lowercase SHA-256 hex string, got {value!r}"
+        )
 
 REQUIRED_FIELDS: Final = (
     "claim_id",
@@ -132,6 +150,79 @@ def _validate_reason_code(row: Mapping[str, Any]) -> None:
         )
 
 
+def _validate_field_formats(row: Mapping[str, Any]) -> None:
+    """Validate field formats for fields with structural constraints (spec §6.1)."""
+    # claim_id: UUID v7
+    claim_id = row.get("claim_id", "")
+    if claim_id:
+        try:
+            parsed = _uuid_mod.UUID(claim_id)
+        except ValueError:
+            raise AuditRowValidationError(
+                f"'claim_id' must be a valid UUID, got {claim_id!r}"
+            )
+        if parsed.version != 7:
+            raise AuditRowValidationError(
+                f"'claim_id' must be UUID v7, got version {parsed.version}"
+            )
+
+    # package_id: UUID v7
+    package_id = row.get("package_id", "")
+    if package_id:
+        try:
+            parsed = _uuid_mod.UUID(package_id)
+        except ValueError:
+            raise AuditRowValidationError(
+                f"'package_id' must be a valid UUID, got {package_id!r}"
+            )
+        if parsed.version != 7:
+            raise AuditRowValidationError(
+                f"'package_id' must be UUID v7, got version {parsed.version}"
+            )
+
+    # envelope_message_id: UUID v4
+    emid = row.get("envelope_message_id", "")
+    if emid:
+        try:
+            parsed = _uuid_mod.UUID(emid)
+        except ValueError:
+            raise AuditRowValidationError(
+                f"'envelope_message_id' must be a valid UUID, got {emid!r}"
+            )
+        if parsed.version != 4:
+            raise AuditRowValidationError(
+                f"'envelope_message_id' must be UUID v4, got version {parsed.version}"
+            )
+
+    # ts: exactly 20 chars, Z suffix, second precision ISO 8601 UTC
+    ts = row.get("ts", "")
+    if ts:
+        if len(ts) != _TS_LENGTH or not ts.endswith("Z"):
+            raise AuditRowValidationError(
+                f"'ts' must be ISO 8601 UTC with Z suffix and second precision "
+                f"(20 chars, e.g. '2026-05-09T14:23:11Z'), got {ts!r}"
+            )
+        try:
+            datetime.strptime(ts, _TS_FORMAT)
+        except ValueError:
+            raise AuditRowValidationError(
+                f"'ts' is not a valid ISO 8601 UTC timestamp, got {ts!r}"
+            )
+
+    # signer_manifest_digest: sha256 hex OR empty string (unsigned packages)
+    smd = row.get("signer_manifest_digest", "")
+    if smd:  # non-empty: must be valid sha256 hex
+        _validate_sha256_hex(smd, "signer_manifest_digest")
+
+
+def _validate_divergence_hashes(row: Mapping[str, Any]) -> None:
+    """Validate aphelion_hash and local_hash are SHA-256 hex when present (P2)."""
+    for field in ("aphelion_hash", "local_hash"):
+        value = row.get(field)
+        if value is not None:
+            _validate_sha256_hex(value, field)
+
+
 def _validate_optional_pairing(row: Mapping[str, Any]) -> None:
     """Optional fields appear only on relevant outcomes (spec §6.1).
 
@@ -173,7 +264,9 @@ def canonicalize_row(row: Mapping[str, Any]) -> AuditRow:
     _validate_outcome(cleaned)
     _validate_source(cleaned)
     _validate_reason_code(cleaned)
+    _validate_field_formats(cleaned)
     _validate_optional_pairing(cleaned)
+    _validate_divergence_hashes(cleaned)
 
     # Empty-string-valid required fields: signer_id + signer_manifest_digest
     # for unsigned packages. All other required fields must be non-empty

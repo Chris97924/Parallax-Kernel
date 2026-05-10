@@ -103,6 +103,112 @@ class TestRowValidation:
         canonicalize_row(row)
 
 
+# ---- Format validation (P1 + P2) -------------------------------------------
+
+
+@pytest.mark.unit
+class TestFieldFormatValidation:
+    """Round-2 Codex P1: format validators for structured required fields."""
+
+    # UUID fields ----------------------------------------------------------------
+
+    def test_claim_id_non_uuid_rejected(self) -> None:
+        with pytest.raises(AuditRowValidationError, match="claim_id"):
+            canonicalize_row(_valid_row(claim_id="not-a-uuid"))
+
+    def test_claim_id_uuid_v4_rejected(self) -> None:
+        # claim_id must be v7, not v4.
+        with pytest.raises(AuditRowValidationError, match="claim_id"):
+            canonicalize_row(_valid_row(claim_id="b3d7e2a1-4f8c-4b9d-8e3a-12c456789abc"))
+
+    def test_package_id_non_uuid_rejected(self) -> None:
+        with pytest.raises(AuditRowValidationError, match="package_id"):
+            canonicalize_row(_valid_row(package_id="not-a-uuid"))
+
+    def test_package_id_uuid_v4_rejected(self) -> None:
+        with pytest.raises(AuditRowValidationError, match="package_id"):
+            canonicalize_row(_valid_row(package_id="b3d7e2a1-4f8c-4b9d-8e3a-12c456789abc"))
+
+    def test_envelope_message_id_non_uuid_rejected(self) -> None:
+        with pytest.raises(AuditRowValidationError, match="envelope_message_id"):
+            canonicalize_row(_valid_row(envelope_message_id="not-a-uuid"))
+
+    def test_envelope_message_id_uuid_v7_rejected(self) -> None:
+        # envelope_message_id must be v4, not v7.
+        with pytest.raises(AuditRowValidationError, match="envelope_message_id"):
+            canonicalize_row(_valid_row(envelope_message_id="0193e2b1-0001-7000-8000-000000000001"))
+
+    # ISO timestamp field --------------------------------------------------------
+
+    def test_ts_non_iso_rejected(self) -> None:
+        with pytest.raises(AuditRowValidationError, match="ts"):
+            canonicalize_row(_valid_row(ts="not-a-date"))
+
+    def test_ts_missing_z_suffix_rejected(self) -> None:
+        # +00:00 offset instead of Z — wrong format per spec.
+        with pytest.raises(AuditRowValidationError, match="ts"):
+            canonicalize_row(_valid_row(ts="2026-05-09T14:23:11+00:00"))
+
+    def test_ts_with_milliseconds_rejected(self) -> None:
+        # Spec: second precision only, exactly 20 chars.
+        with pytest.raises(AuditRowValidationError, match="ts"):
+            canonicalize_row(_valid_row(ts="2026-05-09T14:23:11.123Z"))
+
+    def test_ts_valid_format_accepted(self) -> None:
+        # Should pass — exact spec format.
+        canonicalize_row(_valid_row(ts="2026-05-09T14:23:11Z"))
+
+    # SHA-256 hex fields ---------------------------------------------------------
+
+    def test_signer_manifest_digest_non_hex_rejected(self) -> None:
+        with pytest.raises(AuditRowValidationError, match="signer_manifest_digest"):
+            canonicalize_row(_valid_row(signer_manifest_digest="not-hex"))
+
+    def test_signer_manifest_digest_too_short_rejected(self) -> None:
+        with pytest.raises(AuditRowValidationError, match="signer_manifest_digest"):
+            canonicalize_row(_valid_row(signer_manifest_digest="a" * 63))
+
+    def test_signer_manifest_digest_uppercase_rejected(self) -> None:
+        # Spec requires lowercase hex.
+        with pytest.raises(AuditRowValidationError, match="signer_manifest_digest"):
+            canonicalize_row(_valid_row(signer_manifest_digest="A" * 64))
+
+    def test_signer_manifest_digest_empty_string_still_valid(self) -> None:
+        # Unsigned packages use empty string — must NOT trigger hex validation.
+        canonicalize_row(_valid_row(signer_manifest_digest="", signer_id=""))
+
+    # P2: Divergence hash format -------------------------------------------------
+
+    def test_aphelion_hash_non_hex_rejected(self) -> None:
+        row = _valid_row(
+            outcome="divergence",
+            aphelion_hash="not-hex",
+            local_hash="c" * 64,
+            reason_code="claim.r4_subject_missing",
+        )
+        with pytest.raises(AuditRowValidationError, match="aphelion_hash"):
+            canonicalize_row(row)
+
+    def test_local_hash_non_hex_rejected(self) -> None:
+        row = _valid_row(
+            outcome="divergence",
+            aphelion_hash="b" * 64,
+            local_hash="UPPERCASE" + "x" * 55,
+            reason_code="claim.r4_subject_missing",
+        )
+        with pytest.raises(AuditRowValidationError, match="local_hash"):
+            canonicalize_row(row)
+
+    def test_divergence_valid_hashes_accepted(self) -> None:
+        row = _valid_row(
+            outcome="divergence",
+            aphelion_hash="b" * 64,
+            local_hash="c" * 64,
+            reason_code="claim.r4_subject_missing",
+        )
+        canonicalize_row(row)
+
+
 # ---- Canonical bytes + sha256 ------------------------------------------------
 
 

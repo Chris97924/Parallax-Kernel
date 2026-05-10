@@ -97,6 +97,12 @@ class TestRowValidation:
         with pytest.raises(AuditRowValidationError, match="schema_version bump"):
             canonicalize_row(_valid_row(future_field="x"))
 
+    def test_unknown_field_with_none_value_rejected(self) -> None:
+        # Regression: round-6 P2 — a typo'd field set to None used to bypass
+        # the strict unknown-key check because the None-filter ran before it.
+        with pytest.raises(AuditRowValidationError, match="schema_version bump"):
+            canonicalize_row(_valid_row(future_field=None))
+
     def test_none_values_treated_as_absent(self) -> None:
         row = _valid_row(reason_code=None, aphelion_hash=None)
         # None -> dropped, so optional pairing checks pass on outcome=hit

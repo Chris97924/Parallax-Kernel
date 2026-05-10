@@ -298,6 +298,18 @@ def canonicalize_row(row: Mapping[str, Any]) -> AuditRow:
     treated as absent (spec §6.1: empty string vs absent — empty string
     is valid for required fields, ``None`` is interpreted as "omit").
     """
+    # Reject unknown top-level keys against the RAW input so that a
+    # typo'd field set to None cannot bypass strict-schema enforcement
+    # by being filtered out below. Future fields require an envelope
+    # schema_version bump per spec §6.2.
+    allowed = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS)
+    extra = set(row.keys()) - allowed
+    if extra:
+        raise AuditRowValidationError(
+            f"unknown audit-row field {sorted(extra)[0]!r}; "
+            "new fields require envelope schema_version bump"
+        )
+
     cleaned = {k: v for k, v in row.items() if v is not None}
     _validate_required(cleaned)
     _validate_outcome(cleaned)
@@ -319,17 +331,6 @@ def canonicalize_row(row: Mapping[str, Any]) -> AuditRow:
             raise AuditRowValidationError(
                 f"required field {name!r} must not be empty string"
             )
-
-    # Reject unknown top-level keys to keep the sha256 stable across
-    # implementations. Future fields require an envelope schema_version
-    # bump per spec §6.2.
-    allowed = set(REQUIRED_FIELDS) | set(OPTIONAL_FIELDS)
-    extra = set(cleaned.keys()) - allowed
-    if extra:
-        raise AuditRowValidationError(
-            f"unknown audit-row field {sorted(extra)[0]!r}; "
-            "new fields require envelope schema_version bump"
-        )
 
     # Freeze the backing mapping so callers cannot mutate row.data
     # post-validation and silently invalidate sha256_hex().

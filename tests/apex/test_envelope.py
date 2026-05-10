@@ -76,6 +76,20 @@ class TestCanonicalSerialization:
         b = canonical_dumps({decomposed_key: decomposed_val})
         assert a == b
 
+    def test_nfc_key_collision_raises(self) -> None:
+        # Regression: round-6 P1 — two distinct keys that NFC-normalize to
+        # the same string must raise instead of silently last-write-wins.
+        composed = "é"  # é (U+00E9)
+        decomposed = "é"  # e + combining acute
+        with pytest.raises(ValueError, match="NFC key collision"):
+            canonical_dumps({composed: 1, decomposed: 2})
+
+    def test_nfc_key_collision_in_nested_dict_raises(self) -> None:
+        # Regression: round-6 P1 — recursion must also catch collisions
+        # in nested dicts, not just the top level.
+        with pytest.raises(ValueError, match="NFC key collision"):
+            canonical_dumps({"outer": {"é": 1, "é": 2}})
+
 
 # ---- Envelope parsing (spec §2 + §4) -----------------------------------------
 

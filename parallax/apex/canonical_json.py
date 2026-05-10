@@ -26,13 +26,25 @@ from typing import Any
 
 
 def _nfc(value: Any) -> Any:
-    """NFC-normalize keys + string values recursively."""
+    """NFC-normalize keys + string values recursively.
+
+    Raises ``ValueError`` if two distinct keys NFC-normalize to the
+    same string (e.g. ``"é"`` U+00E9 vs ``"e\\u0301"``). Last-write-wins
+    would silently drop data and make canonical bytes depend on
+    insertion order, breaking the determinism this layer guarantees.
+    """
     if isinstance(value, str):
         return unicodedata.normalize("NFC", value)
     if isinstance(value, dict):
-        return {
-            unicodedata.normalize("NFC", k): _nfc(v) for k, v in value.items()
-        }
+        normalized: dict[str, Any] = {}
+        for k, v in value.items():
+            nk = unicodedata.normalize("NFC", k)
+            if nk in normalized:
+                raise ValueError(
+                    f"NFC key collision: multiple input keys normalize to {nk!r}"
+                )
+            normalized[nk] = _nfc(v)
+        return normalized
     if isinstance(value, list):
         return [_nfc(item) for item in value]
     return value

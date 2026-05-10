@@ -156,6 +156,13 @@ def _validate_reason_code(row: Mapping[str, Any]) -> None:
 
 def _validate_field_formats(row: Mapping[str, Any]) -> None:
     """Validate field formats for fields with structural constraints (spec §6.1)."""
+    # signer_id: required string, may be empty (no UUID/hex constraint per spec §6.1).
+    signer_id = row.get("signer_id", "")
+    if not isinstance(signer_id, str):
+        raise AuditRowValidationError(
+            f"'signer_id' must be a string, got {type(signer_id).__name__}"
+        )
+
     # claim_id: UUID v7
     claim_id = row.get("claim_id", "")
     if not isinstance(claim_id, str):
@@ -231,6 +238,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
 
     # signer_manifest_digest: sha256 hex OR empty string (unsigned packages)
     smd = row.get("signer_manifest_digest", "")
+    if not isinstance(smd, str):
+        raise AuditRowValidationError(
+            f"'signer_manifest_digest' must be a string, got {type(smd).__name__}"
+        )
     if smd:  # non-empty: must be valid sha256 hex
         _validate_sha256_hex(smd, "signer_manifest_digest")
 

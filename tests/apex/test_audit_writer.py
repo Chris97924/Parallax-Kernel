@@ -177,6 +177,20 @@ class TestFieldFormatValidation:
         # Unsigned packages use empty string — must NOT trigger hex validation.
         canonicalize_row(_valid_row(signer_manifest_digest="", signer_id=""))
 
+    def test_signer_manifest_digest_falsey_non_string_rejected(self) -> None:
+        # Regression: round-3 P1 — falsey non-strings (0, False, {}) bypassed
+        # the old `if smd:` truthiness guard without hitting _validate_sha256_hex.
+        for bad in (0, False, {}, []):
+            with pytest.raises(AuditRowValidationError, match="signer_manifest_digest"):
+                canonicalize_row(_valid_row(signer_manifest_digest=bad))
+
+    def test_signer_id_non_string_rejected(self) -> None:
+        # Regression: round-3 P2 — signer_id had no type guard; 0/False/{}
+        # passed because REQUIRED_FIELDS only checks presence, not type.
+        for bad in (0, False, {}, []):
+            with pytest.raises(AuditRowValidationError, match="signer_id"):
+                canonicalize_row(_valid_row(signer_id=bad))
+
     # P2: Divergence hash format -------------------------------------------------
 
     def test_aphelion_hash_non_hex_rejected(self) -> None:

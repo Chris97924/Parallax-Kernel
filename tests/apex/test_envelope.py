@@ -198,3 +198,16 @@ class TestChecksum:
         del env["checksum"]
         with pytest.raises(EnvelopeValidationError):
             parse_envelope(env)
+
+
+# ---- created_at semantic validation (round-3 P2) ----------------------------
+
+
+@pytest.mark.unit
+class TestCreatedAtSemanticValidation:
+    def test_impossible_calendar_date_rejected(self) -> None:
+        # Regression: round-3 P2 — regex matched shape but accepted e.g.
+        # month=99 / day=99.  strptime round-trip now catches these.
+        for bad in ("2026-99-01T00:00:00Z", "2026-01-99T00:00:00Z", "2026-02-30T00:00:00Z"):
+            with pytest.raises(EnvelopeValidationError, match="valid calendar timestamp"):
+                parse_envelope(_valid_envelope(created_at=bad))

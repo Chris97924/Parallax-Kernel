@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Mapping
+from datetime import datetime
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
@@ -186,6 +187,12 @@ def parse_envelope(raw: Mapping[str, Any]) -> Envelope:
         raise EnvelopeValidationError(
             f"created_at must be 20-char ISO 8601 UTC Z, got {created_at!r}"
         )
+    try:
+        datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise EnvelopeValidationError(
+            f"created_at is not a valid calendar timestamp, got {created_at!r}: {exc}"
+        ) from exc
 
     source_raw = raw["source"]
     try:

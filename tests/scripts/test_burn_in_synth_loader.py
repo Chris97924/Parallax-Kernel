@@ -1,0 +1,125 @@
+"""Regression tests for ``scripts/burn-in-synth-loader.py`` run_loader().
+
+Covers the two-counter (5xx / 4xx) budget split introduced in round-4
+of the Codex P1 review cycle.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import httpx
+import importlib.util
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "burn-in-synth-loader.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("_burn_in_synth_loader", str(SCRIPT))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _make_response(status_code: int) -> httpx.Response:
+    """Build a minimal httpx.Response with the given status code."""
+    response = httpx.Response(status_code=status_code)
+    return response
+
+
+def _mock_client_factory(responses: list[httpx.Response]):
+    """Return a mock httpx.Client that yields ``responses`` in order, then loops."""
+    mock_client = MagicMock()
+    mock_client.__enter__ = lambda s: s
+    mock_client.__exit__ = MagicMock(return_value=False)
+    call_count = [0]
+
+    def _get(url, **kwargs):
+        idx = call_count[0] % len(responses)
+        call_count[0] += 1
+        return responses[idx]
+
+    mock_client.get.side_effect = _get
+    mock_client.close = MagicMock()
+    return mock_client
+
+
+# ---------------------------------------------------------------------------
+# test_persistent_4xx_eventually_exits_75
+# ---------------------------------------------------------------------------
+
+
+def test_persistent_4xx_eventually_exits_75():
+    """Persistent 401 stream exhausts the 4xx budget and returns 75.
+
+    With client_error_budget=5 and iterations=10, run_loader should
+    return 75 after exactly 5 consecutive 4xx responses.
+    """
+    loader = _load_module()
+
+    responses = [_make_response(401)] * 10  # all 401s
+
+    mock_client = _mock_client_factory(responses)
+
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1", "key2"],
+            user_id="test-user",
+            interval_seconds=0,
+            error_budget=30,
+            client_error_budget=5,
+            iterations=10,
+        )
+
+    assert result == 75, f"expected 75 (4xx budget exhausted), got {result}"
+
+
+# ---------------------------------------------------------------------------
+# test_2xx_resets_both_counters
+# ---------------------------------------------------------------------------
+
+
+def test_2xx_resets_both_counters():
+    """A 2xx after a mixed 4xx/5xx sequence resets both counters.
+
+    Sequence: [4xx, 4xx, 4xx, 2xx, 5xx, 5xx, ...] — the 2xx at index 3
+    resets both consecutive_errors and consecutive_client_errors to 0.
+    With error_budget=30 and client_error_budget=300 neither small cluster
+    trips the budget; the loop completes all ``iterations`` and returns 0.
+    """
+    loader = _load_module()
+
+    # Build a repeating pattern: 3x 401, 1x 200, 2x 503, 1x 200
+    pattern = [
+        _make_response(401),
+        _make_response(401),
+        _make_response(401),
+        _make_response(200),
+        _make_response(503),
+        _make_response(503),
+        _make_response(200),
+    ]
+    # Enough iterations to run 2+ full cycles but not exhaust either budget
+    iterations = 14  # 2 full cycles of the 7-item pattern
+
+    mock_client = _mock_client_factory(pattern)
+
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1"],
+            user_id="test-user",
+            interval_seconds=0,
+            error_budget=30,
+            client_error_budget=300,
+            iterations=iterations,
+        )
+
+    assert result == 0, (
+        f"expected 0 (iterations exhausted without budget trip), got {result}"
+    )

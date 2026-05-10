@@ -49,6 +49,16 @@ HEADERS = {
 # Restart=always fires rather than silently looping at 1 qps with the
 # metric series going dark.
 CONSECUTIVE_ERROR_BUDGET = 30
+
+# 4xx budget is much higher than the 5xx/transport budget — most 4xx
+# responses are configuration drift (auth not yet provisioned, query-shape
+# mismatch) that retrying won't fix, so we don't want to flap the systemd
+# unit on transient blips. But a *persistent* 4xx (e.g. 401 from a
+# permanently-misconfigured auth setup) must eventually exit so systemd's
+# Restart=always cycles the process and the failure surfaces in journals
+# instead of silently stalling burn-in.
+CONSECUTIVE_CLIENT_ERROR_BUDGET = 300
+
 DEFAULT_INTERVAL_SECONDS = 1.0
 
 
@@ -113,6 +123,7 @@ def run_loader(
     user_id: str,
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
     error_budget: int = CONSECUTIVE_ERROR_BUDGET,
+    client_error_budget: int = CONSECUTIVE_CLIENT_ERROR_BUDGET,
     iterations: int | None = None,
 ) -> int:
     """Drive ``endpoint`` at ~1 qps with the synthetic header.
@@ -121,9 +132,16 @@ def run_loader(
         endpoint: full HTTP URL for the dual-read endpoint.
         sample_keys: M3 corpus claim ids — round-robined across queries.
         interval_seconds: delay between requests.
-        error_budget: consecutive-error threshold; on exhaustion the
-            function returns ``75`` (EX_TEMPFAIL) so systemd
-            ``Restart=always`` re-launches a fresh process.
+        error_budget: consecutive 5xx/transport-error threshold; on
+            exhaustion the function returns ``75`` (EX_TEMPFAIL) so
+            systemd ``Restart=always`` re-launches a fresh process.
+        client_error_budget: consecutive 4xx-error threshold; much higher
+            than ``error_budget`` because 4xx usually indicates config
+            drift that retrying won't fix immediately (auth not yet
+            provisioned, query-shape mismatch).  A *persistent* 4xx
+            (e.g. 401 from permanently-misconfigured auth) still
+            eventually exits so systemd cycles the unit and the failure
+            surfaces in journals instead of silently stalling burn-in.
         iterations: if provided, exit after this many requests (test hook).
 
     Returns:
@@ -133,7 +151,8 @@ def run_loader(
     if not sample_keys:
         return 2
     client = httpx.Client(timeout=5.0, headers=HEADERS)
-    consecutive_errors = 0
+    consecutive_errors = 0          # 5xx + httpx exceptions
+    consecutive_client_errors = 0   # 4xx
     idx = 0
     sent = 0
     try:
@@ -146,29 +165,34 @@ def run_loader(
                 if status >= 500:
                     consecutive_errors += 1
                     LOG.warning(
-                        "synth_qry key=%s status=%d consecutive=%d (5xx)",
+                        "synth_qry key=%s status=%d consecutive_5xx=%d",
                         key, status, consecutive_errors,
                     )
                     if consecutive_errors >= error_budget:
                         LOG.critical(
-                            "synth loader exhausted error budget=%d on 5xx; exiting "
+                            "synth loader exhausted 5xx budget=%d; exiting "
                             "so systemd Restart=always re-launches",
                             error_budget,
                         )
                         return 75
                 elif response.is_error:
-                    # 4xx = server alive but rejected request (e.g. bad query
-                    # shape, missing auth). Don't burn restart budget — we
-                    # would just flap. Reset and log loudly so an operator
-                    # can spot persistent client-side mismatch.
+                    consecutive_client_errors += 1
                     LOG.warning(
-                        "synth_qry key=%s status=%d (4xx, not counted)",
-                        key, status,
+                        "synth_qry key=%s status=%d consecutive_4xx=%d",
+                        key, status, consecutive_client_errors,
                     )
-                    consecutive_errors = 0
+                    if consecutive_client_errors >= client_error_budget:
+                        LOG.critical(
+                            "synth loader exhausted 4xx budget=%d "
+                            "(persistent client error, e.g. auth misconfig); "
+                            "exiting so systemd Restart=always re-launches",
+                            client_error_budget,
+                        )
+                        return 75
                 else:
                     LOG.info("synth_qry key=%s status=%d", key, status)
                     consecutive_errors = 0
+                    consecutive_client_errors = 0
             except httpx.HTTPError as exc:
                 consecutive_errors += 1
                 LOG.error(

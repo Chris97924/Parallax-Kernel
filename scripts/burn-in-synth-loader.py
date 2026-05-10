@@ -129,7 +129,7 @@ def run_loader(
             key = sample_keys[idx % len(sample_keys)]
             idx += 1
             try:
-                response = client.get(f"{endpoint}?key={key}")
+                response = client.get(f"{endpoint}?kind=recent&q={key}")
                 if response.is_error:
                     consecutive_errors += 1
                     LOG.warning(
@@ -138,6 +138,13 @@ def run_loader(
                         response.status_code,
                         consecutive_errors,
                     )
+                    if consecutive_errors >= error_budget:
+                        LOG.critical(
+                            "synth loader exhausted error budget=%d; exiting "
+                            "so systemd Restart=always re-launches",
+                            error_budget,
+                        )
+                        return 75
                 else:
                     LOG.info("synth_qry key=%s status=%d", key, response.status_code)
                     consecutive_errors = 0

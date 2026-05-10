@@ -52,16 +52,16 @@ prom_query() {
 # label wired (item 4.2). Until then both will return "0" → both flags
 # false → DoD evaluator returns PENDING_IMPLEMENTATION per spec §3.4.
 if synthetic_24h_count=$(prom_query "increase(parallax_aphelion_total{traffic_source=\"synthetic\"}[24h])" 2>&1); then
-  synthetic_started_24h=$(awk -v x="${synthetic_24h_count}" 'BEGIN { print (x+0 > 0) ? "true" : "false" }')
+  synthetic_started_24h=$(awk -v x="${synthetic_24h_count}" 'BEGIN { print (x+0 > 0) ? "True" : "False" }')
 else
   synthetic_24h_count="QUERY_FAILED"
-  synthetic_started_24h="null"
+  synthetic_started_24h="None"
 fi
 if natural_24h_count=$(prom_query "increase(parallax_aphelion_total{traffic_source=\"natural\"}[24h])" 2>&1); then
-  natural_started_24h=$(awk -v x="${natural_24h_count}" 'BEGIN { print (x+0 > 0) ? "true" : "false" }')
+  natural_started_24h=$(awk -v x="${natural_24h_count}" 'BEGIN { print (x+0 > 0) ? "True" : "False" }')
 else
   natural_24h_count="QUERY_FAILED"
-  natural_started_24h="null"
+  natural_started_24h="None"
 fi
 
 # ---- Metric pass/fail (vacuous when both flags false) -----------------------

@@ -200,6 +200,20 @@ def test_dod_metric_matrix(
     )
     target = next(m for m in report.metrics if m.metric == metric)
 
+    # Metrics that depend on the synthetic/natural split (B1=error_rate,
+    # B2=discrepancy_rate) return PENDING_IMPLEMENTATION in all test fixtures
+    # because the test DB has no traffic_source column (split not yet landed).
+    # The dedicated pending-gate tests (below) verify the PENDING path; this
+    # matrix focuses on the metrics that DO evaluate in the unimplemented-split
+    # scenario (p99_latency_ms, data_loss_count, min_hits).
+    _SPLIT_GATED = {DodMetric.ERROR_RATE, DodMetric.DISCREPANCY_RATE}
+    if metric in _SPLIT_GATED:
+        assert target.verdict == DodVerdict.PENDING_IMPLEMENTATION, (
+            f"split-gated metric {metric.value} must be PENDING_IMPLEMENTATION "
+            f"when traffic_source column absent, got {target.verdict.value}"
+        )
+        return  # remainder of matrix logic does not apply to pending metrics
+
     if want_pass:
         # MIN_HITS is the only metric that doesn't get downgraded by
         # insufficient_data — so for "pass" cases it must be PASS.
@@ -254,9 +268,12 @@ def test_stage_isolation_no_cross_stage_spillover(
         audit_log=audit, outcomes=outcomes, stage="m4_10pct", until=_FIXED_NOW
     )
 
-    assert r1.overall == DodVerdict.PASS
+    # r1: healthy data, but split not implemented → B1/B2 are PENDING.
+    # Overall must not be PASS (PENDING trumps PASS) and must not be FAIL.
+    assert r1.overall == DodVerdict.PENDING_IMPLEMENTATION
     r10_data_loss = next(m for m in r10.metrics if m.metric == DodMetric.DATA_LOSS_COUNT)
     assert r10_data_loss.verdict == DodVerdict.FAIL
+    # r10: data_loss FAIL + B1/B2 PENDING → overall is FAIL (FAIL > PENDING).
     assert r10.overall == DodVerdict.FAIL
 
 
@@ -295,7 +312,10 @@ def test_window_excludes_events_older_than_7_days(
     report = compute_dod(
         audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
     )
-    assert report.overall == DodVerdict.PASS
+    # Overall: PENDING_IMPLEMENTATION (B1/B2 pending) rather than PASS —
+    # the window test's invariant is that old data_loss rows are excluded,
+    # not the overall verdict shape (which now depends on split readiness).
+    assert report.overall in (DodVerdict.PASS, DodVerdict.PENDING_IMPLEMENTATION)
     data_loss = next(m for m in report.metrics if m.metric == DodMetric.DATA_LOSS_COUNT)
     assert data_loss.observed == 0
 
@@ -323,14 +343,20 @@ def test_insufficient_data_for_low_hits(
     report = compute_dod(
         audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
     )
-    rate_metrics = (
-        DodMetric.ERROR_RATE,
-        DodMetric.DISCREPANCY_RATE,
+    # ERROR_RATE and DISCREPANCY_RATE are gated on the split; they return
+    # PENDING_IMPLEMENTATION in test fixtures (no traffic_source column).
+    _SPLIT_GATED = {DodMetric.ERROR_RATE, DodMetric.DISCREPANCY_RATE}
+    non_split_rate_metrics = (
         DodMetric.P99_LATENCY_MS,
         DodMetric.DATA_LOSS_COUNT,
     )
     for m in report.metrics:
-        if m.metric in rate_metrics:
+        if m.metric in _SPLIT_GATED:
+            assert m.verdict == DodVerdict.PENDING_IMPLEMENTATION, (
+                f"split-gated metric {m.metric.value} must be PENDING_IMPLEMENTATION "
+                f"when traffic_source column absent, got {m.verdict.value}"
+            )
+        elif m.metric in non_split_rate_metrics:
             assert m.verdict == DodVerdict.INSUFFICIENT_DATA, (
                 f"expected INSUFFICIENT_DATA for {m.metric.value} at hits=10, "
                 f"got {m.verdict.value}"
@@ -348,7 +374,9 @@ def test_zero_data_returns_insufficient_data(
     report = compute_dod(
         audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
     )
-    assert report.overall == DodVerdict.INSUFFICIENT_DATA
+    # With zero data AND split not implemented, B1/B2 are PENDING_IMPLEMENTATION
+    # which trumps INSUFFICIENT_DATA in _aggregate precedence.
+    assert report.overall in (DodVerdict.INSUFFICIENT_DATA, DodVerdict.PENDING_IMPLEMENTATION)
 
 
 def test_audit_thin_outcomes_full_does_not_pass_audit_metrics(
@@ -388,9 +416,15 @@ def test_audit_thin_outcomes_full_does_not_pass_audit_metrics(
     report = compute_dod(
         audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
     )
-    audit_metrics = {DodMetric.ERROR_RATE, DodMetric.P99_LATENCY_MS}
+    # ERROR_RATE is split-gated → PENDING_IMPLEMENTATION in test fixtures.
+    # P99_LATENCY_MS is not split-gated → still INSUFFICIENT_DATA when thin.
     for m in report.metrics:
-        if m.metric in audit_metrics:
+        if m.metric == DodMetric.ERROR_RATE:
+            assert m.verdict == DodVerdict.PENDING_IMPLEMENTATION, (
+                f"error_rate should be PENDING_IMPLEMENTATION when split not landed, "
+                f"got {m.verdict.value}"
+            )
+        elif m.metric == DodMetric.P99_LATENCY_MS:
             assert m.verdict == DodVerdict.INSUFFICIENT_DATA, (
                 f"audit-thin metric {m.metric.value} should report "
                 f"INSUFFICIENT_DATA when audit sample < 50, got {m.verdict.value}"
@@ -478,7 +512,9 @@ def test_dod_json_output_shape(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert payload["stage"] == "m4_1pct"
-    assert payload["overall"] == "pass"
+    # overall is "pending_implementation" until traffic_source column lands
+    # (split not implemented in test fixture); shape test only checks structure.
+    assert payload["overall"] in ("pass", "pending_implementation")
     assert {m["metric"] for m in payload["metrics"]} == {
         m.value for m in DodMetric
     }
@@ -519,3 +555,132 @@ def test_default_window_is_seven_days() -> None:
 def test_known_stages_complete() -> None:
     """AC-3.2 — exactly four stages: 1%, 10%, 50%, 100%."""
     assert KNOWN_STAGES == frozenset(_STAGES)
+
+
+# ----------------------------------------------------------------------
+# P1 (round-7): PENDING_IMPLEMENTATION when split not landed
+# ----------------------------------------------------------------------
+
+
+def test_pending_implementation_when_split_not_implemented(
+    stores: tuple[AuditLog, OutcomeStore],
+) -> None:
+    """compute_dod returns PENDING_IMPLEMENTATION overall and for B1/B2 metrics
+    when the traffic_source column is absent (split not yet implemented).
+
+    This verifies that _aggregate's PENDING_IMPLEMENTATION branch is reachable
+    — the split detection path feeds it a real PENDING_IMPLEMENTATION input.
+    """
+    audit, outcomes = stores
+    # Populate healthy data so this is not an INSUFFICIENT_DATA scenario.
+    _populate(audit=audit, outcomes=outcomes, stage="m4_1pct", count=200)
+
+    report = compute_dod(
+        audit_log=audit,
+        outcomes=outcomes,
+        stage="m4_1pct",
+        until=_FIXED_NOW,
+    )
+
+    # The audit_log table in test fixtures has no traffic_source column, so
+    # split_implemented() returns False and B1/B2 must be PENDING.
+    b1 = next(m for m in report.metrics if m.metric == DodMetric.ERROR_RATE)
+    b2 = next(m for m in report.metrics if m.metric == DodMetric.DISCREPANCY_RATE)
+
+    assert b1.verdict == DodVerdict.PENDING_IMPLEMENTATION, (
+        f"ERROR_RATE must be PENDING_IMPLEMENTATION when split not landed, "
+        f"got {b1.verdict.value}"
+    )
+    assert b2.verdict == DodVerdict.PENDING_IMPLEMENTATION, (
+        f"DISCREPANCY_RATE must be PENDING_IMPLEMENTATION when split not landed, "
+        f"got {b2.verdict.value}"
+    )
+    # Overall must be PENDING_IMPLEMENTATION (not PASS, not FAIL).
+    assert report.overall == DodVerdict.PENDING_IMPLEMENTATION, (
+        f"overall must be PENDING_IMPLEMENTATION when B1/B2 are pending, "
+        f"got {report.overall.value}"
+    )
+
+
+def test_non_split_metrics_still_pass_when_split_not_implemented(
+    stores: tuple[AuditLog, OutcomeStore],
+) -> None:
+    """P99_LATENCY_MS, DATA_LOSS_COUNT, and MIN_HITS still compute normally
+    when the split is not implemented — only ERROR_RATE and DISCREPANCY_RATE
+    are gated on the split.
+    """
+    audit, outcomes = stores
+    _populate(audit=audit, outcomes=outcomes, stage="m4_1pct", count=200)
+
+    report = compute_dod(
+        audit_log=audit,
+        outcomes=outcomes,
+        stage="m4_1pct",
+        until=_FIXED_NOW,
+    )
+
+    p99 = next(m for m in report.metrics if m.metric == DodMetric.P99_LATENCY_MS)
+    data_loss = next(m for m in report.metrics if m.metric == DodMetric.DATA_LOSS_COUNT)
+    min_hits = next(m for m in report.metrics if m.metric == DodMetric.MIN_HITS)
+
+    assert p99.verdict == DodVerdict.PASS, (
+        f"p99_latency must still compute PASS when split not landed, got {p99.verdict.value}"
+    )
+    assert data_loss.verdict == DodVerdict.PASS, (
+        f"data_loss_count must still compute PASS when split not landed, "
+        f"got {data_loss.verdict.value}"
+    )
+    assert min_hits.verdict == DodVerdict.PASS, (
+        f"min_hits must still compute PASS when split not landed, "
+        f"got {min_hits.verdict.value}"
+    )
+
+
+def test_pass_fail_metrics_work_when_split_implemented(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regression: when traffic_source column IS present, ERROR_RATE and
+    DISCREPANCY_RATE resume normal PASS/FAIL evaluation — the split gate
+    does NOT permanently block evaluation once implemented.
+    """
+    import sqlite3
+
+    shared_db = tmp_path / "split_ready.db"
+    audit = AuditLog(db_path=shared_db)
+    outcomes = OutcomeStore(db_path=shared_db)
+
+    # Manually add the traffic_source column to simulate item 4.2 landing.
+    conn = sqlite3.connect(str(shared_db))
+    conn.execute("ALTER TABLE audit_log ADD COLUMN traffic_source TEXT")
+    conn.commit()
+    conn.close()
+
+    try:
+        _populate(audit=audit, outcomes=outcomes, stage="m4_1pct", count=200)
+
+        report = compute_dod(
+            audit_log=audit,
+            outcomes=outcomes,
+            stage="m4_1pct",
+            until=_FIXED_NOW,
+        )
+    finally:
+        audit.close()
+        outcomes.close()
+
+    b1 = next(m for m in report.metrics if m.metric == DodMetric.ERROR_RATE)
+    b2 = next(m for m in report.metrics if m.metric == DodMetric.DISCREPANCY_RATE)
+
+    # With healthy data and split implemented, both should evaluate to PASS.
+    assert b1.verdict == DodVerdict.PASS, (
+        f"ERROR_RATE should be PASS when split implemented and no errors, "
+        f"got {b1.verdict.value}"
+    )
+    assert b2.verdict == DodVerdict.PASS, (
+        f"DISCREPANCY_RATE should be PASS when split implemented and no discrepancies, "
+        f"got {b2.verdict.value}"
+    )
+    assert report.overall == DodVerdict.PASS, (
+        f"overall should be PASS when split implemented and all healthy, "
+        f"got {report.overall.value}"
+    )

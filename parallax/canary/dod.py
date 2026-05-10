@@ -63,6 +63,11 @@ class DodVerdict(enum.StrEnum):
     PASS = "pass"
     FAIL = "fail"
     INSUFFICIENT_DATA = "insufficient_data"
+    # Spec ``docs/m4-prep/traffic-gap-resolution.md`` §3.4: returned by
+    # B1/B2 evaluators when synthetic/natural split logic has not yet
+    # landed end-to-end. Distinct from FAIL — the metric cannot be
+    # evaluated, period; not a known regression.
+    PENDING_IMPLEMENTATION = "pending_implementation"
 
 
 # Spec §3.3 — single source of truth for DoD thresholds. Mirrors the
@@ -155,6 +160,29 @@ def _quantile(sorted_values: list[float], q: float) -> float:
     return sorted_values[min(rank - 1, len(sorted_values) - 1)]
 
 
+def _split_implemented(conn: object) -> bool:
+    """Return True when the synthetic/natural traffic-source split has landed.
+
+    The split is considered implemented end-to-end when the ``audit_log``
+    table carries a ``traffic_source`` column — the column is added by item
+    4.2 of ``docs/m4-prep/traffic-gap-resolution.md``. Until that column
+    exists, the DoD evaluator cannot distinguish synthetic from natural
+    traffic and MUST return PENDING_IMPLEMENTATION for the B1/B2 metrics
+    (error_rate and discrepancy_rate) per spec §3.4.
+
+    Uses PRAGMA table_info rather than a try/SELECT to avoid mutating state
+    and to remain safe inside the audit_log's read-only DoD context.
+    """
+    import sqlite3 as _sqlite3
+
+    try:
+        rows = conn.execute("PRAGMA table_info(audit_log)").fetchall()
+    except _sqlite3.Error:
+        # If we can't query the schema at all, treat split as not implemented.
+        return False
+    return any(row["name"] == "traffic_source" for row in rows)
+
+
 def _verdict_for(metric: DodMetric, observed: float, sample_size: int) -> DodVerdict:
     """Compute pass/fail/insufficient_data for one metric.
 
@@ -185,20 +213,31 @@ def _verdict_for(metric: DodMetric, observed: float, sample_size: int) -> DodVer
 
 
 def _aggregate(verdicts: Iterable[DodVerdict]) -> DodVerdict:
-    """PASS if all PASS; FAIL if any FAIL; otherwise INSUFFICIENT_DATA."""
+    """Aggregate per-metric verdicts into an overall stage verdict.
+
+    Order of precedence: FAIL > PENDING_IMPLEMENTATION > INSUFFICIENT_DATA > PASS.
+    PENDING_IMPLEMENTATION trumps INSUFFICIENT_DATA because a metric we
+    cannot evaluate is a sharper signal than a metric with too few
+    observations — extending the window helps the latter, not the former.
+    """
     seen_fail = False
+    seen_pending = False
     seen_insufficient = False
     seen_any = False
     for v in verdicts:
         seen_any = True
         if v == DodVerdict.FAIL:
             seen_fail = True
+        elif v == DodVerdict.PENDING_IMPLEMENTATION:
+            seen_pending = True
         elif v == DodVerdict.INSUFFICIENT_DATA:
             seen_insufficient = True
     if not seen_any:
         return DodVerdict.INSUFFICIENT_DATA
     if seen_fail:
         return DodVerdict.FAIL
+    if seen_pending:
+        return DodVerdict.PENDING_IMPLEMENTATION
     if seen_insufficient:
         return DodVerdict.INSUFFICIENT_DATA
     return DodVerdict.PASS
@@ -249,6 +288,13 @@ def compute_dod(
 
     sample_size = len(audit_rows)
 
+    # Step 1.5 — check whether the synthetic/natural split has landed.
+    # Per spec §3.4: until items 4.7 AND 4.8 are merged, the DoD evaluator
+    # cannot distinguish synthetic from natural traffic. The two metrics that
+    # depend on this split (B1=error_rate, B2=discrepancy_rate) must be
+    # stamped PENDING_IMPLEMENTATION rather than evaluated against raw data.
+    split_ready = _split_implemented(conn_audit)
+
     # Step 2 — per-metric computation.
     error_count = sum(
         1 for row in audit_rows if int(row["response_status"]) >= 500
@@ -296,15 +342,25 @@ def compute_dod(
             metric=DodMetric.ERROR_RATE,
             observed=error_rate,
             threshold=DOD_THRESHOLD[DodMetric.ERROR_RATE],
-            verdict=_verdict_for(DodMetric.ERROR_RATE, error_rate, sample_size),
+            # B1 metric — depends on synthetic/natural split per spec §3.4.
+            verdict=(
+                _verdict_for(DodMetric.ERROR_RATE, error_rate, sample_size)
+                if split_ready
+                else DodVerdict.PENDING_IMPLEMENTATION
+            ),
             sample_size=sample_size,
         ),
         MetricResult(
             metric=DodMetric.DISCREPANCY_RATE,
             observed=discrepancy_rate,
             threshold=DOD_THRESHOLD[DodMetric.DISCREPANCY_RATE],
-            verdict=_verdict_for(
-                DodMetric.DISCREPANCY_RATE, discrepancy_rate, total_outcomes
+            # B2 metric — depends on synthetic/natural split per spec §3.4.
+            verdict=(
+                _verdict_for(
+                    DodMetric.DISCREPANCY_RATE, discrepancy_rate, total_outcomes
+                )
+                if split_ready
+                else DodVerdict.PENDING_IMPLEMENTATION
             ),
             sample_size=total_outcomes,
         ),

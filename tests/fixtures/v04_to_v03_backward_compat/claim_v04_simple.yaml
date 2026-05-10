@@ -1,0 +1,17 @@
+# v0.4-shaped claim frontmatter that MUST pass the v0.3 validator unchanged.
+#
+# v0.4 is additive over v0.3: it introduces optional fields without changing
+# any v0.3 R1-R4 semantics. This fixture exercises that invariant by combining
+# every v0.3 R1-R4 trigger field with one forward-compatible v0.4-only key
+# (``v04_optional_metadata``). The key order matches the canonical key-order
+# rule in ``Aphelion-Graph/spec/v0.3-claim-semantics.md`` so
+# ``validate_v03_fields`` accepts it without raising PX_E_4140 (key_order).
+claim_id: "01963f7d-7000-7000-8000-000000000099"
+subject: "subject:apex-m5-backward-compat"
+polarity: "affirm"
+confidence: 0.987
+valid_from: "2026-05-09T00:00:00Z"
+valid_until: "2027-05-09T00:00:00Z"
+v04_optional_metadata:
+  origin: "parallax-pr-d"
+  shape: "forward-compat"

@@ -429,13 +429,35 @@ def test_latency_secondary_ms_set_on_match(monkeypatch: pytest.MonkeyPatch) -> N
     assert r.latency_secondary_ms >= 0.0
 
 
-def test_aphelion_unreachable_reason_on_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_aphelion_unreachable_reason_propagates_to_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR-D wired adapter: failure path still surfaces as 'aphelion_unreachable'.
+
+    Inject a claim_loader that returns a frontmatter the v0.3 validator
+    rejects, so the adapter raises ``AphelionUnreachableError("claim_schema_error")``
+    and the router classifies the outcome accordingly.
+    """
     monkeypatch.setenv("DUAL_READ", "true")
     primary = _StubPort(_n_hits())
-    secondary = AphelionReadAdapter()
+
+    def _bad_loader(_req: object) -> list[dict[str, str]]:
+        # ``conflict_class`` is a reserved derivation field (spec §7);
+        # v0.3 validator raises SchemaError so the adapter surfaces
+        # AphelionUnreachableError("claim_schema_error").
+        return [
+            {
+                "claim_id": "01963f7d-7000-7000-8000-000000000050",
+                "subject": "subject:foo",
+                "polarity": "affirm",
+                "conflict_class": "ambiguity",
+            }
+        ]
+
+    secondary = AphelionReadAdapter(claim_loader=_bad_loader)
     r = _router(primary, secondary).query(_request())
     assert r.outcome == "aphelion_unreachable"
-    assert r.aphelion_unreachable_reason == "not_implemented"
+    assert r.aphelion_unreachable_reason == "claim_schema_error"
 
 
 # ---------------------------------------------------------------------------

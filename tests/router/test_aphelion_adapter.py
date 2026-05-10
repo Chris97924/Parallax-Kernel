@@ -1,0 +1,254 @@
+"""Tests for the wired AphelionReadAdapter (PR-D / Apex M5 entry).
+
+Supersedes the M3-T1.2 stub tests. The adapter now runs Aphelion v0.3 R4
+detection and emits an Apex M5 envelope + audit row; this file exercises
+the happy path (NOT_FOUND / SUPERSESSION) plus the failure paths that
+still surface as ``AphelionUnreachableError``.
+
+Spec anchors:
+  * ``docs/m5-prep/apex-m5-envelope-spec.md`` §2 + §3.1 + §4.1
+  * ``docs/m5-prep/audit-db-path-config.md`` §6
+  * ``Aphelion-Graph/spec/v0.3-claim-semantics.md`` §6
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable, Mapping
+from typing import Any
+
+import pytest
+
+from parallax.apex.envelope import Envelope, PayloadType, Source, parse_envelope
+from parallax.router.aphelion_adapter import (
+    AphelionReadAdapter,
+    AphelionUnreachableError,
+)
+from parallax.router.contracts import QueryRequest
+from parallax.router.ports import QueryPort
+from parallax.router.types import QueryType
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+_PACKAGE_ID = "01963f7d-7000-7000-8000-0000000000aa"
+
+
+def _claim(
+    *,
+    claim_id: str = "01963f7d-7000-7000-8000-000000000001",
+    subject: str = "subject:foo",
+    polarity: str = "affirm",
+    valid_from: str | None = None,
+    valid_until: str | None = None,
+    supersedes: list[str] | None = None,
+    package_id: str = _PACKAGE_ID,
+) -> dict[str, Any]:
+    """Build a minimal v0.3-valid claim frontmatter with package metadata.
+
+    ``package_id`` is opaque to the v0.3 validator but carried through so the
+    adapter can populate the audit row's required ``package_id`` field
+    (M6/M7 ingest will set this for real; PR-D tests inject it directly).
+    """
+    out: dict[str, Any] = {
+        "claim_id": claim_id,
+        "subject": subject,
+        "polarity": polarity,
+        "package_id": package_id,
+    }
+    if valid_from is not None:
+        out["valid_from"] = valid_from
+    if valid_until is not None:
+        out["valid_until"] = valid_until
+    if supersedes is not None:
+        out["supersedes"] = supersedes
+    return out
+
+
+def _request(
+    *,
+    user_id: str = "u1",
+    q: str = "subject:foo",
+    query_type: QueryType = QueryType.RECENT_CONTEXT,
+) -> QueryRequest:
+    return QueryRequest(query_type=query_type, user_id=user_id, q=q)
+
+
+# ---------------------------------------------------------------------------
+# Construction + Protocol conformance
+# ---------------------------------------------------------------------------
+
+
+def test_constructor_defaults() -> None:
+    adapter = AphelionReadAdapter()
+    assert adapter._timeout_ms == 100.0
+    assert adapter._package_dir is None
+    assert adapter.last_envelope is None
+    assert adapter.last_audit_row is None
+
+
+def test_constructor_custom_args(tmp_path: Any) -> None:
+    adapter = AphelionReadAdapter(package_dir=tmp_path, timeout_ms=50.0)
+    assert adapter._package_dir == tmp_path
+    assert adapter._timeout_ms == 50.0
+
+
+def test_conforms_to_query_port_protocol() -> None:
+    adapter = AphelionReadAdapter()
+    assert isinstance(adapter, QueryPort)
+
+
+# ---------------------------------------------------------------------------
+# AphelionUnreachableError
+# ---------------------------------------------------------------------------
+
+
+def test_unreachable_error_reason_attribute() -> None:
+    err = AphelionUnreachableError("timeout")
+    assert err.reason == "timeout"
+    assert "timeout" in str(err)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "timeout",
+        "connection_error",
+        "claim_schema_error",
+        "envelope_checksum_mismatch",
+        "audit_row_invalid",
+    ],
+)
+def test_unreachable_error_reason_values(reason: str) -> None:
+    err = AphelionUnreachableError(reason)
+    assert err.reason == reason
+
+
+# ---------------------------------------------------------------------------
+# NOT_FOUND happy path (default empty loader)
+# ---------------------------------------------------------------------------
+
+
+def test_query_returns_empty_evidence_on_not_found() -> None:
+    """Default empty loader → NOT_FOUND, empty hits, no envelope emission.
+
+    PR-D scope-cut: no real ``package_id`` to anchor an audit row, so the
+    adapter intentionally skips envelope emission for NOT_FOUND. M6/M7
+    ingest pipeline will revisit this once package metadata is available.
+    """
+    adapter = AphelionReadAdapter()
+    evidence = adapter.query(_request())
+
+    assert evidence.hits == ()
+    assert evidence.stages == ("aphelion_v03_r4",)
+    assert "conflict_class=not_found" in evidence.notes[0]
+    assert adapter.last_envelope is None
+    assert adapter.last_audit_row is None
+
+
+# ---------------------------------------------------------------------------
+# R4 supersession path emits envelope + audit row
+# ---------------------------------------------------------------------------
+
+
+def test_r4_supersession_surfaces_active_claim_and_emits_envelope() -> None:
+    """Newer claim with `supersedes: [old]` → primary == newer; envelope emitted."""
+    older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
+    newer = _claim(
+        claim_id="01963f7d-7000-7000-8000-000000000011",
+        supersedes=["01963f7d-7000-7000-8000-000000000010"],
+    )
+
+    def loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
+        return [older, newer]
+
+    adapter = AphelionReadAdapter(claim_loader=loader)
+    evidence = adapter.query(_request())
+
+    env = adapter.last_envelope
+    assert isinstance(env, Envelope)
+    assert env.payload_type is PayloadType.QUERY_RESULT
+    assert env.source is Source.APHELION
+    assert env.envelope_version == "0.1"
+    assert env.schema_version == 1
+    assert env.payload["conflict_class"] == "supersession"
+    assert env.payload["primary_claim_id"] == newer["claim_id"]
+    assert env.payload["superseded_count"] == 1
+    assert evidence.hits[0]["id"] == newer["claim_id"]
+
+
+def test_audit_db_ref_matches_canonical_sha256() -> None:
+    """envelope.audit_db_ref MUST equal the canonical sha256 of the audit row."""
+    older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
+    newer = _claim(
+        claim_id="01963f7d-7000-7000-8000-000000000011",
+        supersedes=["01963f7d-7000-7000-8000-000000000010"],
+    )
+    adapter = AphelionReadAdapter(claim_loader=lambda _r: [older, newer])
+    adapter.query(_request())
+
+    env = adapter.last_envelope
+    row = adapter.last_audit_row
+    assert env is not None and row is not None
+    assert _SHA256_HEX_RE.match(env.audit_db_ref) is not None
+    assert env.audit_db_ref == row.sha256_hex()
+
+
+def test_envelope_round_trips_through_parse_envelope() -> None:
+    """Emitted envelope passes parse_envelope without raising."""
+    older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
+    newer = _claim(
+        claim_id="01963f7d-7000-7000-8000-000000000011",
+        supersedes=["01963f7d-7000-7000-8000-000000000010"],
+    )
+    adapter = AphelionReadAdapter(claim_loader=lambda _r: [older, newer])
+    adapter.query(_request())
+
+    env = adapter.last_envelope
+    assert env is not None
+    raw = {
+        "envelope_version": env.envelope_version,
+        "schema_version": env.schema_version,
+        "message_id": env.message_id,
+        "created_at": env.created_at,
+        "source": env.source.value,
+        "audit_db_ref": env.audit_db_ref,
+        "payload_type": env.payload_type.value,
+        "payload": dict(env.payload),
+        "checksum": env.checksum,
+    }
+    reparsed = parse_envelope(raw)
+    assert reparsed.checksum == env.checksum
+
+
+# ---------------------------------------------------------------------------
+# Failure path — bad claim surfaces as AphelionUnreachableError
+# ---------------------------------------------------------------------------
+
+
+def test_schema_error_surfaces_as_unreachable() -> None:
+    """Validator rejects a reserved field → AphelionUnreachableError(claim_schema_error).
+
+    ``conflict_class`` is a reserved derivation field (spec §7) that MUST NOT
+    appear in frontmatter; the v0.3 validator raises ``SchemaError`` and the
+    adapter surfaces it as the M3 contract error.
+    """
+
+    def bad_loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
+        return [
+            {
+                "claim_id": "01963f7d-7000-7000-8000-000000000050",
+                "subject": "subject:foo",
+                "polarity": "affirm",
+                "conflict_class": "ambiguity",
+            }
+        ]
+
+    adapter = AphelionReadAdapter(claim_loader=bad_loader)
+    with pytest.raises(AphelionUnreachableError) as excinfo:
+        adapter.query(_request())
+    assert excinfo.value.reason == "claim_schema_error"

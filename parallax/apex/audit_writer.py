@@ -24,6 +24,7 @@ import uuid as _uuid_mod
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Final
 
 from parallax.apex.canonical_json import canonical_dumps, sha256_hex
@@ -330,7 +331,9 @@ def canonicalize_row(row: Mapping[str, Any]) -> AuditRow:
             "new fields require envelope schema_version bump"
         )
 
-    return AuditRow(data=cleaned)
+    # Freeze the backing mapping so callers cannot mutate row.data
+    # post-validation and silently invalidate sha256_hex().
+    return AuditRow(data=MappingProxyType(cleaned))
 
 
 def assert_audit_row_committed(committed: bool) -> None:

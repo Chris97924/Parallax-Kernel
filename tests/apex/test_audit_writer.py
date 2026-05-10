@@ -237,8 +237,10 @@ class TestFieldFormatValidation:
 class TestRowHashing:
     def test_sha256_matches_manual_canonical_json(self) -> None:
         row = canonicalize_row(_valid_row())
+        # row.data is a MappingProxyType, so dict()-wrap to match
+        # AuditRow.to_canonical_bytes() which calls dict(self.data).
         manual = json.dumps(
-            row.data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            dict(row.data), sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
         assert row.to_canonical_bytes() == manual
         assert row.sha256_hex() == hashlib.sha256(manual).hexdigest()
@@ -255,6 +257,27 @@ class TestRowHashing:
         b_row = _valid_row(outcome="error", reason_code="pkg.unsigned")
         b = canonicalize_row(b_row).sha256_hex()
         assert a != b
+
+
+# ---- AuditRow.data immutability (round-5 P1) --------------------------------
+
+
+@pytest.mark.unit
+class TestAuditRowImmutability:
+    def test_audit_row_data_is_immutable(self) -> None:
+        # Regression: round-5 P1 — canonicalize_row used to return AuditRow
+        # backed by a plain dict; callers could mutate row.data and silently
+        # invalidate sha256_hex(). The backing mapping must be read-only.
+        row = canonicalize_row(_valid_row())
+
+        with pytest.raises(TypeError):
+            row.data["claim_id"] = "0193e2b1-0001-7000-8000-deadbeefdead"  # type: ignore[index]
+
+        with pytest.raises(TypeError):
+            row.data["new_field"] = "x"  # type: ignore[index]
+
+        with pytest.raises(TypeError):
+            del row.data["claim_id"]  # type: ignore[attr-defined]
 
 
 # ---- Write-order invariant guard --------------------------------------------

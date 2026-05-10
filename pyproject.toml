@@ -51,6 +51,8 @@ testpaths = ["tests"]
 addopts = "-q --cov=parallax --cov-report=term-missing --cov-fail-under=80 -m 'not llm_integration'"
 markers = [
     "llm_integration: hits a real LLM provider (OpenRouter). Skipped by default; run with -m llm_integration and OPENROUTER_API_KEY set.",
+    "unit: fast, deterministic, no I/O (Apex M5 envelope/audit_writer + future unit suites)",
+    "integration: requires external resources (DB, network, filesystem state across processes)",
 ]
 
 [tool.coverage.run]

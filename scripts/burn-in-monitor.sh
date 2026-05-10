@@ -51,10 +51,18 @@ prom_query() {
 # These queries assume server-side instrumentation has the traffic_source
 # label wired (item 4.2). Until then both will return "0" → both flags
 # false → DoD evaluator returns PENDING_IMPLEMENTATION per spec §3.4.
-synthetic_24h_count=$(prom_query "increase(parallax_aphelion_total{traffic_source=\"synthetic\"}[24h])" 2>/dev/null || echo 0)
-natural_24h_count=$(prom_query "increase(parallax_aphelion_total{traffic_source=\"natural\"}[24h])" 2>/dev/null || echo 0)
-synthetic_started_24h=$(awk -v x="${synthetic_24h_count}" 'BEGIN { print (x+0 > 0) ? "true" : "false" }')
-natural_started_24h=$(awk -v x="${natural_24h_count}" 'BEGIN { print (x+0 > 0) ? "true" : "false" }')
+if synthetic_24h_count=$(prom_query "increase(parallax_aphelion_total{traffic_source=\"synthetic\"}[24h])" 2>&1); then
+  synthetic_started_24h=$(awk -v x="${synthetic_24h_count}" 'BEGIN { print (x+0 > 0) ? "true" : "false" }')
+else
+  synthetic_24h_count="QUERY_FAILED"
+  synthetic_started_24h="null"
+fi
+if natural_24h_count=$(prom_query "increase(parallax_aphelion_total{traffic_source=\"natural\"}[24h])" 2>&1); then
+  natural_started_24h=$(awk -v x="${natural_24h_count}" 'BEGIN { print (x+0 > 0) ? "true" : "false" }')
+else
+  natural_24h_count="QUERY_FAILED"
+  natural_started_24h="null"
+fi
 
 # ---- Metric pass/fail (vacuous when both flags false) -----------------------
 # Real per-metric evaluation is item 4.7 (Phase-1/Phase-2 split logic).

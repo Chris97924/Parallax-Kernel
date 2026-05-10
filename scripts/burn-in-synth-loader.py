@@ -13,7 +13,7 @@ header and labels accordingly (see
 
 Usage::
 
-    PARALLAX_BURN_IN_ENDPOINT="http://127.0.0.1:8000/v1/dual-read" \\
+    PARALLAX_BURN_IN_ENDPOINT="http://127.0.0.1:8000/query" \\
     PARALLAX_BURN_IN_FIXTURE=/path/to/m3_corpus.json \\
     python scripts/burn-in-synth-loader.py
 
@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -37,7 +38,7 @@ import httpx
 
 LOG = logging.getLogger("parallax.burn_in.synth_loader")
 
-DEFAULT_ENDPOINT = "http://127.0.0.1:8000/v1/dual-read"
+DEFAULT_ENDPOINT = "http://127.0.0.1:8000/query"
 HEADERS = {
     "X-Parallax-Traffic-Source": "synthetic",
     "X-Parallax-Synth-Marker": "burn-in-loader-v1",
@@ -129,8 +130,17 @@ def run_loader(
             idx += 1
             try:
                 response = client.get(f"{endpoint}?key={key}")
-                LOG.info("synth_qry key=%s status=%d", key, response.status_code)
-                consecutive_errors = 0
+                if response.is_error:
+                    consecutive_errors += 1
+                    LOG.warning(
+                        "synth_qry key=%s status=%d consecutive=%d",
+                        key,
+                        response.status_code,
+                        consecutive_errors,
+                    )
+                else:
+                    LOG.info("synth_qry key=%s status=%d", key, response.status_code)
+                    consecutive_errors = 0
             except httpx.HTTPError as exc:
                 consecutive_errors += 1
                 LOG.error(
@@ -155,7 +165,12 @@ def run_loader(
         client.close()
 
 
+def _handle_sigterm(signum: int, frame: object) -> None:  # noqa: ARG001
+    raise KeyboardInterrupt()
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)sZ %(levelname)s %(name)s %(message)s",

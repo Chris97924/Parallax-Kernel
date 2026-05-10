@@ -36,8 +36,12 @@ _TS_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
 _TS_LENGTH: Final = 20
 
 
-def _validate_sha256_hex(value: str, field_name: str) -> None:
+def _validate_sha256_hex(value: object, field_name: str) -> None:
     """Raise AuditRowValidationError if *value* is not a 64-char lowercase SHA-256 hex."""
+    if not isinstance(value, str):
+        raise AuditRowValidationError(
+            f"{field_name!r} must be a string, got {type(value).__name__}"
+        )
     if not _SHA256_HEX_RE.match(value):
         raise AuditRowValidationError(
             f"{field_name!r} must be a 64-char lowercase SHA-256 hex string, got {value!r}"
@@ -154,6 +158,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
     """Validate field formats for fields with structural constraints (spec §6.1)."""
     # claim_id: UUID v7
     claim_id = row.get("claim_id", "")
+    if not isinstance(claim_id, str):
+        raise AuditRowValidationError(
+            f"'claim_id' must be a string, got {type(claim_id).__name__}"
+        )
     if claim_id:
         try:
             parsed = _uuid_mod.UUID(claim_id)
@@ -168,6 +176,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
 
     # package_id: UUID v7
     package_id = row.get("package_id", "")
+    if not isinstance(package_id, str):
+        raise AuditRowValidationError(
+            f"'package_id' must be a string, got {type(package_id).__name__}"
+        )
     if package_id:
         try:
             parsed = _uuid_mod.UUID(package_id)
@@ -182,6 +194,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
 
     # envelope_message_id: UUID v4
     emid = row.get("envelope_message_id", "")
+    if not isinstance(emid, str):
+        raise AuditRowValidationError(
+            f"'envelope_message_id' must be a string, got {type(emid).__name__}"
+        )
     if emid:
         try:
             parsed = _uuid_mod.UUID(emid)
@@ -196,6 +212,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
 
     # ts: exactly 20 chars, Z suffix, second precision ISO 8601 UTC
     ts = row.get("ts", "")
+    if not isinstance(ts, str):
+        raise AuditRowValidationError(
+            f"'ts' must be a string, got {type(ts).__name__}"
+        )
     if ts:
         if len(ts) != _TS_LENGTH or not ts.endswith("Z"):
             raise AuditRowValidationError(

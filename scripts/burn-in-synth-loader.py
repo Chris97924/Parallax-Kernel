@@ -14,6 +14,7 @@ header and labels accordingly (see
 Usage::
 
     PARALLAX_BURN_IN_ENDPOINT="http://127.0.0.1:8000/query" \\
+    PARALLAX_BURN_IN_USER_ID="parallax-burn-in-synth" \\
     PARALLAX_BURN_IN_FIXTURE=/path/to/m3_corpus.json \\
     python scripts/burn-in-synth-loader.py
 
@@ -53,6 +54,16 @@ DEFAULT_INTERVAL_SECONDS = 1.0
 
 def _resolve_endpoint() -> str:
     return os.environ.get("PARALLAX_BURN_IN_ENDPOINT", DEFAULT_ENDPOINT)
+
+
+def _resolve_user_id() -> str:
+    raw = os.environ.get("PARALLAX_BURN_IN_USER_ID", "parallax-burn-in-synth")
+    if not raw:
+        raise SystemExit(
+            "PARALLAX_BURN_IN_USER_ID must be a non-empty string; "
+            "synthetic loader has no auth so user_id is required by /query."
+        )
+    return raw
 
 
 def _resolve_fixture_path() -> Path:
@@ -99,6 +110,7 @@ def run_loader(
     *,
     endpoint: str,
     sample_keys: Sequence[str],
+    user_id: str,
     interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
     error_budget: int = CONSECUTIVE_ERROR_BUDGET,
     iterations: int | None = None,
@@ -129,24 +141,33 @@ def run_loader(
             key = sample_keys[idx % len(sample_keys)]
             idx += 1
             try:
-                response = client.get(f"{endpoint}?kind=recent&q={key}")
-                if response.is_error:
+                response = client.get(f"{endpoint}?kind=recent&q={key}&user_id={user_id}")
+                status = response.status_code
+                if status >= 500:
                     consecutive_errors += 1
                     LOG.warning(
-                        "synth_qry key=%s status=%d consecutive=%d",
-                        key,
-                        response.status_code,
-                        consecutive_errors,
+                        "synth_qry key=%s status=%d consecutive=%d (5xx)",
+                        key, status, consecutive_errors,
                     )
                     if consecutive_errors >= error_budget:
                         LOG.critical(
-                            "synth loader exhausted error budget=%d; exiting "
+                            "synth loader exhausted error budget=%d on 5xx; exiting "
                             "so systemd Restart=always re-launches",
                             error_budget,
                         )
                         return 75
+                elif response.is_error:
+                    # 4xx = server alive but rejected request (e.g. bad query
+                    # shape, missing auth). Don't burn restart budget — we
+                    # would just flap. Reset and log loudly so an operator
+                    # can spot persistent client-side mismatch.
+                    LOG.warning(
+                        "synth_qry key=%s status=%d (4xx, not counted)",
+                        key, status,
+                    )
+                    consecutive_errors = 0
                 else:
-                    LOG.info("synth_qry key=%s status=%d", key, response.status_code)
+                    LOG.info("synth_qry key=%s status=%d", key, status)
                     consecutive_errors = 0
             except httpx.HTTPError as exc:
                 consecutive_errors += 1
@@ -183,17 +204,20 @@ def main() -> int:
         format="%(asctime)sZ %(levelname)s %(name)s %(message)s",
     )
     endpoint = _resolve_endpoint()
+    user_id = _resolve_user_id()
     fixture_path = _resolve_fixture_path()
     sample_keys = _load_fixture(fixture_path)
     LOG.info(
-        "synth loader starting endpoint=%s fixture=%s keys=%d",
+        "synth loader starting endpoint=%s user_id=%s fixture=%s keys=%d",
         endpoint,
+        user_id,
         fixture_path,
         len(sample_keys),
     )
     return run_loader(
         endpoint=endpoint,
         sample_keys=sample_keys,
+        user_id=user_id,
         interval_seconds=_interval_seconds(),
     )
 

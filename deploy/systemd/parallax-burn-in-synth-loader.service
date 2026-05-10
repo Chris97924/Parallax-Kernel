@@ -19,7 +19,8 @@ Type=simple
 # Endpoint + fixture are env-driven so the unit file is environment-
 # agnostic. Operator overrides via:
 #   ~/.config/systemd/user/parallax-burn-in-synth-loader.service.d/override.conf
-Environment=PARALLAX_BURN_IN_ENDPOINT=http://127.0.0.1:8000/v1/dual-read
+Environment=PARALLAX_BURN_IN_ENDPOINT=http://127.0.0.1:8000/query
+Environment=PARALLAX_BURN_IN_USER_ID=parallax-burn-in-synth
 # PARALLAX_BURN_IN_FIXTURE MUST be set in an override.conf — there is no
 # safe default. The script aborts loudly if it is unset.
 ExecStart=/usr/bin/env python3 %h/parallax-kernel/scripts/burn-in-synth-loader.py

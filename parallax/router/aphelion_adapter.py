@@ -159,6 +159,14 @@ class AphelionReadAdapter:
             AphelionUnreachableError: any failure surfaces as the M3 contract
                 error so DualReadRouter can classify outcome consistently.
         """
+        # Clear cached envelope/audit state up-front so any subsequent failure
+        # (loader, validator, reader, canonicalize, parse_envelope) cannot leak
+        # values from a prior successful query into ``last_envelope`` /
+        # ``last_audit_row``. Real values are reassigned only after the full
+        # success path below.
+        self.last_envelope = None
+        self.last_audit_row = None
+
         subject = _resolve_subject(request)
         candidates = tuple(self._claim_loader(request))
 
@@ -206,16 +214,20 @@ class AphelionReadAdapter:
         )
 
         if primary_claim_id is None or primary_package_id is None:
-            self.last_envelope = None
-            self.last_audit_row = None
             return evidence
 
+        # Spec ``audit-db-path-config.md`` L113 requires the audit row's ``ts``
+        # to match ``envelope.created_at``. Compute a single emission timestamp
+        # here and reuse it for both fields so the contract holds even when the
+        # reader runs against a non-default ``query_time`` or crosses a second
+        # boundary between the audit row and the envelope construction.
+        emit_ts = _utc_now_iso_z()
         envelope_message_id = str(uuid.uuid4())
         audit_row_data: dict[str, Any] = {
             "claim_id": primary_claim_id,
             "package_id": primary_package_id,
             "envelope_message_id": envelope_message_id,
-            "ts": result.used_query_time,
+            "ts": emit_ts,
             "outcome": outcome,
             "source": "aphelion",
             # session_id is required-non-empty per audit_writer canonicalization
@@ -246,7 +258,7 @@ class AphelionReadAdapter:
             "envelope_version": ENVELOPE_VERSION_LITERAL,
             "schema_version": ENVELOPE_SCHEMA_VERSION,
             "message_id": envelope_message_id,
-            "created_at": _utc_now_iso_z(),
+            "created_at": emit_ts,
             "source": Source.APHELION.value,
             "audit_db_ref": audit_row.sha256_hex(),
             "payload_type": PayloadType.QUERY_RESULT.value,

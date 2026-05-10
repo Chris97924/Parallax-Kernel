@@ -198,6 +198,29 @@ def test_audit_db_ref_matches_canonical_sha256() -> None:
     assert env.audit_db_ref == row.sha256_hex()
 
 
+def test_audit_row_ts_matches_envelope_created_at() -> None:
+    """Spec ``audit-db-path-config.md`` L113: audit row ``ts`` MUST equal envelope ``created_at``.
+
+    Regression for Codex P2 review on PR #51: the previous implementation
+    populated ``audit_row.ts`` from ``result.used_query_time`` (reader time)
+    and ``envelope.created_at`` from a freshly computed timestamp, which can
+    diverge when a non-default ``query_time`` is supplied or a second boundary
+    is crossed between the two computations.
+    """
+    older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
+    newer = _claim(
+        claim_id="01963f7d-7000-7000-8000-000000000011",
+        supersedes=["01963f7d-7000-7000-8000-000000000010"],
+    )
+    adapter = AphelionReadAdapter(claim_loader=lambda _r: [older, newer])
+    adapter.query(_request())
+
+    env = adapter.last_envelope
+    row = adapter.last_audit_row
+    assert env is not None and row is not None
+    assert row.data["ts"] == env.created_at
+
+
 def test_envelope_round_trips_through_parse_envelope() -> None:
     """Emitted envelope passes parse_envelope without raising."""
     older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
@@ -252,3 +275,50 @@ def test_schema_error_surfaces_as_unreachable() -> None:
     with pytest.raises(AphelionUnreachableError) as excinfo:
         adapter.query(_request())
     assert excinfo.value.reason == "claim_schema_error"
+
+
+def test_failed_query_clears_last_envelope_and_last_audit_row() -> None:
+    """A failing query MUST reset cached envelope/audit state.
+
+    Regression for Codex P2 review on PR #51: the previous implementation
+    only reset ``last_envelope`` / ``last_audit_row`` on the explicit
+    primary-None branch, so any exception raised before that branch (e.g.
+    schema validation failure) left stale values from a prior successful
+    query visible to callers.
+    """
+    older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
+    newer = _claim(
+        claim_id="01963f7d-7000-7000-8000-000000000011",
+        supersedes=["01963f7d-7000-7000-8000-000000000010"],
+    )
+
+    state: dict[str, list[Mapping[str, Any]]] = {
+        "claims": [older, newer],
+    }
+
+    def loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
+        return state["claims"]
+
+    adapter = AphelionReadAdapter(claim_loader=loader)
+
+    # First call: successful supersession query populates the cache.
+    adapter.query(_request())
+    assert adapter.last_envelope is not None
+    assert adapter.last_audit_row is not None
+
+    # Second call on the SAME adapter with a v0.3-invalid claim must clear
+    # the cached values before the SchemaError surfaces as the M3 contract
+    # error — never leave stale envelope/audit data behind.
+    state["claims"] = [
+        {
+            "claim_id": "01963f7d-7000-7000-8000-000000000050",
+            "subject": "subject:foo",
+            "polarity": "affirm",
+            "conflict_class": "ambiguity",  # reserved derivation field
+        }
+    ]
+    with pytest.raises(AphelionUnreachableError) as excinfo:
+        adapter.query(_request())
+    assert excinfo.value.reason == "claim_schema_error"
+    assert adapter.last_envelope is None
+    assert adapter.last_audit_row is None

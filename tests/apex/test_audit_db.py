@@ -695,8 +695,10 @@ class TestWriteRow:
     def test_digest_length_check_rejects_short_and_long(
         self, conn: sqlite3.Connection
     ) -> None:
-        """E2 dedicated test: signer_manifest_digest=64-char rule."""
-        for bad_digest in ("a" * 63, "a" * 65, ""):
+        """E2 + F1: signer_manifest_digest must be exactly 64 chars
+        OR empty string (unsigned packages, spec §6.1). 63/65 still
+        reject."""
+        for bad_digest in ("a" * 63, "a" * 65):
             with pytest.raises(sqlite3.IntegrityError, match="signer_manifest_digest"):
                 conn.execute(
                     "INSERT INTO audit_row ("
@@ -715,6 +717,36 @@ class TestWriteRow:
                         "2026-05-09T14:23:11Z",
                     ),
                 )
+
+    def test_digest_empty_string_accepted_for_unsigned_packages(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """F1: spec §6.1 allows signer_manifest_digest='' for unsigned
+        Aphelion packages. The CHECK must accept this case while still
+        rejecting other non-64 lengths."""
+        conn.execute(
+            "INSERT INTO audit_row ("
+            "claim_id,envelope_message_id,outcome,package_id,session_id,"
+            "signer_id,signer_manifest_digest,source,ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                "0193e2b1-0001-7000-8000-000000000051",
+                "b3d7e2a1-4f8c-4b9d-8e3a-12c000000051",
+                "hit",
+                "0193ef00-0001-7000-8000-000000000051",
+                "sess-unsigned",
+                "",  # unsigned: signer_id also empty per spec §6.1
+                "",  # empty digest — must be accepted
+                "aphelion",
+                "2026-05-09T14:23:11Z",
+            ),
+        )
+        # Row landed; subsequent read confirms it.
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM audit_row WHERE envelope_message_id = ?",
+            ("b3d7e2a1-4f8c-4b9d-8e3a-12c000000051",),
+        ).fetchone()
+        assert count == 1
 
     def test_in_transaction_precondition_rejected(self) -> None:
         """E6c: write_audit_row guards against conn already in a txn."""

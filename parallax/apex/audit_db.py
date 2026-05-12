@@ -137,8 +137,14 @@ _SCHEMA_STATEMENTS: Final = (
         package_id              TEXT NOT NULL,
         session_id              TEXT NOT NULL,
         signer_id               TEXT NOT NULL,
+        -- signer_manifest_digest: sha256 hex (64 chars) for signed
+        -- packages, OR empty string for unsigned Aphelion packages
+        -- (spec §6.1 + audit_writer.canonicalize_row's empty-string
+        -- exemption for this column). The empty-string allowance is
+        -- a deliberate gap — NULL is still NOT NULL-rejected.
         signer_manifest_digest  TEXT NOT NULL
-            CHECK (length(signer_manifest_digest) = 64),
+            CHECK (length(signer_manifest_digest) = 64
+                   OR signer_manifest_digest = ''),
         source                  TEXT NOT NULL
             CHECK (source IN ({_SOURCE_SQL_LITERALS})),
         -- ts: defense-in-depth gate matching the writer's strict

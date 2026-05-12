@@ -107,9 +107,8 @@ class TestResolvePath:
         assert result == custom
 
     def test_unset_env_rejected(self) -> None:
-        """D8: no hardcoded default — unset env raises EX_CONFIG so an
-        operator does not silently inherit a Chris-specific path baked
-        into the package."""
+        """Unset env raises EX_CONFIG — no hardcoded operator-specific
+        default is baked into the package."""
         with pytest.raises(AuditDbConfigError, match="is not set"):
             resolve_audit_db_path(env={})
 
@@ -118,7 +117,7 @@ class TestResolvePath:
             resolve_audit_db_path(env={ENV_VAR_NAME: ""})
 
     def test_no_chris_specific_paths_in_module(self) -> None:
-        """D8: ensure no operator-specific paths leaked back into the module."""
+        """Ensure no operator-specific paths leaked back into the module."""
         import inspect
 
         src = inspect.getsource(audit_db_mod)
@@ -176,7 +175,7 @@ class TestStartupGates:
     def test_quick_check_budget_enforced_via_progress_handler_abort(
         self, audit_db_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """D2: when the progress handler is invoked DURING quick_check and
+        """When the progress handler is invoked DURING quick_check and
         returns 1, SQLite aborts the PRAGMA and the first error arm
         (``aborted via progress handler``) fires — distinct from the
         post-hoc elapsed check path. We force the handler to fire on the
@@ -315,7 +314,7 @@ class TestSchemaBootstrap:
     def test_schema_version_null_value_rejected(
         self, audit_db_path: pathlib.Path
     ) -> None:
-        """D9: ``MAX(version)`` returning NULL (empty table) raises
+        """``MAX(version)`` returning NULL (empty table) raises
         EX_CONFIG instead of silently passing. Simulates the race where
         the version row is missing after bootstrap (or was wiped)."""
         c = open_audit_db(audit_db_path)
@@ -329,9 +328,9 @@ class TestSchemaBootstrap:
         audit_db_path: pathlib.Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D9 + E5: when a schema DDL statement raises mid-transaction,
-        the inner ROLLBACK runs (best-effort) AND leaves the DB clean —
-        the broken statement's side effects are reverted.
+        """When a schema DDL statement raises mid-transaction, the inner
+        ROLLBACK runs (best-effort) AND leaves the DB clean — the broken
+        statement's side effects are reverted.
         """
         # Inject a broken DDL into _SCHEMA_STATEMENTS that will raise
         # sqlite3.OperationalError when executed.
@@ -342,8 +341,8 @@ class TestSchemaBootstrap:
         monkeypatch.setattr(audit_db_mod, "_SCHEMA_STATEMENTS", broken)
         with pytest.raises(sqlite3.OperationalError):
             open_audit_db(audit_db_path)
-        # E5: prove ROLLBACK actually ran by reopening the DB without
-        # the broken DDL and asserting it succeeds cleanly + the
+        # Prove ROLLBACK actually ran by reopening the DB without the
+        # broken DDL and asserting it succeeds cleanly + the
         # half-applied table is absent. If ROLLBACK had been a no-op
         # the partial schema would persist and either the second open
         # would fail or the __broken__ table would be present.
@@ -368,7 +367,7 @@ class TestSchemaBootstrap:
         audit_db_path: pathlib.Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D9: if the BEGIN IMMEDIATE in the write probe succeeds but
+        """If the BEGIN IMMEDIATE in the write probe succeeds but
         the subsequent ROLLBACK raises, the failure surfaces as
         :class:`AuditDbConfigError` (EX_CONFIG) not a raw
         :class:`sqlite3.OperationalError`. Spec §4.5 path."""
@@ -404,7 +403,7 @@ class TestSchemaBootstrap:
         audit_db_path: pathlib.Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D7: when reopening a DB whose version is ahead of the code,
+        """When reopening a DB whose version is ahead of the code,
         :func:`_apply_schema` must NOT be called — the pre-apply guard
         aborts first so stale code cannot mutate the version table via
         ``INSERT OR IGNORE``.
@@ -462,7 +461,7 @@ class TestEnumDrift:
         assert ddl.count("source IN (") == 1
 
     def test_sql_string_list_escapes_single_quotes(self) -> None:
-        """D3: a future enum value containing ``'`` must double-escape
+        """A future enum value containing ``'`` must double-escape
         rather than break DDL parsing.
 
         Verifies both the generation rule and that the resulting DDL
@@ -487,7 +486,7 @@ class TestEnumDrift:
 
 
 # ---------------------------------------------------------------------------
-# D4 — non-empty enum frozensets enforced at import time
+# Non-empty enum frozensets enforced at import time
 # ---------------------------------------------------------------------------
 
 
@@ -512,8 +511,8 @@ class TestEnumImportGuard:
         [
             ("OUTCOME_VALUES", []),
             ("SOURCE_VALUES", []),
-            # E1: -O strips bare `assert` — guard must use if/raise so
-            # this variant still aborts under optimization.
+            # -O strips bare `assert` — guard must use if/raise so this
+            # variant still aborts under optimization.
             ("OUTCOME_VALUES", ["-O"]),
         ],
     )
@@ -525,7 +524,7 @@ class TestEnumImportGuard:
         The module-level guard must raise AssertionError at import —
         proving fail-fast rather than silent always-false CHECK.
 
-        Parametrized over both enum frozensets + -O optimization (E1).
+        Parametrized over both enum frozensets + -O optimization.
 
         Subprocess isolation is required: ``importlib.reload`` inside the
         test process would swap class identity for imported names like
@@ -623,9 +622,9 @@ class TestWriteRow:
     def test_invalid_outcome_rejected_by_check_constraint(
         self, conn: sqlite3.Connection
     ) -> None:
-        """E2: use a valid 64-char digest + valid signer_id so the
-        outcome CHECK is the ONLY constraint that can fire — without
-        this, the digest-length CHECK could mask the assertion."""
+        """Use a valid 64-char digest + valid signer_id so the outcome
+        CHECK is the ONLY constraint that can fire — without this, the
+        digest-length CHECK could mask the assertion."""
         with pytest.raises(sqlite3.IntegrityError, match="outcome"):
             conn.execute(
                 "INSERT INTO audit_row ("
@@ -648,7 +647,7 @@ class TestWriteRow:
     def test_invalid_source_rejected_by_check_constraint(
         self, conn: sqlite3.Connection
     ) -> None:
-        """E2: same fixture hardening as outcome test above."""
+        """Same fixture hardening as outcome test above."""
         with pytest.raises(sqlite3.IntegrityError, match="source"):
             conn.execute(
                 "INSERT INTO audit_row ("
@@ -671,7 +670,7 @@ class TestWriteRow:
     def test_not_null_required_fields_enforced(
         self, conn: sqlite3.Connection
     ) -> None:
-        """E2: NULL session_id triggers NOT NULL distinctly; all other
+        """NULL session_id triggers NOT NULL distinctly; all other
         fields are valid so no CHECK can fire first."""
         with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
             conn.execute(
@@ -695,9 +694,8 @@ class TestWriteRow:
     def test_digest_length_check_rejects_short_and_long(
         self, conn: sqlite3.Connection
     ) -> None:
-        """E2 + F1: signer_manifest_digest must be exactly 64 chars
-        OR empty string (unsigned packages, spec §6.1). 63/65 still
-        reject."""
+        """signer_manifest_digest must be exactly 64 chars OR empty
+        string (unsigned packages, spec §6.1). 63/65 still reject."""
         for bad_digest in ("a" * 63, "a" * 65):
             with pytest.raises(sqlite3.IntegrityError, match="signer_manifest_digest"):
                 conn.execute(
@@ -721,7 +719,7 @@ class TestWriteRow:
     def test_digest_empty_string_accepted_for_unsigned_packages(
         self, conn: sqlite3.Connection
     ) -> None:
-        """F1: spec §6.1 allows signer_manifest_digest='' for unsigned
+        """Spec §6.1 allows signer_manifest_digest='' for unsigned
         Aphelion packages. The CHECK must accept this case while still
         rejecting other non-64 lengths."""
         conn.execute(
@@ -749,7 +747,7 @@ class TestWriteRow:
         assert count == 1
 
     def test_in_transaction_precondition_rejected(self) -> None:
-        """E6c: write_audit_row guards against conn already in a txn."""
+        """write_audit_row guards against conn already in a txn."""
         row = canonicalize_row(_valid_row())
 
         class FakeBusyConn:
@@ -780,7 +778,7 @@ class TestWriteRow:
         assert count == 0
 
     def test_rollback_database_error_does_not_mask_insert_error(self) -> None:
-        """D6: if the INSERT raises and the subsequent ROLLBACK also raises
+        """If the INSERT raises and the subsequent ROLLBACK also raises
         a :class:`sqlite3.DatabaseError` (not just :class:`OperationalError`),
         the original INSERT exception must reach the caller, not the
         ROLLBACK one.
@@ -821,7 +819,7 @@ class TestWriteRow:
     def test_commit_failure_raises_write_error_and_clears_transaction(
         self,
     ) -> None:
-        """D5: a COMMIT that raises (disk full, SQLITE_FULL) must surface
+        """A COMMIT that raises (disk full, SQLITE_FULL) must surface
         as :class:`AuditDbWriteError` AND best-effort ROLLBACK runs so
         the connection returns to autocommit state. No raw
         ``sqlite3.OperationalError`` leaks to the caller.
@@ -856,7 +854,7 @@ class TestWriteRow:
         )
 
     def test_commit_failure_when_rollback_also_fails(self) -> None:
-        """D5: if even the best-effort ROLLBACK after COMMIT-fail raises,
+        """If even the best-effort ROLLBACK after COMMIT-fail raises,
         the caller still sees AuditDbWriteError (not the secondary error)."""
         row = canonicalize_row(_valid_row())
         commit_error = sqlite3.OperationalError("database or disk is full")
@@ -904,11 +902,11 @@ _GOLDEN_ROW: dict[str, Any] = {
     "source": "aphelion",
     "ts": "2026-05-09T14:23:11Z",
 }
-# D1: HARDCODED hex literal — intentionally NOT computed at import time.
+# HARDCODED hex literal — intentionally NOT computed at import time.
 # A live call to ``sha256_hex(canonical_dumps(_GOLDEN_ROW))`` here would
-# drift with the canonicalizer (tautology — round-2 found Bundle C left
-# this self-referential). The literal below was computed once on
-# 2026-05-12 against canonical_json v1; if it ever fails the test, either
+# drift with the canonicalizer (tautology — the test would always pass
+# even if canonicalization changed). The literal below was computed once
+# on 2026-05-12 against canonical_json v1; if it ever fails the test, either
 # the canonicalizer changed (investigate before regenerating) or
 # _GOLDEN_ROW changed (also intentional? otherwise revert).
 #

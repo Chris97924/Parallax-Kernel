@@ -235,7 +235,7 @@ def test_wal_reads_not_blocked_by_writes(tmp_path: pathlib.Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# D-poly scenario: validate=True under concurrent open
+# Scenario 4: validate=True under concurrent open
 # ---------------------------------------------------------------------------
 
 
@@ -253,7 +253,7 @@ def _worker_validated_open_and_write(
 
 
 def test_validated_open_and_write_concurrent(tmp_path: pathlib.Path) -> None:
-    """D-poly: ensure spec §4 gates (quick_check + write_probe) under
+    """Ensure spec §4 gates (quick_check + write_probe) under
     contention don't deadlock or starve. ``BEGIN IMMEDIATE`` in the
     write probe momentarily holds an EXCLUSIVE lock — busy_timeout=5s
     should let parallel openers serialize without raising.

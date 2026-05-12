@@ -2,7 +2,7 @@
 
 Pins ``docs/m5-prep/audit-db-path-config.md`` §3-§6 normative contract:
 
-  * §3 — ``PARALLAX_AUDIT_DB_PATH`` env var with OS-family default
+  * §3 — ``PARALLAX_AUDIT_DB_PATH`` env var; unset/empty rejected as EX_CONFIG
   * §4 — startup validation gates (absolute path, parent exists+writable,
          ``PRAGMA quick_check`` within 30 s with a progress-handler abort,
          write-permission probe via ``BEGIN IMMEDIATE`` + ``ROLLBACK``)
@@ -21,9 +21,8 @@ operate against a newer DB.
 
 Concurrency: WAL journal mode, ``busy_timeout=5000`` ms,
 ``wal_autocheckpoint=200`` pages, autocommit isolation with explicit
-``BEGIN IMMEDIATE`` around the writer's INSERT, mirroring
-:mod:`parallax.canary.audit_log`. Each producer thread/process gets its
-own connection via :func:`open_audit_db`.
+``BEGIN IMMEDIATE`` around the writer's INSERT. Each producer
+thread/process gets its own connection via :func:`open_audit_db`.
 """
 
 from __future__ import annotations
@@ -108,7 +107,7 @@ def _sql_string_list(values: frozenset[str]) -> str:
 # as always-false → every write would silently IntegrityError. Fail fast
 # at import time instead so an operator-visible startup error surfaces.
 # Bare `assert` would be stripped under `python -O` / PYTHONOPTIMIZE=1
-# (E1) so use explicit if/raise to survive optimized builds.
+# so use explicit if/raise to survive optimized builds.
 if not OUTCOME_VALUES:
     raise AssertionError(
         "parallax.apex.audit_writer.OUTCOME_VALUES must be non-empty; "
@@ -261,7 +260,7 @@ def _check_parent_writable(path: pathlib.Path) -> None:
     if not parent.exists():
         raise AuditDbConfigError(
             f"EX_CONFIG: audit_db parent directory does not exist: {parent}. "
-            "Create it before starting parallax-server (spec §6 Chris-action 1+2)."
+            "Create it before starting parallax-server (spec §6)."
         )
     if not parent.is_dir():
         raise AuditDbConfigError(
@@ -455,14 +454,9 @@ def open_audit_db(
         _check_absolute_path(resolved)
         _check_parent_writable(resolved)
 
-    # Note on PRAGMA busy_timeout ordering (spec §4.3 "FIRST"):
-    # ``sqlite3.connect(timeout=N)`` internally calls
-    # ``sqlite3_busy_timeout()`` to N×1000 ms before any user code runs.
-    # We pass ``_CONNECT_TIMEOUT_SECONDS = _BUSY_TIMEOUT_MS / 1000`` so
-    # the connect-time default already matches the spec value, then
-    # re-apply via PRAGMA as the first user statement for traceability.
-    # If the two constants ever diverge the file-level Final binding
-    # makes the mismatch a static-analysis lint, not a runtime surprise.
+    # ``timeout=N`` makes sqlite3 call ``sqlite3_busy_timeout(N×1000)``
+    # before any user statement runs (spec §4.3 "FIRST"); the explicit
+    # PRAGMA below re-applies the same value for traceability.
     conn = sqlite3.connect(
         str(resolved),
         isolation_level=None,
@@ -477,8 +471,8 @@ def open_audit_db(
         if validate:
             _quick_check(conn)
             _write_probe(conn)
-        # D7: verify BEFORE applying schema so stale code (v=N) opening
-        # a newer DB (v=N+1) does not mutate the version table via the
+        # Verify BEFORE applying schema so stale code (v=N) opening a
+        # newer DB (v=N+1) does not mutate the version table via the
         # INSERT OR IGNORE in _apply_schema.
         _verify_schema_version_if_present(conn)
         _apply_schema(conn)
@@ -548,11 +542,10 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
     placeholders = ",".join("?" * len(columns))
     sql = f"INSERT INTO audit_row ({','.join(columns)}) VALUES ({placeholders})"
 
-    # E6b: BEGIN IMMEDIATE can fail on lock contention (SQLITE_BUSY
-    # past busy_timeout). Wrap symmetrically with the COMMIT path so
-    # callers see a single error contract (AuditDbWriteError) instead
-    # of a raw OperationalError on one path and a wrapped error on the
-    # other.
+    # BEGIN / INSERT / COMMIT all wrapped so callers see a single
+    # AuditDbWriteError contract instead of raw sqlite3.Error variants.
+    # ROLLBACK is best-effort on the failure paths; a secondary
+    # rollback failure is logged but does not mask the primary error.
     try:
         conn.execute("BEGIN IMMEDIATE")
     except sqlite3.Error as exc:
@@ -562,9 +555,9 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
     try:
         conn.execute(sql, values)
     except Exception:
-        # Catch sqlite3.Error (parent of OperationalError + DatabaseError)
-        # so a corrupt-WAL ROLLBACK failure does not replace the original
-        # INSERT exception in the caller's traceback (round-2 D6).
+        # sqlite3.Error covers OperationalError + DatabaseError so a
+        # corrupt-WAL ROLLBACK failure does not replace the original
+        # INSERT exception in the caller's traceback.
         try:
             conn.execute("ROLLBACK")
         except sqlite3.Error as rb_exc:
@@ -573,11 +566,6 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
                 rb_exc,
             )
         raise
-    # D5: COMMIT can raise on disk-full / SQLITE_FULL / SQLITE_BUSY. Wrap
-    # it so the transaction does not leak and the failure surfaces as a
-    # structured error instead of a raw OperationalError. Connection
-    # state is restored to autocommit via best-effort ROLLBACK; if even
-    # that fails the original COMMIT exception still reaches the caller.
     try:
         conn.execute("COMMIT")
     except sqlite3.Error as exc:

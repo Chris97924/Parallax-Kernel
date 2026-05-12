@@ -34,6 +34,7 @@ from parallax.apex.audit_db import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
     AuditDbConfigError,
+    AuditDbUsageError,
     AuditDbWriteError,
     open_audit_db,
     resolve_audit_db_path,
@@ -328,9 +329,10 @@ class TestSchemaBootstrap:
         audit_db_path: pathlib.Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """D9: when a schema DDL statement raises mid-transaction, the
-        inner ROLLBACK runs (best-effort) and the ORIGINAL exception
-        propagates — even if the rollback itself raises."""
+        """D9 + E5: when a schema DDL statement raises mid-transaction,
+        the inner ROLLBACK runs (best-effort) AND leaves the DB clean —
+        the broken statement's side effects are reverted.
+        """
         # Inject a broken DDL into _SCHEMA_STATEMENTS that will raise
         # sqlite3.OperationalError when executed.
         broken = (
@@ -340,6 +342,26 @@ class TestSchemaBootstrap:
         monkeypatch.setattr(audit_db_mod, "_SCHEMA_STATEMENTS", broken)
         with pytest.raises(sqlite3.OperationalError):
             open_audit_db(audit_db_path)
+        # E5: prove ROLLBACK actually ran by reopening the DB without
+        # the broken DDL and asserting it succeeds cleanly + the
+        # half-applied table is absent. If ROLLBACK had been a no-op
+        # the partial schema would persist and either the second open
+        # would fail or the __broken__ table would be present.
+        monkeypatch.undo()
+        c = open_audit_db(audit_db_path)
+        try:
+            tables = {
+                r["name"]
+                for r in c.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            assert "audit_row" in tables, "fresh open must succeed after rollback"
+            assert "__broken__" not in tables, (
+                "broken DDL state leaked past rollback — ROLLBACK did not run"
+            )
+        finally:
+            c.close()
 
     def test_write_probe_rollback_failure_raises_ex_config(
         self,
@@ -485,11 +507,25 @@ class TestEnumImportGuard:
 
         assert len(SOURCE_VALUES) > 0
 
-    def test_empty_frozenset_assertion_raises_on_import(self) -> None:
-        """Spawn a fresh interpreter where ``audit_writer.OUTCOME_VALUES``
-        is monkeypatched to ``frozenset()`` BEFORE ``audit_db`` is
-        imported. The module-level assert must raise AssertionError at
-        import — proving fail-fast rather than silent always-false CHECK.
+    @pytest.mark.parametrize(
+        ("which", "interpreter_args"),
+        [
+            ("OUTCOME_VALUES", []),
+            ("SOURCE_VALUES", []),
+            # E1: -O strips bare `assert` — guard must use if/raise so
+            # this variant still aborts under optimization.
+            ("OUTCOME_VALUES", ["-O"]),
+        ],
+    )
+    def test_empty_frozenset_aborts_audit_db_import(
+        self, which: str, interpreter_args: list[str]
+    ) -> None:
+        """Spawn a fresh interpreter where one of the enum frozensets is
+        monkeypatched to ``frozenset()`` BEFORE ``audit_db`` is imported.
+        The module-level guard must raise AssertionError at import —
+        proving fail-fast rather than silent always-false CHECK.
+
+        Parametrized over both enum frozensets + -O optimization (E1).
 
         Subprocess isolation is required: ``importlib.reload`` inside the
         test process would swap class identity for imported names like
@@ -501,19 +537,20 @@ class TestEnumImportGuard:
 
         script = (
             "import parallax.apex.audit_writer as w; "
-            "w.OUTCOME_VALUES = frozenset(); "
+            f"w.{which} = frozenset(); "
             "import parallax.apex.audit_db"  # should AssertionError here
         )
         result = subprocess.run(
-            [_sys.executable, "-c", script],
+            [_sys.executable, *interpreter_args, "-c", script],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=15,
         )
         assert result.returncode != 0, (
-            "Empty OUTCOME_VALUES must abort audit_db import"
+            f"Empty {which} (interpreter_args={interpreter_args}) "
+            "must abort audit_db import"
         )
-        assert "OUTCOME_VALUES must be non-empty" in result.stderr, (
+        assert f"{which} must be non-empty" in result.stderr, (
             f"Expected assertion message in stderr; got: {result.stderr!r}"
         )
 
@@ -586,7 +623,10 @@ class TestWriteRow:
     def test_invalid_outcome_rejected_by_check_constraint(
         self, conn: sqlite3.Connection
     ) -> None:
-        with pytest.raises(sqlite3.IntegrityError):
+        """E2: use a valid 64-char digest + valid signer_id so the
+        outcome CHECK is the ONLY constraint that can fire — without
+        this, the digest-length CHECK could mask the assertion."""
+        with pytest.raises(sqlite3.IntegrityError, match="outcome"):
             conn.execute(
                 "INSERT INTO audit_row ("
                 "claim_id,envelope_message_id,outcome,package_id,session_id,"
@@ -598,8 +638,8 @@ class TestWriteRow:
                     "INVALID_OUTCOME",
                     "0193ef00-0001-7000-8000-000000000099",
                     "sess",
-                    "",
-                    "",
+                    "signer",
+                    "a" * 64,
                     "aphelion",
                     "2026-05-09T14:23:11Z",
                 ),
@@ -608,7 +648,8 @@ class TestWriteRow:
     def test_invalid_source_rejected_by_check_constraint(
         self, conn: sqlite3.Connection
     ) -> None:
-        with pytest.raises(sqlite3.IntegrityError):
+        """E2: same fixture hardening as outcome test above."""
+        with pytest.raises(sqlite3.IntegrityError, match="source"):
             conn.execute(
                 "INSERT INTO audit_row ("
                 "claim_id,envelope_message_id,outcome,package_id,session_id,"
@@ -620,8 +661,8 @@ class TestWriteRow:
                     "hit",
                     "0193ef00-0001-7000-8000-000000000098",
                     "sess",
-                    "",
-                    "",
+                    "signer",
+                    "a" * 64,
                     "openai",
                     "2026-05-09T14:23:11Z",
                 ),
@@ -630,7 +671,9 @@ class TestWriteRow:
     def test_not_null_required_fields_enforced(
         self, conn: sqlite3.Connection
     ) -> None:
-        with pytest.raises(sqlite3.IntegrityError):
+        """E2: NULL session_id triggers NOT NULL distinctly; all other
+        fields are valid so no CHECK can fire first."""
+        with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
             conn.execute(
                 "INSERT INTO audit_row ("
                 "claim_id,envelope_message_id,outcome,package_id,session_id,"
@@ -642,12 +685,49 @@ class TestWriteRow:
                     "hit",
                     "0193ef00-0001-7000-8000-000000000097",
                     None,
-                    "",
-                    "",
+                    "signer",
+                    "a" * 64,
                     "aphelion",
                     "2026-05-09T14:23:11Z",
                 ),
             )
+
+    def test_digest_length_check_rejects_short_and_long(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """E2 dedicated test: signer_manifest_digest=64-char rule."""
+        for bad_digest in ("a" * 63, "a" * 65, ""):
+            with pytest.raises(sqlite3.IntegrityError, match="signer_manifest_digest"):
+                conn.execute(
+                    "INSERT INTO audit_row ("
+                    "claim_id,envelope_message_id,outcome,package_id,session_id,"
+                    "signer_id,signer_manifest_digest,source,ts) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        "0193e2b1-0001-7000-8000-000000000050",
+                        f"b3d7e2a1-4f8c-4b9d-8e3a-{len(bad_digest):012d}",
+                        "hit",
+                        "0193ef00-0001-7000-8000-000000000050",
+                        "sess",
+                        "signer",
+                        bad_digest,
+                        "aphelion",
+                        "2026-05-09T14:23:11Z",
+                    ),
+                )
+
+    def test_in_transaction_precondition_rejected(self) -> None:
+        """E6c: write_audit_row guards against conn already in a txn."""
+        row = canonicalize_row(_valid_row())
+
+        class FakeBusyConn:
+            in_transaction = True
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                raise AssertionError("execute must not run when conn is busy")
+
+        with pytest.raises(AuditDbUsageError, match="autocommit"):
+            write_audit_row(FakeBusyConn(), row)  # type: ignore[arg-type]
 
     def test_canonicalize_bypass_rejected(self, conn: sqlite3.Connection) -> None:
         """Constructing AuditRow directly with invalid data must fail at write.

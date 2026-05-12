@@ -44,6 +44,10 @@ from parallax.apex.audit_writer import (
 )
 
 _log = logging.getLogger(__name__)
+# Standard library practice (PEP 282 / logging HOWTO): a library module
+# attaches a NullHandler so an application that has not configured the
+# root logger does not emit "No handlers" warnings on library log calls.
+_log.addHandler(logging.NullHandler())
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
@@ -53,6 +57,7 @@ __all__ = [
     "QUICK_CHECK_BUDGET_SECONDS",
     "REQUIRED_COLUMNS",
     "AuditDbConfigError",
+    "AuditDbUsageError",
     "AuditDbWriteError",
     "open_audit_db",
     "resolve_audit_db_path",
@@ -102,14 +107,18 @@ def _sql_string_list(values: frozenset[str]) -> str:
 # Empty enum frozensets generate `outcome IN ()` which SQLite evaluates
 # as always-false → every write would silently IntegrityError. Fail fast
 # at import time instead so an operator-visible startup error surfaces.
-assert OUTCOME_VALUES, (
-    "parallax.apex.audit_writer.OUTCOME_VALUES must be non-empty; "
-    "empty enum would silently reject every audit row at write time"
-)
-assert SOURCE_VALUES, (
-    "parallax.apex.audit_writer.SOURCE_VALUES must be non-empty; "
-    "empty enum would silently reject every audit row at write time"
-)
+# Bare `assert` would be stripped under `python -O` / PYTHONOPTIMIZE=1
+# (E1) so use explicit if/raise to survive optimized builds.
+if not OUTCOME_VALUES:
+    raise AssertionError(
+        "parallax.apex.audit_writer.OUTCOME_VALUES must be non-empty; "
+        "empty enum would silently reject every audit row at write time"
+    )
+if not SOURCE_VALUES:
+    raise AssertionError(
+        "parallax.apex.audit_writer.SOURCE_VALUES must be non-empty; "
+        "empty enum would silently reject every audit row at write time"
+    )
 _OUTCOME_SQL_LITERALS: Final = _sql_string_list(OUTCOME_VALUES)
 _SOURCE_SQL_LITERALS: Final = _sql_string_list(SOURCE_VALUES)
 
@@ -132,8 +141,13 @@ _SCHEMA_STATEMENTS: Final = (
             CHECK (length(signer_manifest_digest) = 64),
         source                  TEXT NOT NULL
             CHECK (source IN ({_SOURCE_SQL_LITERALS})),
+        -- ts: defense-in-depth gate matching the writer's strict
+        -- 20-char ISO-8601 second-precision UTC format. The writer
+        -- (audit_writer.canonicalize_row) is the source-of-truth
+        -- validator; this CHECK exists as last-resort sanity for
+        -- direct INSERTs that bypass canonicalize_row.
         ts                      TEXT NOT NULL
-            CHECK (ts LIKE '____-__-__T__:__:__%Z'),
+            CHECK (ts LIKE '____-__-__T__:__:__Z'),
         aphelion_hash           TEXT,
         local_hash              TEXT,
         reason_code             TEXT
@@ -170,6 +184,17 @@ class AuditDbWriteError(RuntimeError):
     issue worthy of ``EX_CONFIG`` exit. Callers at the envelope-emit
     boundary should log + degrade gracefully (e.g. queue + retry) rather
     than exit the process.
+    """
+
+
+class AuditDbUsageError(RuntimeError):
+    """Audit-db caller-contract violation (caller-side bug).
+
+    Raised when :func:`write_audit_row` is given a connection that
+    already has an open transaction. Distinct from
+    :class:`AuditDbWriteError` so callers can distinguish "I passed the
+    wrong conn" (fix the caller) from "the DB had a write-time storage
+    failure" (degrade gracefully and retry).
     """
 
 
@@ -258,13 +283,20 @@ def _quick_check(conn: sqlite3.Connection) -> None:
         # Defense: any exception inside the callback would be silently
         # discarded by CPython sqlite3 (treated as 0/continue), nulling
         # the budget guard. Force abort on internal failure so a broken
-        # clock or unexpected error still trips the timeout.
+        # clock or unexpected error still trips the timeout. Log the
+        # exception first so operators can distinguish a genuine budget
+        # exhaustion from a programmer error masquerading as a timeout.
         try:
             if time.monotonic() - start > QUICK_CHECK_BUDGET_SECONDS:
                 timed_out = True
                 return 1  # non-zero return → SQLite aborts the running operation
             return 0
-        except BaseException:  # noqa: BLE001 — see above
+        except BaseException as exc:  # noqa: BLE001 — see above
+            _log.warning(
+                "audit_db _progress callback raised unexpectedly: %s",
+                exc,
+                exc_info=True,
+            )
             timed_out = True
             return 1
 
@@ -484,8 +516,10 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
     # BEGIN IMMEDIATE below would raise "cannot start a transaction
     # within a transaction" and leave the caller's txn dirty. Trip
     # early with a clearer error so the contract violation is visible.
+    # The getattr fallback to False is intentional for FakeConn used in
+    # tests; production sqlite3.Connection always exposes in_transaction.
     if getattr(conn, "in_transaction", False):
-        raise RuntimeError(
+        raise AuditDbUsageError(
             "write_audit_row requires a connection in autocommit state "
             "(conn.in_transaction must be False)"
         )
@@ -508,7 +542,17 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
     placeholders = ",".join("?" * len(columns))
     sql = f"INSERT INTO audit_row ({','.join(columns)}) VALUES ({placeholders})"
 
-    conn.execute("BEGIN IMMEDIATE")
+    # E6b: BEGIN IMMEDIATE can fail on lock contention (SQLITE_BUSY
+    # past busy_timeout). Wrap symmetrically with the COMMIT path so
+    # callers see a single error contract (AuditDbWriteError) instead
+    # of a raw OperationalError on one path and a wrapped error on the
+    # other.
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.Error as exc:
+        raise AuditDbWriteError(
+            f"audit_db begin-immediate failed (locked or busy): {exc}"
+        ) from exc
     try:
         conn.execute(sql, values)
     except Exception:
@@ -517,8 +561,11 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
         # INSERT exception in the caller's traceback (round-2 D6).
         try:
             conn.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as rb_exc:
+            _log.warning(
+                "audit_db rollback after insert-failure also raised: %s",
+                rb_exc,
+            )
         raise
     # D5: COMMIT can raise on disk-full / SQLITE_FULL / SQLITE_BUSY. Wrap
     # it so the transaction does not leak and the failure surfaces as a
@@ -530,8 +577,11 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
     except sqlite3.Error as exc:
         try:
             conn.execute("ROLLBACK")
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as rb_exc:
+            _log.warning(
+                "audit_db rollback after commit-failure also raised: %s",
+                rb_exc,
+            )
         raise AuditDbWriteError(
             f"audit_db commit failed (disk full or locked): {exc}"
         ) from exc

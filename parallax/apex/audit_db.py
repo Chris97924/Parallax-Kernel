@@ -448,8 +448,13 @@ def open_audit_db(
         and the audit-row schema present.
 
     Raises:
-        AuditDbConfigError: when spec §4 gates or schema_version
-            verification fail.
+        AuditDbConfigError: when spec §4 gates, schema_version verification,
+            or the underlying :func:`sqlite3.connect` call fail (e.g. file
+            permission errors, invalid path targets, readonly mount edge
+            cases). All :class:`sqlite3.Error` subclasses raised at
+            connection-open time are translated to ``AuditDbConfigError``
+            so callers that only catch ``AuditDbConfigError`` cover this
+            path.
     """
     resolved = pathlib.Path(path) if path is not None else resolve_audit_db_path()
 
@@ -460,11 +465,19 @@ def open_audit_db(
     # ``timeout=N`` makes sqlite3 call ``sqlite3_busy_timeout(N×1000)``
     # before any user statement runs (spec §4.3 "FIRST"); the explicit
     # PRAGMA below re-applies the same value for traceability.
-    conn = sqlite3.connect(
-        str(resolved),
-        isolation_level=None,
-        timeout=_CONNECT_TIMEOUT_SECONDS,
-    )
+    # Translate connect-time sqlite3.Error subclasses to AuditDbConfigError
+    # so spec §4.5 EX_CONFIG signaling matches the other startup gates;
+    # see the docstring for the enumerated failure modes covered.
+    try:
+        conn = sqlite3.connect(
+            str(resolved),
+            isolation_level=None,
+            timeout=_CONNECT_TIMEOUT_SECONDS,
+        )
+    except sqlite3.Error as exc:
+        raise AuditDbConfigError(
+            f"EX_CONFIG: audit_db connection open failed for {str(resolved)!r}: {exc}"
+        ) from exc
     conn.row_factory = sqlite3.Row
     try:
         conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")

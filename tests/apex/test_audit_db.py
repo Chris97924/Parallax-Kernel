@@ -461,6 +461,43 @@ class TestSchemaBootstrap:
         ):
             open_audit_db(audit_db_path)
 
+    def test_open_audit_db_connect_failure_raises_ex_config(
+        self,
+        audit_db_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If :func:`sqlite3.connect` itself raises
+        :class:`sqlite3.OperationalError` (file permission errors,
+        invalid path targets, readonly mount edge cases), the failure
+        must surface as :class:`AuditDbConfigError` not a raw sqlite
+        exception — spec §4.5 EX_CONFIG contract.
+        """
+
+        def _failing_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(audit_db_mod.sqlite3, "connect", _failing_connect)
+        with pytest.raises(AuditDbConfigError, match="connection open failed"):
+            open_audit_db(audit_db_path)
+
+    def test_open_audit_db_connect_database_error_raises_ex_config(
+        self,
+        audit_db_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Broader :class:`sqlite3.Error` subclasses raised at connect
+        time (e.g. :class:`sqlite3.DatabaseError` on a corrupt header)
+        must also map to :class:`AuditDbConfigError` — proves the
+        except clause is widened past ``OperationalError``.
+        """
+
+        def _failing_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+            raise sqlite3.DatabaseError("file is not a database")
+
+        monkeypatch.setattr(audit_db_mod.sqlite3, "connect", _failing_connect)
+        with pytest.raises(AuditDbConfigError, match="connection open failed"):
+            open_audit_db(audit_db_path)
+
     def test_schema_version_verified_before_apply_schema(
         self,
         audit_db_path: pathlib.Path,

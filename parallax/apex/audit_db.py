@@ -28,10 +28,10 @@ own connection via :func:`open_audit_db`.
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import sqlite3
-import sys
 import time
 from collections.abc import Mapping
 from typing import Any, Final
@@ -43,6 +43,8 @@ from parallax.apex.audit_writer import (
     canonicalize_row,
 )
 
+_log = logging.getLogger(__name__)
+
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "ENV_VAR_NAME",
@@ -51,6 +53,7 @@ __all__ = [
     "QUICK_CHECK_BUDGET_SECONDS",
     "REQUIRED_COLUMNS",
     "AuditDbConfigError",
+    "AuditDbWriteError",
     "open_audit_db",
     "resolve_audit_db_path",
     "write_audit_row",
@@ -89,11 +92,24 @@ def _sql_string_list(values: frozenset[str]) -> str:
     """Render a frozenset of strings as a SQL ``IN (...)`` literal list.
 
     Sorted for deterministic DDL — schema bytes are stable across runs
-    so ``CREATE TABLE IF NOT EXISTS`` does not flap.
+    so ``CREATE TABLE IF NOT EXISTS`` does not flap. Single quotes inside
+    a value are SQL-doubled (``'`` → ``''``) so a future enum value
+    containing an apostrophe (e.g. ``o'brien``) cannot break DDL parsing.
     """
-    return ",".join(f"'{v}'" for v in sorted(values))
+    return ",".join(f"'{v.replace(chr(39), chr(39) * 2)}'" for v in sorted(values))
 
 
+# Empty enum frozensets generate `outcome IN ()` which SQLite evaluates
+# as always-false → every write would silently IntegrityError. Fail fast
+# at import time instead so an operator-visible startup error surfaces.
+assert OUTCOME_VALUES, (
+    "parallax.apex.audit_writer.OUTCOME_VALUES must be non-empty; "
+    "empty enum would silently reject every audit row at write time"
+)
+assert SOURCE_VALUES, (
+    "parallax.apex.audit_writer.SOURCE_VALUES must be non-empty; "
+    "empty enum would silently reject every audit row at write time"
+)
 _OUTCOME_SQL_LITERALS: Final = _sql_string_list(OUTCOME_VALUES)
 _SOURCE_SQL_LITERALS: Final = _sql_string_list(SOURCE_VALUES)
 
@@ -112,10 +128,12 @@ _SCHEMA_STATEMENTS: Final = (
         package_id              TEXT NOT NULL,
         session_id              TEXT NOT NULL,
         signer_id               TEXT NOT NULL,
-        signer_manifest_digest  TEXT NOT NULL,
+        signer_manifest_digest  TEXT NOT NULL
+            CHECK (length(signer_manifest_digest) = 64),
         source                  TEXT NOT NULL
             CHECK (source IN ({_SOURCE_SQL_LITERALS})),
-        ts                      TEXT NOT NULL,
+        ts                      TEXT NOT NULL
+            CHECK (ts LIKE '____-__-__T__:__:__%Z'),
         aphelion_hash           TEXT,
         local_hash              TEXT,
         reason_code             TEXT
@@ -144,19 +162,24 @@ class AuditDbConfigError(RuntimeError):
     """
 
 
-def _default_path() -> pathlib.Path:
-    """OS-family default audit-db path per spec §3."""
-    if sys.platform.startswith("win"):
-        return pathlib.Path(r"E:\Parallax\data\audit.db")
-    return pathlib.Path("/home/chris/parallax-kernel/db/audit.db")
+class AuditDbWriteError(RuntimeError):
+    """Audit-db write-time failure (disk full, locked, corrupt WAL).
+
+    Distinct from :class:`AuditDbConfigError` so the server-startup
+    boundary does not wrongly classify runtime disk-full as a config
+    issue worthy of ``EX_CONFIG`` exit. Callers at the envelope-emit
+    boundary should log + degrade gracefully (e.g. queue + retry) rather
+    than exit the process.
+    """
 
 
 def resolve_audit_db_path(env: Mapping[str, str] | None = None) -> pathlib.Path:
-    """Resolve audit-db path from env var with OS-family fallback.
+    """Resolve audit-db path from the ``PARALLAX_AUDIT_DB_PATH`` env var.
 
-    Empty-string env var (``PARALLAX_AUDIT_DB_PATH=``) is rejected as
-    EX_CONFIG — silent fallback to default would mask operator intent.
-    Unset env var (key absent) uses the OS-family default per spec §3.
+    Both unset and empty-string are rejected as EX_CONFIG. Production
+    code MUST NOT embed operator-specific defaults; the spec §3 contract
+    is that the operator sets the env var explicitly, or the server
+    refuses to start. See ``.env.example`` for the documented form.
 
     ``env`` defaults to :data:`os.environ`; an explicit mapping lets
     callers (and tests) override without mutating process state.
@@ -165,11 +188,14 @@ def resolve_audit_db_path(env: Mapping[str, str] | None = None) -> pathlib.Path:
         env = os.environ
     raw = env.get(ENV_VAR_NAME)
     if raw is None:
-        return _default_path()
+        raise AuditDbConfigError(
+            f"EX_CONFIG: {ENV_VAR_NAME} is not set; spec §3 requires the "
+            "audit-db path to be configured explicitly. See .env.example."
+        )
     if raw == "":
         raise AuditDbConfigError(
             f"EX_CONFIG: {ENV_VAR_NAME} is set to empty string; "
-            "unset the variable to use the default, or set an absolute path"
+            "set an absolute path or unset the variable to surface the same error"
         )
     return pathlib.Path(raw)
 
@@ -229,10 +255,18 @@ def _quick_check(conn: sqlite3.Connection) -> None:
 
     def _progress() -> int:
         nonlocal timed_out
-        if time.monotonic() - start > QUICK_CHECK_BUDGET_SECONDS:
+        # Defense: any exception inside the callback would be silently
+        # discarded by CPython sqlite3 (treated as 0/continue), nulling
+        # the budget guard. Force abort on internal failure so a broken
+        # clock or unexpected error still trips the timeout.
+        try:
+            if time.monotonic() - start > QUICK_CHECK_BUDGET_SECONDS:
+                timed_out = True
+                return 1  # non-zero return → SQLite aborts the running operation
+            return 0
+        except BaseException:  # noqa: BLE001 — see above
             timed_out = True
-            return 1  # non-zero return → SQLite aborts the running operation
-        return 0
+            return 1
 
     conn.set_progress_handler(_progress, _PROGRESS_HANDLER_INTERVAL_OPS)
     try:
@@ -308,6 +342,25 @@ def _apply_schema(conn: sqlite3.Connection) -> None:
         cur.execute("COMMIT")
     finally:
         cur.close()
+
+
+def _verify_schema_version_if_present(conn: sqlite3.Connection) -> None:
+    """Pre-apply guard: verify version IFF the version table already exists.
+
+    A stale client (code at v=N) opening a DB previously written by
+    newer code (DB at v=N+1) must abort BEFORE :func:`_apply_schema`
+    runs, or the v=N ``INSERT OR IGNORE INTO audit_db_schema_version``
+    would mutate the newer DB. On a truly fresh DB the table does not
+    yet exist and this is a no-op; :func:`_verify_schema_version`
+    re-checks post-apply as belt-and-braces.
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master "
+        "WHERE type='table' AND name='audit_db_schema_version'"
+    ).fetchone()
+    if row is None:
+        return
+    _verify_schema_version(conn)
 
 
 def _verify_schema_version(conn: sqlite3.Connection) -> None:
@@ -386,15 +439,24 @@ def open_audit_db(
         if validate:
             _quick_check(conn)
             _write_probe(conn)
+        # D7: verify BEFORE applying schema so stale code (v=N) opening
+        # a newer DB (v=N+1) does not mutate the version table via the
+        # INSERT OR IGNORE in _apply_schema.
+        _verify_schema_version_if_present(conn)
         _apply_schema(conn)
         _verify_schema_version(conn)
     except BaseException:
         # Suppress secondary close() failures so the original
-        # AuditDbConfigError reaches the caller.
+        # AuditDbConfigError reaches the caller. Log the close failure
+        # so an operator can investigate (silently swallowing it would
+        # mask file-handle leaks or FS-level errors).
         try:
             conn.close()
-        except Exception:
-            pass
+        except Exception as close_exc:
+            _log.warning(
+                "audit_db connection close failed during error handling: %s",
+                close_exc,
+            )
         raise
     return conn
 
@@ -417,6 +479,17 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
     violation; raises :class:`AuditRowValidationError` if the row data
     does not pass canonicalize_row.
     """
+    # Precondition: writer expects an autocommit connection. If the
+    # caller passes a conn that already has an open transaction the
+    # BEGIN IMMEDIATE below would raise "cannot start a transaction
+    # within a transaction" and leave the caller's txn dirty. Trip
+    # early with a clearer error so the contract violation is visible.
+    if getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "write_audit_row requires a connection in autocommit state "
+            "(conn.in_transaction must be False)"
+        )
+
     # Belt-and-braces: re-validate. canonicalize_row is idempotent on
     # already-validated rows; cost is microseconds vs the cost of a
     # divergent audit chain caused by a row that skipped validation.
@@ -439,9 +512,26 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
     try:
         conn.execute(sql, values)
     except Exception:
+        # Catch sqlite3.Error (parent of OperationalError + DatabaseError)
+        # so a corrupt-WAL ROLLBACK failure does not replace the original
+        # INSERT exception in the caller's traceback (round-2 D6).
         try:
             conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
+        except sqlite3.Error:
             pass
         raise
-    conn.execute("COMMIT")
+    # D5: COMMIT can raise on disk-full / SQLITE_FULL / SQLITE_BUSY. Wrap
+    # it so the transaction does not leak and the failure surfaces as a
+    # structured error instead of a raw OperationalError. Connection
+    # state is restored to autocommit via best-effort ROLLBACK; if even
+    # that fails the original COMMIT exception still reaches the caller.
+    try:
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise AuditDbWriteError(
+            f"audit_db commit failed (disk full or locked): {exc}"
+        ) from exc

@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sqlite3
-from typing import Any
+from typing import Any, Final
 
 import pytest
 
@@ -34,6 +34,7 @@ from parallax.apex.audit_db import (
     OPTIONAL_COLUMNS,
     REQUIRED_COLUMNS,
     AuditDbConfigError,
+    AuditDbWriteError,
     open_audit_db,
     resolve_audit_db_path,
     write_audit_row,
@@ -104,14 +105,26 @@ class TestResolvePath:
         result = resolve_audit_db_path(env={ENV_VAR_NAME: str(custom)})
         assert result == custom
 
-    def test_unset_uses_os_default(self) -> None:
-        result = resolve_audit_db_path(env={})
-        assert result.is_absolute()
-        assert str(result).endswith("audit.db")
+    def test_unset_env_rejected(self) -> None:
+        """D8: no hardcoded default — unset env raises EX_CONFIG so an
+        operator does not silently inherit a Chris-specific path baked
+        into the package."""
+        with pytest.raises(AuditDbConfigError, match="is not set"):
+            resolve_audit_db_path(env={})
 
     def test_empty_env_var_rejected(self) -> None:
         with pytest.raises(AuditDbConfigError, match="empty string"):
             resolve_audit_db_path(env={ENV_VAR_NAME: ""})
+
+    def test_no_chris_specific_paths_in_module(self) -> None:
+        """D8: ensure no operator-specific paths leaked back into the module."""
+        import inspect
+
+        src = inspect.getsource(audit_db_mod)
+        for forbidden in (r"E:\Parallax", "/home/chris", r"E:\\Parallax"):
+            assert forbidden not in src, (
+                f"hardcoded operator-specific path leaked into audit_db.py: {forbidden!r}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -143,26 +156,42 @@ class TestStartupGates:
         with pytest.raises(AuditDbConfigError, match="parent"):
             open_audit_db(bogus)
 
-    def test_quick_check_budget_enforced_via_progress_handler(
+    def test_quick_check_budget_enforced_post_hoc_fallback(
         self, audit_db_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Spec §4.3 — quick_check exceeding budget aborts via progress handler.
-
-        We monkeypatch the budget to a negative value so the first progress
-        callback fires immediately and aborts the running PRAGMA quick_check.
-        Without progress-handler enforcement the test would still pass via
-        the post-hoc elapsed check, but only because of the negative budget;
-        the assertion below verifies the handler path specifically by
-        confirming the AuditDbConfigError reports the
-        EX_AUDIT_DB_SLOW_QUICKCHECK reason.
+        """Spec §4.3 — empty-DB quick_check completes before the progress
+        handler is even invoked, so the post-hoc elapsed check is the
+        sole guard. Verified by asserting the message wording specific
+        to the post-hoc arm (``took X.Ys > budget``).
         """
-        # Pre-create the DB so the second open hits the quick_check path.
         bootstrap = open_audit_db(audit_db_path)
         bootstrap.close()
-        # Tighten the budget so the very first progress callback aborts.
         monkeypatch.setattr(audit_db_mod, "QUICK_CHECK_BUDGET_SECONDS", -1.0)
         with pytest.raises(
-            AuditDbConfigError, match="EX_AUDIT_DB_SLOW_QUICKCHECK"
+            AuditDbConfigError, match=r"EX_AUDIT_DB_SLOW_QUICKCHECK: quick_check took"
+        ):
+            open_audit_db(audit_db_path)
+
+    def test_quick_check_budget_enforced_via_progress_handler_abort(
+        self, audit_db_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D2: when the progress handler is invoked DURING quick_check and
+        returns 1, SQLite aborts the PRAGMA and the first error arm
+        (``aborted via progress handler``) fires — distinct from the
+        post-hoc elapsed check path. We force the handler to fire on the
+        very first VM op by setting the interval to 1.
+        """
+        bootstrap = open_audit_db(audit_db_path)
+        bootstrap.close()
+        monkeypatch.setattr(audit_db_mod, "_PROGRESS_HANDLER_INTERVAL_OPS", 1)
+        monkeypatch.setattr(audit_db_mod, "QUICK_CHECK_BUDGET_SECONDS", -1.0)
+        # The first-arm message wording is unique — it can ONLY come
+        # from the handler-abort path. If quick_check completed without
+        # abort, the post-hoc arm would produce "took X.Ys > -1s budget"
+        # instead, which does not match this regex.
+        with pytest.raises(
+            AuditDbConfigError,
+            match=r"aborted via progress handler",
         ):
             open_audit_db(audit_db_path)
 
@@ -282,6 +311,104 @@ class TestSchemaBootstrap:
         ):
             open_audit_db(audit_db_path)
 
+    def test_schema_version_null_value_rejected(
+        self, audit_db_path: pathlib.Path
+    ) -> None:
+        """D9: ``MAX(version)`` returning NULL (empty table) raises
+        EX_CONFIG instead of silently passing. Simulates the race where
+        the version row is missing after bootstrap (or was wiped)."""
+        c = open_audit_db(audit_db_path)
+        c.execute("DELETE FROM audit_db_schema_version")
+        c.close()
+        with pytest.raises(AuditDbConfigError, match="schema_version table is empty"):
+            open_audit_db(audit_db_path)
+
+    def test_apply_schema_mid_ddl_failure_preserves_original_exception(
+        self,
+        audit_db_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D9: when a schema DDL statement raises mid-transaction, the
+        inner ROLLBACK runs (best-effort) and the ORIGINAL exception
+        propagates — even if the rollback itself raises."""
+        # Inject a broken DDL into _SCHEMA_STATEMENTS that will raise
+        # sqlite3.OperationalError when executed.
+        broken = (
+            *audit_db_mod._SCHEMA_STATEMENTS,
+            "CREATE TABLE __broken__ (this is not valid SQL",
+        )
+        monkeypatch.setattr(audit_db_mod, "_SCHEMA_STATEMENTS", broken)
+        with pytest.raises(sqlite3.OperationalError):
+            open_audit_db(audit_db_path)
+
+    def test_write_probe_rollback_failure_raises_ex_config(
+        self,
+        audit_db_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D9: if the BEGIN IMMEDIATE in the write probe succeeds but
+        the subsequent ROLLBACK raises, the failure surfaces as
+        :class:`AuditDbConfigError` (EX_CONFIG) not a raw
+        :class:`sqlite3.OperationalError`. Spec §4.5 path."""
+        # Pre-bootstrap so the second open hits the gates.
+        bootstrap = open_audit_db(audit_db_path)
+        bootstrap.close()
+
+        # Wrap _write_probe via a fake-conn substitution: capture the
+        # real probe code path with a fake conn where BEGIN succeeds
+        # but ROLLBACK raises.
+        original_probe = audit_db_mod._write_probe
+
+        class _ProbeFakeConn:
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                if normalized.startswith("BEGIN"):
+                    return None
+                if normalized.startswith("ROLLBACK"):
+                    raise sqlite3.OperationalError("sentinel rollback fail")
+                raise AssertionError(f"unexpected sql: {sql!r}")
+
+        def wrapped(real_conn: sqlite3.Connection) -> None:
+            original_probe(_ProbeFakeConn())  # type: ignore[arg-type]
+
+        monkeypatch.setattr(audit_db_mod, "_write_probe", wrapped)
+        with pytest.raises(
+            AuditDbConfigError, match="write probe rollback failed"
+        ):
+            open_audit_db(audit_db_path)
+
+    def test_schema_version_verified_before_apply_schema(
+        self,
+        audit_db_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D7: when reopening a DB whose version is ahead of the code,
+        :func:`_apply_schema` must NOT be called — the pre-apply guard
+        aborts first so stale code cannot mutate the version table via
+        ``INSERT OR IGNORE``.
+        """
+        # Bootstrap a healthy DB, then inject a future-version row.
+        c = open_audit_db(audit_db_path)
+        c.execute(
+            "INSERT INTO audit_db_schema_version (version) VALUES (?)",
+            (CURRENT_SCHEMA_VERSION + 1,),
+        )
+        c.close()
+        # Spy on _apply_schema — it must NOT run on this reopen.
+        calls: list[bool] = []
+        real_apply = audit_db_mod._apply_schema
+
+        def spy(conn: sqlite3.Connection) -> None:
+            calls.append(True)
+            real_apply(conn)
+
+        monkeypatch.setattr(audit_db_mod, "_apply_schema", spy)
+        with pytest.raises(AuditDbConfigError, match="schema_version mismatch"):
+            open_audit_db(audit_db_path)
+        assert calls == [], (
+            "_apply_schema must not run when pre-apply version guard rejects"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Enum drift guard (C2)
@@ -311,6 +438,84 @@ class TestEnumDrift:
                 f"source enum value {v!r} missing from DDL CHECK clause"
             )
         assert ddl.count("source IN (") == 1
+
+    def test_sql_string_list_escapes_single_quotes(self) -> None:
+        """D3: a future enum value containing ``'`` must double-escape
+        rather than break DDL parsing.
+
+        Verifies both the generation rule and that the resulting DDL
+        compiles cleanly on a fresh sqlite connection.
+        """
+        # Generation: single quotes doubled.
+        rendered = audit_db_mod._sql_string_list(frozenset({"o'brien", "hit"}))
+        assert "'o''brien'" in rendered
+        assert "'hit'" in rendered
+        # Smoke: a CHECK clause built from this list parses without error.
+        c = sqlite3.connect(":memory:")
+        try:
+            c.execute(
+                f"CREATE TABLE t (x TEXT NOT NULL CHECK (x IN ({rendered})))"
+            )
+            c.execute("INSERT INTO t (x) VALUES (?)", ("o'brien",))
+            c.execute("INSERT INTO t (x) VALUES (?)", ("hit",))
+            with pytest.raises(sqlite3.IntegrityError):
+                c.execute("INSERT INTO t (x) VALUES (?)", ("nope",))
+        finally:
+            c.close()
+
+
+# ---------------------------------------------------------------------------
+# D4 — non-empty enum frozensets enforced at import time
+# ---------------------------------------------------------------------------
+
+
+class TestEnumImportGuard:
+    """An empty OUTCOME_VALUES/SOURCE_VALUES would generate ``outcome IN ()``
+    which SQLite evaluates as always-false → silent reject of every write.
+    The module asserts non-empty at import to surface this at startup.
+    """
+
+    def test_outcome_values_is_non_empty(self) -> None:
+        from parallax.apex.audit_writer import OUTCOME_VALUES
+
+        assert len(OUTCOME_VALUES) > 0
+
+    def test_source_values_is_non_empty(self) -> None:
+        from parallax.apex.audit_writer import SOURCE_VALUES
+
+        assert len(SOURCE_VALUES) > 0
+
+    def test_empty_frozenset_assertion_raises_on_import(self) -> None:
+        """Spawn a fresh interpreter where ``audit_writer.OUTCOME_VALUES``
+        is monkeypatched to ``frozenset()`` BEFORE ``audit_db`` is
+        imported. The module-level assert must raise AssertionError at
+        import — proving fail-fast rather than silent always-false CHECK.
+
+        Subprocess isolation is required: ``importlib.reload`` inside the
+        test process would swap class identity for imported names like
+        :class:`AuditDbWriteError`, breaking subsequent ``isinstance``
+        checks in other tests in this session.
+        """
+        import subprocess
+        import sys as _sys
+
+        script = (
+            "import parallax.apex.audit_writer as w; "
+            "w.OUTCOME_VALUES = frozenset(); "
+            "import parallax.apex.audit_db"  # should AssertionError here
+        )
+        result = subprocess.run(
+            [_sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode != 0, (
+            "Empty OUTCOME_VALUES must abort audit_db import"
+        )
+        assert "OUTCOME_VALUES must be non-empty" in result.stderr, (
+            f"Expected assertion message in stderr; got: {result.stderr!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +667,109 @@ class TestWriteRow:
         (count,) = conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()
         assert count == 0
 
+    def test_rollback_database_error_does_not_mask_insert_error(self) -> None:
+        """D6: if the INSERT raises and the subsequent ROLLBACK also raises
+        a :class:`sqlite3.DatabaseError` (not just :class:`OperationalError`),
+        the original INSERT exception must reach the caller, not the
+        ROLLBACK one.
+
+        Uses a fake connection (sqlite3.Connection.execute is read-only and
+        cannot be monkey-patched in place).
+        """
+        row = canonicalize_row(_valid_row())
+        insert_error = sqlite3.ProgrammingError("sentinel insert failure")
+        rollback_error = sqlite3.DatabaseError("sentinel rollback failure")
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("BEGIN"):
+                    return None
+                if normalized.startswith("INSERT"):
+                    raise insert_error
+                if normalized.startswith("ROLLBACK"):
+                    raise rollback_error
+                if normalized.startswith("COMMIT"):
+                    return None
+                raise AssertionError(f"unexpected sql: {sql!r}")
+
+        fake = FakeConn()
+        with pytest.raises(sqlite3.ProgrammingError) as exc_info:
+            write_audit_row(fake, row)  # type: ignore[arg-type]
+        assert exc_info.value is insert_error, (
+            "ROLLBACK failure must not replace the original INSERT exception"
+        )
+        # Sanity: BEGIN, INSERT, ROLLBACK were all attempted.
+        assert fake.calls == ["BEGIN", "INSERT", "ROLLBACK"]
+
+    def test_commit_failure_raises_write_error_and_clears_transaction(
+        self,
+    ) -> None:
+        """D5: a COMMIT that raises (disk full, SQLITE_FULL) must surface
+        as :class:`AuditDbWriteError` AND best-effort ROLLBACK runs so
+        the connection returns to autocommit state. No raw
+        ``sqlite3.OperationalError`` leaks to the caller.
+        """
+        row = canonicalize_row(_valid_row())
+        commit_error = sqlite3.OperationalError("database or disk is full")
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("COMMIT"):
+                    raise commit_error
+                # BEGIN / INSERT / ROLLBACK all succeed silently
+                return None
+
+        fake = FakeConn()
+        with pytest.raises(AuditDbWriteError, match="commit failed") as exc_info:
+            write_audit_row(fake, row)  # type: ignore[arg-type]
+        # Wrapped, not raw
+        assert exc_info.value.__cause__ is commit_error
+        # Best-effort ROLLBACK fired to drain the transaction
+        assert "BEGIN" in fake.calls
+        assert "INSERT" in fake.calls
+        assert "COMMIT" in fake.calls
+        assert "ROLLBACK" in fake.calls
+        assert fake.calls[-1] == "ROLLBACK", (
+            "ROLLBACK must run AFTER the failed COMMIT to clear the txn"
+        )
+
+    def test_commit_failure_when_rollback_also_fails(self) -> None:
+        """D5: if even the best-effort ROLLBACK after COMMIT-fail raises,
+        the caller still sees AuditDbWriteError (not the secondary error)."""
+        row = canonicalize_row(_valid_row())
+        commit_error = sqlite3.OperationalError("database or disk is full")
+        rollback_error = sqlite3.OperationalError("cannot rollback - no transaction")
+
+        class FakeConn:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("COMMIT"):
+                    raise commit_error
+                if normalized.startswith("ROLLBACK"):
+                    raise rollback_error
+                return None
+
+        fake = FakeConn()
+        with pytest.raises(AuditDbWriteError) as exc_info:
+            write_audit_row(fake, row)  # type: ignore[arg-type]
+        assert exc_info.value.__cause__ is commit_error, (
+            "Secondary ROLLBACK failure must not mask the COMMIT failure"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Smoke + golden vector (H6)
@@ -484,10 +792,21 @@ _GOLDEN_ROW: dict[str, Any] = {
     "source": "aphelion",
     "ts": "2026-05-09T14:23:11Z",
 }
-# Computed once during initial test development; locked here to detect
-# canonicalization drift. See tests/apex/conftest_GOLDEN_HEX_COMPUTE.txt
-# for the regen procedure.
-_GOLDEN_SHA256_HEX: str = sha256_hex(canonical_dumps(_GOLDEN_ROW))
+# D1: HARDCODED hex literal — intentionally NOT computed at import time.
+# A live call to ``sha256_hex(canonical_dumps(_GOLDEN_ROW))`` here would
+# drift with the canonicalizer (tautology — round-2 found Bundle C left
+# this self-referential). The literal below was computed once on
+# 2026-05-12 against canonical_json v1; if it ever fails the test, either
+# the canonicalizer changed (investigate before regenerating) or
+# _GOLDEN_ROW changed (also intentional? otherwise revert).
+#
+# Regen (only after confirming a deliberate canonicalization change):
+#   python -c "from parallax.apex.canonical_json import canonical_dumps, sha256_hex; \
+#       from tests.apex.test_audit_db import _GOLDEN_ROW; \
+#       print(sha256_hex(canonical_dumps(_GOLDEN_ROW)))"
+_GOLDEN_SHA256_HEX: Final[str] = (
+    "cc08c900b1bd82e67fd320314584b204ec7bd2da6b7dd74e14fd0738dd161cf4"
+)
 
 
 class TestEnvelopeSmoke:

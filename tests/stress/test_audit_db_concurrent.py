@@ -232,3 +232,49 @@ def test_wal_reads_not_blocked_by_writes(tmp_path: pathlib.Path) -> None:
         )
     # Final count matches the 200 writes.
     assert reader_count_series[-1] == 200
+
+
+# ---------------------------------------------------------------------------
+# D-poly scenario: validate=True under concurrent open
+# ---------------------------------------------------------------------------
+
+
+def _worker_validated_open_and_write(
+    db_path: pathlib.Path, thread_idx: int
+) -> bool:
+    """Open with the full spec §4 startup gates, write one row, close."""
+    conn = open_audit_db(db_path, validate=True)
+    try:
+        row = canonicalize_row(_valid_row_for_thread(9_000_000 + thread_idx))
+        write_audit_row(conn, row)
+        return True
+    finally:
+        conn.close()
+
+
+def test_validated_open_and_write_concurrent(tmp_path: pathlib.Path) -> None:
+    """D-poly: ensure spec §4 gates (quick_check + write_probe) under
+    contention don't deadlock or starve. ``BEGIN IMMEDIATE`` in the
+    write probe momentarily holds an EXCLUSIVE lock — busy_timeout=5s
+    should let parallel openers serialize without raising.
+    """
+    db = tmp_path / "audit.db"
+    # Pre-create directory so _check_parent_writable passes; the file
+    # itself is created on first connect.
+    open_audit_db(db, validate=True).close()
+
+    threads = max(2, _THREADS // 2)
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = [
+            pool.submit(_worker_validated_open_and_write, db, t)
+            for t in range(threads)
+        ]
+        results = [f.result() for f in as_completed(futures)]
+    assert all(results), "every validated open+write must succeed"
+
+    audit_conn = sqlite3.connect(str(db))
+    try:
+        (count,) = audit_conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()
+    finally:
+        audit_conn.close()
+    assert count == threads, f"expected {threads} rows from validated path, got {count}"

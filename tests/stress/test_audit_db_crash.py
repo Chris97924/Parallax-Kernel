@@ -4,10 +4,12 @@ Two scenarios:
 
 * Mid-write crash: child process writes rows in a tight loop printing
   ``ok i`` after each commit. Parent reads stdout until at least 100
-  commits land (forces WAL frame boundary crossing — default
-  ``wal_autocheckpoint=200`` pages plus our test's 200 pages of WAL
-  buffer mean checkpoints fire during the run, NOT after termination),
-  then ``terminate()`` s. Parent reopens and asserts:
+  commits land, then ``terminate()`` s. The recovery path actually
+  exercised is WAL replay on reopen — 100 small rows do NOT generate
+  enough WAL pages (~20-25 KB) to cross the
+  ``wal_autocheckpoint=200`` pages (~1.6 MB) threshold mid-run, so
+  checkpoints fire at close time, not during the run. Parent reopens
+  and asserts:
     - ALL stdout is drained (no stuck pipe).
     - ``count == max_committed + 1`` exactly — every acknowledged row
       survives, no uncommitted row sneaks in.
@@ -30,6 +32,8 @@ import textwrap
 import time
 
 import pytest
+
+from parallax.apex.audit_writer import OUTCOME_VALUES, SOURCE_VALUES
 
 pytestmark = pytest.mark.integration
 
@@ -100,14 +104,19 @@ def _child_bootstrap_only_script(db_path: pathlib.Path) -> str:
     )
 
 
-def _drain_remaining_ok_lines(stream) -> int:
+def _drain_remaining_ok_lines(stream) -> tuple[int, list[str]]:
     """Read any remaining ``ok i`` lines after terminate() returns.
 
-    Returns the max ``i`` seen across the entire stream (or -1 if none).
+    Returns ``(max_i, unparseable)`` where ``max_i`` is the highest
+    sequence number seen (or -1 if none) and ``unparseable`` collects
+    any non-``ok`` lines (e.g. tracebacks from the child) so the
+    caller can include them in an assertion-failure diagnostic — a
+    silent ``pass`` would mask child crashes as count mismatches.
     """
     high = -1
+    unparseable: list[str] = []
     if stream is None:
-        return high
+        return high, unparseable
     while True:
         line = stream.readline()
         if not line:
@@ -116,8 +125,10 @@ def _drain_remaining_ok_lines(stream) -> int:
             try:
                 high = max(high, int(line.split()[1]))
             except (ValueError, IndexError):
-                pass
-    return high
+                unparseable.append(line.rstrip("\n"))
+        else:
+            unparseable.append(line.rstrip("\n"))
+    return high, unparseable
 
 
 class TestCrashMidWrite:
@@ -154,10 +165,18 @@ class TestCrashMidWrite:
             proc.wait(timeout=5)
 
         # Drain remaining buffered stdout so the high-water mark is the
-        # MAX of in-band + post-terminate buffered rows.
-        max_post_drain = _drain_remaining_ok_lines(proc.stdout)
+        # MAX of in-band + post-terminate buffered rows. Capture any
+        # non-``ok`` lines (e.g. child-side tracebacks) so a count
+        # mismatch surfaces the underlying child error instead of a
+        # cryptic numeric diff.
+        max_post_drain, drain_noise = _drain_remaining_ok_lines(proc.stdout)
         max_committed = max(max_seen, max_post_drain)
         stderr_dump = proc.stderr.read() if proc.stderr else ""
+        if drain_noise:
+            stderr_dump = (
+                f"{stderr_dump}\n[unparseable stdout lines]\n"
+                + "\n".join(drain_noise)
+            )
 
         assert max_committed >= _MIN_COMMITTED_BEFORE_KILL - 1, (
             f"child did not produce enough commits before terminate; "
@@ -177,11 +196,16 @@ class TestCrashMidWrite:
                 f"actually found {count}. stderr={stderr_dump!r}"
             )
 
-            # No CHECK violation hiding in WAL replay.
+            # No CHECK violation hiding in WAL replay. Enum literals
+            # come from the writer's source-of-truth frozensets so the
+            # check stays valid if a new outcome / source value is
+            # added to OUTCOME_VALUES / SOURCE_VALUES.
+            outcome_list = ",".join(f"'{v}'" for v in sorted(OUTCOME_VALUES))
+            source_list = ",".join(f"'{v}'" for v in sorted(SOURCE_VALUES))
             bogus = conn.execute(
-                "SELECT COUNT(*) FROM audit_row "
-                "WHERE outcome NOT IN ('hit','miss','divergence','error') "
-                "OR source NOT IN ('aphelion','parallax')"
+                f"SELECT COUNT(*) FROM audit_row "
+                f"WHERE outcome NOT IN ({outcome_list}) "
+                f"OR source NOT IN ({source_list})"
             ).fetchone()[0]
             assert bogus == 0
 

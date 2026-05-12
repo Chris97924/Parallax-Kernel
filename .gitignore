@@ -90,3 +90,6 @@ eval/longmemeval/reproduce.py
 eval/run_phase2_ladder.sh
 eval/run_phase2_nim.sh
 eval/run_phase2_pro.sh
+
+# Apex runtime logs (per-day dual-read decisions, audit envelopes)
+parallax/logs/

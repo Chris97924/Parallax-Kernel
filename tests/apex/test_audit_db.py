@@ -398,6 +398,69 @@ class TestSchemaBootstrap:
         ):
             open_audit_db(audit_db_path)
 
+    def test_write_probe_begin_database_error_raises_ex_config(
+        self,
+        audit_db_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """BEGIN IMMEDIATE raising a non-Operational :class:`sqlite3.Error`
+        subclass (e.g. :class:`sqlite3.DatabaseError` on a malformed file)
+        must still translate into :class:`AuditDbConfigError` so EX_CONFIG
+        signaling is consistent — callers that only catch
+        ``AuditDbConfigError`` cannot miss this path.
+        """
+        bootstrap = open_audit_db(audit_db_path)
+        bootstrap.close()
+
+        original_probe = audit_db_mod._write_probe
+
+        class _ProbeFakeConn:
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                if normalized.startswith("BEGIN"):
+                    raise sqlite3.DatabaseError("sentinel malformed db")
+                raise AssertionError(f"unexpected sql: {sql!r}")
+
+        def wrapped(real_conn: sqlite3.Connection) -> None:
+            original_probe(_ProbeFakeConn())  # type: ignore[arg-type]
+
+        monkeypatch.setattr(audit_db_mod, "_write_probe", wrapped)
+        with pytest.raises(AuditDbConfigError, match="write probe failed"):
+            open_audit_db(audit_db_path)
+
+    def test_write_probe_rollback_database_error_raises_ex_config(
+        self,
+        audit_db_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ROLLBACK raising :class:`sqlite3.DatabaseError` (not
+        :class:`OperationalError`) must still translate into
+        :class:`AuditDbConfigError` — verifies the rollback ``except``
+        widening to :class:`sqlite3.Error`.
+        """
+        bootstrap = open_audit_db(audit_db_path)
+        bootstrap.close()
+
+        original_probe = audit_db_mod._write_probe
+
+        class _ProbeFakeConn:
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                if normalized.startswith("BEGIN"):
+                    return None
+                if normalized.startswith("ROLLBACK"):
+                    raise sqlite3.DatabaseError("sentinel rollback db error")
+                raise AssertionError(f"unexpected sql: {sql!r}")
+
+        def wrapped(real_conn: sqlite3.Connection) -> None:
+            original_probe(_ProbeFakeConn())  # type: ignore[arg-type]
+
+        monkeypatch.setattr(audit_db_mod, "_write_probe", wrapped)
+        with pytest.raises(
+            AuditDbConfigError, match="write probe rollback failed"
+        ):
+            open_audit_db(audit_db_path)
+
     def test_schema_version_verified_before_apply_schema(
         self,
         audit_db_path: pathlib.Path,

@@ -339,18 +339,21 @@ def _write_probe(conn: sqlite3.Connection) -> None:
 
     Catches OS-level read-only filesystems, snapshotted backup volumes,
     and stale lockfiles AT STARTUP rather than on first envelope emission.
-    Failures (including the rollback path) surface as
-    :class:`AuditDbConfigError` so spec §4.5 EX_CONFIG logging fires.
+    All :class:`sqlite3.Error` subclasses (``OperationalError`` on
+    read-only/locked DBs, ``DatabaseError`` on a malformed file, etc.)
+    are translated to :class:`AuditDbConfigError` so spec §4.5 EX_CONFIG
+    classification stays consistent — callers that only catch
+    :class:`AuditDbConfigError` cannot miss this path.
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
-    except sqlite3.OperationalError as exc:
+    except sqlite3.Error as exc:
         raise AuditDbConfigError(
             f"EX_CONFIG: audit_db write probe failed (read-only or locked): {exc}"
         ) from exc
     try:
         conn.execute("ROLLBACK")
-    except sqlite3.OperationalError as exc:
+    except sqlite3.Error as exc:
         raise AuditDbConfigError(
             f"EX_CONFIG: audit_db write probe rollback failed: {exc}"
         ) from exc

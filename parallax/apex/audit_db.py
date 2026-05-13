@@ -260,7 +260,7 @@ def _check_parent_writable(path: pathlib.Path) -> None:
     if not parent.exists():
         raise AuditDbConfigError(
             f"EX_CONFIG: audit_db parent directory does not exist: {parent}. "
-            "Create it before starting parallax-server (spec §6)."
+            "Create it before starting parallax-server (spec §9)."
         )
     if not parent.is_dir():
         raise AuditDbConfigError(

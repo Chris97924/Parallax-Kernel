@@ -139,6 +139,7 @@ class DualReadRouter:
         *,
         correlation_id: str | None = None,
         dual_read_override: bool | None = None,
+        traffic_source: str | None = None,
     ) -> DualReadResult:
         """Dispatch primary + secondary in parallel; return DualReadResult.
 
@@ -189,7 +190,7 @@ class DualReadRouter:
                 latency_secondary_ms=None,
                 aphelion_unreachable_reason=None,
             )
-            self._record(request.user_id, result.outcome)
+            self._record(request.user_id, result.outcome, traffic_source=traffic_source)
             self._log_decision(
                 outcome="skipped",
                 correlation_id=cid,
@@ -221,7 +222,7 @@ class DualReadRouter:
                 latency_secondary_ms=None,
                 aphelion_unreachable_reason=None,
             )
-            self._record(request.user_id, result.outcome)
+            self._record(request.user_id, result.outcome, traffic_source=traffic_source)
             self._log_decision(
                 outcome="skipped",
                 correlation_id=cid,
@@ -361,7 +362,7 @@ class DualReadRouter:
             write_error_observed=write_error_observed,
         )
 
-        self._record(request.user_id, outcome)
+        self._record(request.user_id, outcome, traffic_source=traffic_source)
         # JSONL-PRODUCER — record dual-read decision for downstream metrics.
         # Pass outcome through verbatim (5-value DualReadOutcome vocabulary:
         # match | diverge | primary_only | aphelion_unreachable | skipped) so
@@ -418,7 +419,13 @@ class DualReadRouter:
                 exc_str=str(exc),
             )
 
-    def _record(self, user_id: str, outcome: DualReadOutcome) -> None:
+    def _record(
+        self,
+        user_id: str,
+        outcome: DualReadOutcome,
+        *,
+        traffic_source: str | None = None,
+    ) -> None:
         """Record outcome to live counter + Prometheus gauges (optional).
 
         Observability code MUST NEVER kill the request. A failing Prometheus
@@ -428,7 +435,11 @@ class DualReadRouter:
         — that violates fail-closed invariant #1. Guard each side-effect.
         """
         try:
-            record_dual_read_outcome(user_id=user_id, outcome=outcome)
+            record_dual_read_outcome(
+                user_id=user_id,
+                outcome=outcome,
+                traffic_source=traffic_source,
+            )
         except Exception as exc:  # noqa: BLE001 — observability must not crash query path
             _safe_log_warning(
                 "record_dual_read_outcome_failed",
@@ -437,7 +448,11 @@ class DualReadRouter:
             )
         if self._live_counter is not None:
             try:
-                self._live_counter.record(user_id=user_id, outcome=outcome)
+                self._live_counter.record(
+                    user_id=user_id,
+                    outcome=outcome,
+                    traffic_source=traffic_source,
+                )
             except Exception as exc:  # noqa: BLE001 — same rationale as above
                 _safe_log_warning(
                     "live_counter_record_failed",

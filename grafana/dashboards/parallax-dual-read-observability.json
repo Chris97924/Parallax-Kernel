@@ -54,9 +54,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "parallax_dual_read_discrepancy_rate",
+          "expr": "max(parallax_dual_read_discrepancy_rate{traffic_source=\"synthetic\"})",
           "instant": true,
+          "legendFormat": "synthetic",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(parallax_dual_read_discrepancy_rate{traffic_source=\"natural\"})",
+          "instant": true,
+          "legendFormat": "natural",
+          "refId": "B"
         }
       ],
       "title": "Dual-read discrepancy rate",
@@ -106,9 +114,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "parallax_aphelion_unreachable_rate",
+          "expr": "max(parallax_aphelion_unreachable_rate{traffic_source=\"synthetic\"})",
           "instant": true,
+          "legendFormat": "synthetic",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(parallax_aphelion_unreachable_rate{traffic_source=\"natural\"})",
+          "instant": true,
+          "legendFormat": "natural",
+          "refId": "B"
         }
       ],
       "title": "Aphelion unreachable rate",
@@ -414,9 +430,15 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (outcome) (rate(parallax_dual_read_outcomes_total[5m]))",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (outcome) (rate(parallax_dual_read_outcomes_total{traffic_source=\"synthetic\"}[5m]))",
+          "legendFormat": "synthetic {{outcome}}",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (outcome) (rate(parallax_dual_read_outcomes_total{traffic_source=\"natural\"}[5m]))",
+          "legendFormat": "natural {{outcome}}",
+          "refId": "B"
         }
       ],
       "title": "Dual-read outcome breakdown",

@@ -11,7 +11,8 @@ SessionStart hook plugin consumes.
 from __future__ import annotations
 
 import sqlite3
-from typing import Annotated, Any
+from contextlib import closing
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
@@ -22,14 +23,12 @@ from parallax.obs.metrics import get_counter as _get_counter
 from parallax.router import (
     QueryRequest as RouterQueryRequest,
 )
-from parallax.router import (
-    RealMemoryRouter,
-    UnroutableQueryError,
-    is_router_enabled,
-    resolve,
-)
+from parallax.router import RealMemoryRouter, UnroutableQueryError, is_router_enabled, resolve
+from parallax.router.aphelion_adapter import AphelionReadAdapter
+from parallax.router.config import is_dual_read_enabled
+from parallax.router.dual_read import DualReadRouter
 from parallax.server.auth import current_user_id, require_auth
-from parallax.server.deps import get_conn
+from parallax.server.deps import DBFactory, default_db_factory, get_conn
 from parallax.server.schemas import (
     RETRIEVE_KINDS,
     QueryResponse,
@@ -46,6 +45,17 @@ router = APIRouter(
 
 _log = _get_logger("parallax.server.routes.query")
 _deprecated_kind_counter = _get_counter("deprecated_kind_bug_total")
+
+
+class _FactoryRealMemoryRouter:
+    """QueryPort wrapper that opens its SQLite connection inside worker threads."""
+
+    def __init__(self, db_factory: DBFactory) -> None:
+        self._db_factory = db_factory
+
+    def query(self, request: RouterQueryRequest):
+        with closing(self._db_factory()) as conn:
+            return RealMemoryRouter(conn).query(request)
 
 
 def _hit_to_dto(hit: R.RetrievalHit, *, level: int) -> RetrievalHitDTO:
@@ -107,6 +117,7 @@ def _router_hit_to_dto(hit: dict[str, Any], *, level: int, query_type: str) -> R
 def _dispatch_with_router(
     conn: sqlite3.Connection,
     *,
+    db_factory: DBFactory,
     kind: RetrieveKind,
     user_id: str,
     q: str,
@@ -114,6 +125,8 @@ def _dispatch_with_router(
     limit: int,
     since: str | None,
     until: str | None,
+    dual_read_override: bool | None,
+    traffic_source: str | None,
 ) -> list[RetrievalHitDTO]:
     try:
         query_type = resolve(f"RetrieveKind.{kind}")
@@ -129,11 +142,20 @@ def _dispatch_with_router(
         until=until,
         level=level,
     )
-    mem_router = RealMemoryRouter(conn)
+    dual_read_enabled = (
+        dual_read_override if dual_read_override is not None else is_dual_read_enabled()
+    )
+    primary = _FactoryRealMemoryRouter(db_factory) if dual_read_enabled else RealMemoryRouter(conn)
+    mem_router = DualReadRouter(primary=primary, secondary=AphelionReadAdapter())
     try:
-        evidence = mem_router.query(request)
+        result = mem_router.query(
+            request,
+            dual_read_override=dual_read_override,
+            traffic_source=traffic_source or "natural",
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    evidence = result.primary
 
     return [
         _router_hit_to_dto(hit, level=level, query_type=query_type.value) for hit in evidence.hits
@@ -215,8 +237,13 @@ def get_query(
         )
 
     if is_router_enabled():
+        db_factory = cast(
+            DBFactory,
+            getattr(request.app.state, "db_factory", default_db_factory),
+        )
         dtos = _dispatch_with_router(
             conn,
+            db_factory=db_factory,
             kind=kind,
             user_id=resolved_user_id,
             q=q,
@@ -224,6 +251,8 @@ def get_query(
             limit=limit,
             since=since,
             until=until,
+            dual_read_override=getattr(request.state, "dual_read", None),
+            traffic_source=getattr(request.state, "traffic_source", None) or "natural",
         )
     else:
         hits = _dispatch(

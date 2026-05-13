@@ -12,6 +12,7 @@ Public API:
     record_dual_read_outcome              -- module-level convenience wrapper
     dual_read_discrepancy_rate            -- pure read on singleton
     aphelion_unreachable_rate             -- pure read on singleton
+    parallax_aphelion_total               -- Aphelion-bound request counter
 
 Design notes
 ------------
@@ -111,6 +112,12 @@ _outcomes_counter = _get_or_create_counter(
     "parallax_dual_read_outcomes",
     "Total dual-read outcome events by type, user, and burn-in traffic source.",
     ["outcome", "user_id", "traffic_source"],
+)
+
+_aphelion_counter = _get_or_create_counter(
+    "parallax_aphelion",
+    "Total dual-read requests that attempted the Aphelion secondary.",
+    ["user_id", "traffic_source"],
 )
 
 _discrepancy_rate_gauge = _get_or_create_gauge(
@@ -251,6 +258,8 @@ def record_dual_read_outcome(
     """
     source = _normalize_traffic_source(traffic_source)
     _outcomes_counter.labels(outcome=outcome, user_id=user_id, traffic_source=source).inc()
+    if outcome != "skipped":
+        _aphelion_counter.labels(user_id=user_id, traffic_source=source).inc()
     _singleton.record(user_id=user_id, outcome=outcome, traffic_source=source)
     _discrepancy_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
         _singleton.discrepancy_rate(user_id=user_id, traffic_source=source)

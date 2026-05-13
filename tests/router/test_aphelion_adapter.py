@@ -199,7 +199,7 @@ def test_audit_db_ref_matches_canonical_sha256() -> None:
 
 
 def test_audit_row_ts_matches_envelope_created_at() -> None:
-    """Spec ``audit-db-path-config.md`` L113: audit row ``ts`` MUST equal envelope ``created_at``.
+    """Spec ``audit-db-path-config.md`` §6.1 (``ts`` field): audit row ``ts`` MUST equal envelope ``created_at``.
 
     Regression for Codex P2 review on PR #51: the previous implementation
     populated ``audit_row.ts`` from ``result.used_query_time`` (reader time)

@@ -64,7 +64,7 @@ __all__ = [
 ]
 
 ENV_VAR_NAME: Final = "PARALLAX_AUDIT_DB_PATH"
-EX_CONFIG: Final = 78  # sysexits.h EX_CONFIG — spec §4.5
+EX_CONFIG: Final = 78  # sysexits.h EX_CONFIG — spec §4 item 8
 CURRENT_SCHEMA_VERSION: Final = 1
 QUICK_CHECK_BUDGET_SECONDS: float = 30.0  # NOT Final — tests monkeypatch this
 _BUSY_TIMEOUT_MS: Final = 5000
@@ -175,7 +175,7 @@ class AuditDbConfigError(RuntimeError):
     """Audit-db path / permissions / integrity failed spec §4 startup gates.
 
     The string form starts with a reason code (e.g. ``EX_CONFIG``,
-    ``EX_AUDIT_DB_SLOW_QUICKCHECK``) matching the spec §4.5 structured
+    ``EX_AUDIT_DB_SLOW_QUICKCHECK``) matching the spec §4 item 8 structured
     log format. Callers at the server-startup boundary translate this
     to process exit code :data:`EX_CONFIG`.
     """
@@ -260,7 +260,7 @@ def _check_parent_writable(path: pathlib.Path) -> None:
     if not parent.exists():
         raise AuditDbConfigError(
             f"EX_CONFIG: audit_db parent directory does not exist: {parent}. "
-            "Create it before starting parallax-server (spec §6)."
+            "Create it before starting parallax-server (spec §9)."
         )
     if not parent.is_dir():
         raise AuditDbConfigError(
@@ -273,7 +273,7 @@ def _check_parent_writable(path: pathlib.Path) -> None:
 
 
 def _quick_check(conn: sqlite3.Connection) -> None:
-    """Spec §4.3 — ``PRAGMA quick_check`` within wall-clock budget.
+    """Spec §4 item 5 — ``PRAGMA quick_check`` within wall-clock budget.
 
     Uses ``conn.set_progress_handler`` so a stalled quick_check (corrupted
     page, hung filesystem) is proactively aborted instead of hanging the
@@ -335,13 +335,13 @@ def _quick_check(conn: sqlite3.Connection) -> None:
 
 
 def _write_probe(conn: sqlite3.Connection) -> None:
-    """Spec §4.3 — ``BEGIN IMMEDIATE`` + ``ROLLBACK`` to detect read-only files.
+    """Spec §4 item 6 — ``BEGIN IMMEDIATE`` + ``ROLLBACK`` to detect read-only files.
 
     Catches OS-level read-only filesystems, snapshotted backup volumes,
     and stale lockfiles AT STARTUP rather than on first envelope emission.
     All :class:`sqlite3.Error` subclasses (``OperationalError`` on
     read-only/locked DBs, ``DatabaseError`` on a malformed file, etc.)
-    are translated to :class:`AuditDbConfigError` so spec §4.5 EX_CONFIG
+    are translated to :class:`AuditDbConfigError` so spec §4 item 8 EX_CONFIG
     classification stays consistent — callers that only catch
     :class:`AuditDbConfigError` cannot miss this path.
     """
@@ -463,10 +463,10 @@ def open_audit_db(
         _check_parent_writable(resolved)
 
     # ``timeout=N`` makes sqlite3 call ``sqlite3_busy_timeout(N×1000)``
-    # before any user statement runs (spec §4.3 "FIRST"); the explicit
-    # PRAGMA below re-applies the same value for traceability.
+    # before any user statement runs (spec §4 item 4 "busy_timeout FIRST");
+    # the explicit PRAGMA below re-applies the same value for traceability.
     # Translate connect-time sqlite3.Error subclasses to AuditDbConfigError
-    # so spec §4.5 EX_CONFIG signaling matches the other startup gates;
+    # so spec §4 item 8 EX_CONFIG signaling matches the other startup gates;
     # see the docstring for the enumerated failure modes covered.
     try:
         conn = sqlite3.connect(

@@ -159,7 +159,7 @@ class TestStartupGates:
     def test_quick_check_budget_enforced_post_hoc_fallback(
         self, audit_db_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Spec §4.3 — empty-DB quick_check completes before the progress
+        """Spec §4 item 5 — empty-DB quick_check completes before the progress
         handler is even invoked, so the post-hoc elapsed check is the
         sole guard. Verified by asserting the message wording specific
         to the post-hoc arm (``took X.Ys > budget``).
@@ -370,7 +370,7 @@ class TestSchemaBootstrap:
         """If the BEGIN IMMEDIATE in the write probe succeeds but
         the subsequent ROLLBACK raises, the failure surfaces as
         :class:`AuditDbConfigError` (EX_CONFIG) not a raw
-        :class:`sqlite3.OperationalError`. Spec §4.5 path."""
+        :class:`sqlite3.OperationalError`. Spec §4 item 8 path."""
         # Pre-bootstrap so the second open hits the gates.
         bootstrap = open_audit_db(audit_db_path)
         bootstrap.close()
@@ -470,7 +470,7 @@ class TestSchemaBootstrap:
         :class:`sqlite3.OperationalError` (file permission errors,
         invalid path targets, readonly mount edge cases), the failure
         must surface as :class:`AuditDbConfigError` not a raw sqlite
-        exception — spec §4.5 EX_CONFIG contract.
+        exception — spec §4 item 8 EX_CONFIG contract.
         """
 
         def _failing_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:

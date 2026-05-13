@@ -63,7 +63,7 @@ When Chris resumes, this is the punch list to break into PRs:
 
 ```
 M5 prep (Chris-action, today/tomorrow):
-  [ ] mkdir + env file + systemd restart per audit-db-path-config.md §5
+  [ ] mkdir + env file + systemd restart per audit-db-path-config.md §5 + §9
   [x] Confirm canonical audit-row schema — DONE 2026-05-09 PM (audit-db-path-config.md §6 NORMATIVE; OQs resolved in §6.5)
   [x] Confirm `confidence` carve-out from R4-trigger list — DONE 2026-05-09 PM (v0.3-claim-semantics.md §6.5 carve-out section, ADR-0002 final list of 4 trigger fields)
   [ ] v0.4 → v0.3 backward-compat fixture: round-trip an existing v0.4 producer's `.aphelion` package through the v0.3 validator and assert zero new errors. Without this fixture, the "additive only" claim in v0.3-claim-semantics.md §1 is theoretical.

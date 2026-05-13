@@ -1,6 +1,6 @@
 # Apex M5 Audit DB Path Configuration
 
-**Status:** Normative (Chris-pinned 2026-05-09 via xcouncil consensus; §3 / §4 / §6 aligned with `parallax/apex/audit_db.py` impl 2026-05-13)
+**Status:** Normative (Chris-pinned 2026-05-09 via xcouncil consensus; §3 / §4 / §6 / §9 aligned with `parallax/apex/audit_db.py` impl 2026-05-13)
 **Date:** 2026-05-09 (spec freeze) / 2026-05-13 (impl-sync revision)
 **Owner:** Parallax-Kernel
 **Consumers:** Apex M5 envelope writer, dual-read router, audit-replay tooling
@@ -49,7 +49,7 @@ The Parallax server (`parallax serve`) MUST validate the resolved path on startu
    - Connect-time `sqlite3.Error` (including `OperationalError` for permission/lock failures) is translated to `AuditDbConfigError` so all startup-gate failures share one exit class.
 5. **`PRAGMA quick_check` within a 30 s wall-clock budget.** A `set_progress_handler` callback aborts the operation if the budget is exceeded; both a budget-driven abort and a post-hoc elapsed check raise `AuditDbConfigError("EX_AUDIT_DB_SLOW_QUICKCHECK: …")`. A non-`ok` quick_check result raises `AuditDbConfigError("EX_CONFIG: audit_db quick_check returned non-ok: …")`.
 6. **Write-permission probe.** `BEGIN IMMEDIATE` followed by `ROLLBACK`; failure (read-only mount, snapshotted backup volume, stale lockfile) raises `AuditDbConfigError("EX_CONFIG: audit_db write probe failed …")`.
-7. **Schema applied + version verified.** `_apply_schema()` runs the DDL (see §6) idempotently via `CREATE TABLE IF NOT EXISTS`. The schema is **not** loaded from an external `.sql` file — the DDL is generated at module import time from `audit_writer.OUTCOME_VALUES` and `SOURCE_VALUES` so the `CHECK` literals cannot drift from the writer's validation set. After apply, `_verify_schema_version` reads `MAX(version)` from `audit_db_schema_version` and refuses to open a DB whose recorded version disagrees with `CURRENT_SCHEMA_VERSION`. A pre-apply guard (`_verify_schema_version_if_present`) covers the case where stale code (v=N) opens a DB previously written by newer code (v=N+1).
+7. **Schema applied + version verified.** Execution order: (a) `_verify_schema_version_if_present` — pre-apply guard that reads `MAX(version)` from `audit_db_schema_version` IF the table already exists; refuses to open a DB whose recorded version disagrees with `CURRENT_SCHEMA_VERSION`. This catches stale code (v=N) opening a DB previously written by newer code (v=N+1) BEFORE any DDL writes mutate the version table. (b) `_apply_schema()` runs the DDL (see §6) idempotently via `CREATE TABLE IF NOT EXISTS` plus an `INSERT OR IGNORE` into `audit_db_schema_version`. The schema is **not** loaded from an external `.sql` file — the DDL is generated at module import time from `audit_writer.OUTCOME_VALUES` and `SOURCE_VALUES` so the `CHECK` literals cannot drift from the writer's validation set. (c) `_verify_schema_version` re-runs the version check after apply as belt-and-braces (covers the fresh-DB case where the pre-apply guard was a no-op).
 8. **On any §4 gate failure:** the structured log shape is `{"event": "audit_db_validation_failed", "reason": "<code>", "path": "<resolved_path>"}` and the server exits with code `78` (`EX_CONFIG`, per `sysexits.h`). Do NOT serve traffic with a broken audit path.
 
 **Note on EX_CONFIG 78**: Parallax server adopts the `sysexits.h` exit-code convention here for the first time. Other Parallax-side startup failures use ad-hoc codes; this one fixes 78 because the audit chain is critical-path. Future startup-failure exits SHOULD adopt sysexits codes for consistency.
@@ -115,15 +115,15 @@ Optional fields (present only when applicable; MUST be omitted when not — do N
 
 Empty string vs absent: empty string is a valid REQUIRED-field value where allowed (`signer_id` and `signer_manifest_digest` for unsigned packages). Empty string MUST NOT be conflated with absent — the optional fields above are absent (omitted from JSON), not empty-string.
 
-**Defense-in-depth DDL `CHECK` constraints** (`parallax/apex/audit_db.py::_SCHEMA_STATEMENTS`):
+**Defense-in-depth DDL constraints** (`parallax/apex/audit_db.py::_SCHEMA_STATEMENTS`) — 4 `CHECK` + 1 `UNIQUE`:
 
-| Column | CHECK | Purpose |
-|---|---|---|
-| `outcome` | `outcome IN (<literals>)` | Literals derived from `audit_writer.OUTCOME_VALUES` at module import time so the DDL cannot drift independently of the writer's enum |
-| `source` | `source IN (<literals>)` | Same generation pattern, sourced from `audit_writer.SOURCE_VALUES` |
-| `signer_manifest_digest` | `length(...) = 64 OR ... = ''` | Allows the unsigned-package exemption (empty string per spec) while rejecting any non-64-char non-empty value |
-| `ts` | `ts LIKE '____-__-__T__:__:__Z'` | Last-resort sanity for direct INSERTs that bypass `canonicalize_row`; the writer remains source-of-truth for ISO-8601 strict validation |
-| `envelope_message_id` | `UNIQUE` | Idempotency guard — re-inserting the same envelope returns `sqlite3.IntegrityError` instead of duplicating |
+| Column | Constraint kind | Constraint | Purpose |
+|---|---|---|---|
+| `outcome` | CHECK | `outcome IN (<literals>)` | Literals derived from `audit_writer.OUTCOME_VALUES` at module import time so the DDL cannot drift independently of the writer's enum |
+| `source` | CHECK | `source IN (<literals>)` | Same generation pattern, sourced from `audit_writer.SOURCE_VALUES` |
+| `signer_manifest_digest` | CHECK | `length(...) = 64 OR ... = ''` | Allows the unsigned-package exemption (empty string per spec) while rejecting any non-64-char non-empty value |
+| `ts` | CHECK | `ts LIKE '____-__-__T__:__:__Z'` | Last-resort sanity for direct INSERTs that bypass `canonicalize_row`; the writer remains source-of-truth for ISO-8601 strict validation |
+| `envelope_message_id` | UNIQUE | `UNIQUE` | Idempotency guard — re-inserting the same envelope returns `sqlite3.IntegrityError` instead of duplicating |
 
 **Indexes:** `idx_audit_row_ts` on `ts`, `idx_audit_row_session_id` on `session_id`. No index on `outcome` — 4-value enum has too low cardinality for an index to beat a table scan and the write-amp cost would be pure loss.
 
@@ -186,7 +186,7 @@ Identical to `apex-m5-envelope-spec.md` §4.1 to keep both digests under one rul
 4. No floats, no `null`. Optional fields are omitted when absent (NOT serialized as null).
 5. Empty string is valid where the schema permits (REQUIRED fields can be empty string when documented; MUST NOT be conflated with absent).
 
-Python reference:
+Python reference (illustrative — production form is `parallax/apex/audit_writer.py::canonicalize_row()` returning `AuditRow` with `.sha256_hex()` method; the function below is for cross-implementation reference only):
 
 ```python
 import json, hashlib, unicodedata

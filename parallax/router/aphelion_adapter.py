@@ -227,8 +227,10 @@ class AphelionReadAdapter:
         if primary_claim_id is None or primary_package_id is None:
             return evidence
 
-        # Spec ``audit-db-path-config.md`` L113 requires the audit row's ``ts``
-        # to match ``envelope.created_at``. Compute a single emission timestamp
+        # Spec ``audit-db-path-config.md`` §6.1 (audit row schema, ``ts`` field)
+        # requires the audit row's ``ts`` to match ``envelope.created_at``
+        # (second precision matching envelope.created_at, per §6.1 schema
+        # comment). Compute a single emission timestamp
         # here and reuse it for both fields so the contract holds even when the
         # reader runs against a non-default ``query_time`` or crosses a second
         # boundary between the audit row and the envelope construction.

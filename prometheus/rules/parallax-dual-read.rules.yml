@@ -30,7 +30,8 @@ groups:
             48h SLO observation window must restart if this fires during pre-flip phase.
 
       - alert: AphelionUnreachableRateHigh
-        expr: parallax_aphelion_unreachable_rate > 0.01
+        expr: |
+          max by (user_id, traffic_source) (parallax_aphelion_unreachable_rate) > 0.01
         for: 5m
         labels:
           severity: warning
@@ -68,7 +69,8 @@ groups:
             were force-cut. Investigate stuck connections or upstream blocks.
 
       - alert: DualReadDiscrepancyRateHigh
-        expr: parallax_dual_read_discrepancy_rate > 0.001
+        expr: |
+          max by (user_id, traffic_source) (parallax_dual_read_discrepancy_rate) > 0.001
         for: 30m
         labels:
           severity: warning

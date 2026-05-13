@@ -157,7 +157,7 @@ def test_thread_safety() -> None:
 
     assert not errors
     with c._lock:
-        total = len(c._data.get("shared", []))
+        total = len(c._data.get(("shared", "natural"), []))
     assert total == 10_000
 
 
@@ -193,14 +193,33 @@ def test_prometheus_counter_increments() -> None:
     n = 7
     # Snapshot before to handle cumulative prometheus state
     before = _scrape_counter_value(
-        "parallax_dual_read_outcomes", {"outcome": "diverge", "user_id": uid}
+        "parallax_dual_read_outcomes",
+        {"outcome": "diverge", "user_id": uid, "traffic_source": "natural"},
     )
     for _ in range(n):
         record_dual_read_outcome(user_id=uid, outcome="diverge")
     after = _scrape_counter_value(
-        "parallax_dual_read_outcomes", {"outcome": "diverge", "user_id": uid}
+        "parallax_dual_read_outcomes",
+        {"outcome": "diverge", "user_id": uid, "traffic_source": "natural"},
     )
     assert (after - before) == n
+
+
+def test_prometheus_counter_carries_traffic_source_label() -> None:
+    """M4 burn-in metrics must split synthetic vs natural traffic."""
+    uid = "prom_traffic_source_test_user"
+    before = _scrape_counter_value(
+        "parallax_dual_read_outcomes",
+        {"outcome": "match", "user_id": uid, "traffic_source": "synthetic"},
+    )
+
+    record_dual_read_outcome(user_id=uid, outcome="match", traffic_source="synthetic")
+
+    after = _scrape_counter_value(
+        "parallax_dual_read_outcomes",
+        {"outcome": "match", "user_id": uid, "traffic_source": "synthetic"},
+    )
+    assert (after - before) == 1
 
 
 def test_prometheus_gauge_reflects_rate() -> None:
@@ -211,7 +230,10 @@ def test_prometheus_gauge_reflects_rate() -> None:
     record_dual_read_outcome(user_id=uid, outcome="match")
 
     expected = dual_read_discrepancy_rate(user_id=uid)
-    gauge_val = _scrape_gauge_value("parallax_dual_read_discrepancy_rate", {"user_id": uid})
+    gauge_val = _scrape_gauge_value(
+        "parallax_dual_read_discrepancy_rate",
+        {"user_id": uid, "traffic_source": "natural"},
+    )
     assert abs(gauge_val - expected) < 1e-9
 
 

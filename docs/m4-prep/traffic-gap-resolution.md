@@ -95,7 +95,7 @@ This double gate (synthetic for clock, natural for semantics) addresses both Son
 
 ### 3.4 PENDING_IMPLEMENTATION gate (added 2026-05-09 Phase-4 review)
 
-Items 4.7 (`parallax canary --dod` Phase-1/Phase-2 split) and 4.8 (burn-in monitor split) are PENDING. Until both land, the DoD evaluator has no awareness of `traffic_source` and CANNOT distinguish synthetic from natural traffic.
+Items 4.7 (`parallax canary --dod` Phase-1/Phase-2 split) and 4.8 (burn-in monitor split) were PENDING at freeze time and shipped via PR #50 on 2026-05-10. The DoD evaluator now has awareness of `traffic_source` and can distinguish synthetic from natural traffic.
 
 **Mandatory gate**: until items 4.7 AND 4.8 are merged, `parallax canary --dod` MUST return `PENDING_IMPLEMENTATION` (NOT pass / NOT fail) for the B1 and B2 checks. The CLI exits with status code 65 (`EX_DATAERR` — sysexits) and prints:
 
@@ -113,14 +113,14 @@ The gate auto-removes when items 4.7 and 4.8 ship. No manual flag flip.
 | # | Task | Owner | Status |
 |---|---|---|---|
 | 4.1 | Spec the loader (this doc) | Claude autopilot | DONE 2026-05-09 |
-| 4.2 | Add `traffic_source` label to all M4 burn-in metrics in `parallax/metrics/canary.py` | Claude / Codex follow-up | PENDING (separate small PR) |
-| 4.3 | Update Prometheus rules in `deploy/observability/rules/parallax_m4_canary.yml` to group by `traffic_source` | Claude / Codex follow-up | PENDING |
-| 4.4 | Update Grafana dashboard JSON to split panels by `traffic_source` | Claude / Codex follow-up | PENDING |
-| 4.5 | Write loader script (`scripts/burn-in-synth-loader.py` — 1 qps, M3-corpus-shape queries, localhost) | Claude / Codex follow-up | PENDING |
-| 4.6 | systemd user-service unit (`~/.config/systemd/user/parallax-burn-in-synth-loader.service`) | Claude / Codex follow-up | PENDING |
-| 4.7 | Update `parallax canary --dod` to honor the Phase 1 / Phase 2 split | Claude / Codex follow-up | PENDING |
-| 4.8 | Update `scripts/burn-in-monitor.sh` to surface `synthetic_started_24h` + `natural_started_24h` separately | Claude / Codex follow-up | PENDING |
-| 4.9 | Append §8.8 to `m4-m5-readiness-report.md` documenting the hybrid resolution | Claude / Codex follow-up | PENDING |
+| 4.2 | Add `traffic_source` label to all M4 burn-in metrics in `parallax/router/dual_read.py` + `parallax/router/discrepancy_live.py` | Claude / Codex follow-up | DONE 2026-05-13 (this PR) |
+| 4.3 | Update Prometheus rules in `prometheus/rules/parallax-dual-read.rules.yml` to group by `traffic_source` | Claude / Codex follow-up | DONE 2026-05-13 (this PR) |
+| 4.4 | Update Grafana dashboard JSON to split panels by `traffic_source` | Claude / Codex follow-up | DONE 2026-05-13 (this PR) |
+| 4.5 | Write loader script (`scripts/burn-in-synth-loader.py` — 1 qps, M3-corpus-shape queries, localhost) | Claude / Codex follow-up | DONE 2026-05-10 (PR #50) |
+| 4.6 | systemd user-service unit (`~/.config/systemd/user/parallax-burn-in-synth-loader.service`) | Claude / Codex follow-up | DONE 2026-05-10 (PR #50) |
+| 4.7 | Update `parallax canary --dod` to honor the Phase 1 / Phase 2 split | Claude / Codex follow-up | DONE 2026-05-10 (PR #50) |
+| 4.8 | Update `scripts/burn-in-monitor.sh` to surface `synthetic_started_24h` + `natural_started_24h` separately | Claude / Codex follow-up | DONE 2026-05-10 (PR #50) |
+| 4.9 | Append §8.8 to `m4-m5-readiness-report.md` documenting the hybrid resolution | Claude / Codex follow-up | DONE 2026-05-13 (this PR) |
 
 Items 4.2–4.9 are mechanical and chunk-able. They are NOT Chris-gated for design (this doc settles design). Chris-gated only for: (a) deciding when to run them in the M4 timeline, (b) approving the small PR that lands them.
 

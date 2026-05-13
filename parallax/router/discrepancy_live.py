@@ -12,6 +12,7 @@ Public API:
     record_dual_read_outcome              -- module-level convenience wrapper
     dual_read_discrepancy_rate            -- pure read on singleton
     aphelion_unreachable_rate             -- pure read on singleton
+    parallax_aphelion_total               -- Aphelion-bound request counter
 
 Design notes
 ------------
@@ -61,6 +62,18 @@ APHELION_UNREACHABLE_RATE_THRESHOLD: Final[float] = 0.005  # 0.5%
 # ---------------------------------------------------------------------------
 
 DualReadOutcome = Literal["match", "diverge", "primary_only", "aphelion_unreachable", "skipped"]
+TrafficSource = Literal["synthetic", "natural"]
+KNOWN_TRAFFIC_SOURCES: Final[frozenset[str]] = frozenset({"synthetic", "natural"})
+DEFAULT_TRAFFIC_SOURCE: Final[TrafficSource] = "natural"
+
+
+def _normalize_traffic_source(value: str | None) -> TrafficSource:
+    if value is None:
+        return DEFAULT_TRAFFIC_SOURCE
+    candidate = value.strip().lower()
+    if candidate == "synthetic":
+        return "synthetic"
+    return DEFAULT_TRAFFIC_SOURCE
 
 # ---------------------------------------------------------------------------
 # Prometheus collectors
@@ -97,8 +110,14 @@ def _get_or_create_gauge(
 
 _outcomes_counter = _get_or_create_counter(
     "parallax_dual_read_outcomes",
-    "Total dual-read outcome events by type and user.",
-    ["outcome", "user_id"],
+    "Total dual-read outcome events by type, user, and burn-in traffic source.",
+    ["outcome", "user_id", "traffic_source"],
+)
+
+_aphelion_counter = _get_or_create_counter(
+    "parallax_aphelion",
+    "Total dual-read requests that attempted the Aphelion secondary.",
+    ["user_id", "traffic_source"],
 )
 
 _discrepancy_rate_gauge = _get_or_create_gauge(
@@ -107,13 +126,13 @@ _discrepancy_rate_gauge = _get_or_create_gauge(
         "Rolling-window fraction of dual-read outcomes that are 'diverge'"
         " (excludes aphelion_unreachable from denominator)."
     ),
-    ["user_id"],
+    ["user_id", "traffic_source"],
 )
 
 _unreachable_rate_gauge = _get_or_create_gauge(
     "parallax_aphelion_unreachable_rate",
     "Rolling-window fraction of dual-read outcomes where Aphelion was unreachable.",
-    ["user_id"],
+    ["user_id", "traffic_source"],
 )
 
 # ---------------------------------------------------------------------------
@@ -137,34 +156,43 @@ class LiveDiscrepancyCounter:
     window_seconds: float = 3600.0  # mirrors M2's discrepancy_rate(window='1h')
 
     def __post_init__(self) -> None:
-        # Per-user deques: user_id -> deque of (monotonic_ts, outcome)
-        self._data: dict[str, collections.deque[_Entry]] = {}
+        # Per (user_id, traffic_source) deques keep M4 synthetic and natural
+        # burn-in windows independent.
+        self._data: dict[tuple[str, TrafficSource], collections.deque[_Entry]] = {}
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public methods
     # ------------------------------------------------------------------
 
-    def record(self, *, user_id: str, outcome: DualReadOutcome) -> None:
+    def record(
+        self,
+        *,
+        user_id: str,
+        outcome: DualReadOutcome,
+        traffic_source: str | None = None,
+    ) -> None:
         """Append (now, outcome) for user; trim entries older than window."""
         now = time.monotonic()
         cutoff = now - self.window_seconds
+        source = _normalize_traffic_source(traffic_source)
         with self._lock:
-            dq = self._data.setdefault(user_id, collections.deque())
+            dq = self._data.setdefault((user_id, source), collections.deque())
             dq.append((now, outcome))
             # Trim front (oldest entries)
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
 
-    def discrepancy_rate(self, *, user_id: str) -> float:
+    def discrepancy_rate(self, *, user_id: str, traffic_source: str | None = None) -> float:
         """Fraction of in-window outcomes that are 'diverge'.
 
         Excludes 'aphelion_unreachable' from the denominator (mirrors M2's
         exclusion of 'shadow_only' from the discrepancy denominator per
         ralplan §6 line 429). Empty window → 0.0.
         """
+        source = _normalize_traffic_source(traffic_source)
         with self._lock:
-            dq = self._data.get(user_id)
+            dq = self._data.get((user_id, source))
             if not dq:
                 return 0.0
             entries = list(dq)
@@ -176,13 +204,19 @@ class LiveDiscrepancyCounter:
         diverge = sum(1 for _, o in entries if o == "diverge")
         return diverge / denominator
 
-    def aphelion_unreachable_rate(self, *, user_id: str) -> float:
+    def aphelion_unreachable_rate(
+        self,
+        *,
+        user_id: str,
+        traffic_source: str | None = None,
+    ) -> float:
         """Fraction of in-window outcomes that are 'aphelion_unreachable'.
 
         Denominator is ALL outcomes (total events). Empty window → 0.0.
         """
+        source = _normalize_traffic_source(traffic_source)
         with self._lock:
-            dq = self._data.get(user_id)
+            dq = self._data.get((user_id, source))
             if not dq:
                 return 0.0
             entries = list(dq)
@@ -210,28 +244,36 @@ _singleton = LiveDiscrepancyCounter()
 # ---------------------------------------------------------------------------
 
 
-def record_dual_read_outcome(*, user_id: str, outcome: DualReadOutcome) -> None:
+def record_dual_read_outcome(
+    *,
+    user_id: str,
+    outcome: DualReadOutcome,
+    traffic_source: str | None = None,
+) -> None:
     """Record one dual-read outcome:
 
-    1. Increment ``parallax_dual_read_outcomes_total{outcome, user_id}``.
+    1. Increment ``parallax_dual_read_outcomes_total{outcome, user_id, traffic_source}``.
     2. Append to singleton rolling window.
     3. Recompute and SET both rate gauges for ``user_id``.
     """
-    _outcomes_counter.labels(outcome=outcome, user_id=user_id).inc()
-    _singleton.record(user_id=user_id, outcome=outcome)
-    _discrepancy_rate_gauge.labels(user_id=user_id).set(
-        _singleton.discrepancy_rate(user_id=user_id)
+    source = _normalize_traffic_source(traffic_source)
+    _outcomes_counter.labels(outcome=outcome, user_id=user_id, traffic_source=source).inc()
+    if outcome != "skipped":
+        _aphelion_counter.labels(user_id=user_id, traffic_source=source).inc()
+    _singleton.record(user_id=user_id, outcome=outcome, traffic_source=source)
+    _discrepancy_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
+        _singleton.discrepancy_rate(user_id=user_id, traffic_source=source)
     )
-    _unreachable_rate_gauge.labels(user_id=user_id).set(
-        _singleton.aphelion_unreachable_rate(user_id=user_id)
+    _unreachable_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
+        _singleton.aphelion_unreachable_rate(user_id=user_id, traffic_source=source)
     )
 
 
-def dual_read_discrepancy_rate(*, user_id: str) -> float:
+def dual_read_discrepancy_rate(*, user_id: str, traffic_source: str | None = None) -> float:
     """Return the current rolling-window discrepancy rate for ``user_id``."""
-    return _singleton.discrepancy_rate(user_id=user_id)
+    return _singleton.discrepancy_rate(user_id=user_id, traffic_source=traffic_source)
 
 
-def aphelion_unreachable_rate(*, user_id: str) -> float:
+def aphelion_unreachable_rate(*, user_id: str, traffic_source: str | None = None) -> float:
     """Return the current rolling-window Aphelion-unreachable rate for ``user_id``."""
-    return _singleton.aphelion_unreachable_rate(user_id=user_id)
+    return _singleton.aphelion_unreachable_rate(user_id=user_id, traffic_source=traffic_source)

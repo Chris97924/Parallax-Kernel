@@ -487,6 +487,27 @@ def test_record_dual_read_outcome_failure_does_not_propagate(
     assert r.primary is not None
 
 
+def test_router_threads_traffic_source_to_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Synthetic burn-in requests must emit metrics with traffic_source=synthetic."""
+    monkeypatch.setenv("DUAL_READ", "true")
+    primary = _StubPort(_n_hits())
+    secondary = _StubPort(_n_hits())
+
+    import parallax.router.dual_read as dr_mod
+
+    calls: list[dict[str, object]] = []
+
+    def _capture(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(dr_mod, "record_dual_read_outcome", _capture)
+
+    _router(primary, secondary).query(_request(), traffic_source="synthetic")
+
+    assert calls
+    assert calls[-1]["traffic_source"] == "synthetic"
+
+
 def test_live_counter_record_failure_does_not_propagate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

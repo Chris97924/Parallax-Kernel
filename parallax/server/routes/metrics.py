@@ -41,6 +41,7 @@ from fastapi.responses import PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
+    REGISTRY,
     CollectorRegistry,
     Gauge,
     generate_latest,
@@ -296,6 +297,34 @@ def _sanitize_metric_name(name: str) -> str:
     return name.strip("_")
 
 
+def _format_prometheus_labels(labels: dict[str, str]) -> str:
+    if not labels:
+        return ""
+    rendered = []
+    for key, value in sorted(labels.items()):
+        escaped = value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+        rendered.append(f'{key}="{escaped}"')
+    return "{" + ",".join(rendered) + "}"
+
+
+def _render_aphelion_total() -> str:
+    """Expose the live prometheus_client Aphelion counter without duplicating gauges."""
+    for metric in REGISTRY.collect():
+        if metric.name != "parallax_aphelion":
+            continue
+        lines = [
+            f"# HELP parallax_aphelion_total {metric.documentation}",
+            "# TYPE parallax_aphelion_total counter",
+        ]
+        for sample in metric.samples:
+            if sample.name != "parallax_aphelion_total":
+                continue
+            labels = _format_prometheus_labels(sample.labels)
+            lines.append(f"parallax_aphelion_total{labels} {sample.value}")
+        return "\n".join(lines) + "\n"
+    return ""
+
+
 def _build_payload() -> str:
     """Render Prometheus text format combining in-house counters + shadow gauges."""
     reg = CollectorRegistry()
@@ -423,7 +452,7 @@ def _build_payload() -> str:
     )
     policy_gauge.labels(policy_version=POLICY_VERSION_DEFAULT).set(1.0)
 
-    return generate_latest(reg).decode("utf-8")
+    return generate_latest(reg).decode("utf-8") + _render_aphelion_total()
 
 
 @router.get("/metrics", response_class=PlainTextResponse)

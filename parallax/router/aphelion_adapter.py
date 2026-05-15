@@ -24,6 +24,8 @@ Spec anchors:
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
@@ -35,7 +37,12 @@ from aphelion.read_adapter import AphelionReadAdapter as _V03Reader
 from aphelion.read_adapter import ConflictClass
 from aphelion.v03_validator import validate_v03_fields
 
-from parallax.apex.audit_writer import AuditRow, canonicalize_row
+from parallax.apex.audit_db import AuditDbUsageError, AuditDbWriteError, write_audit_row
+from parallax.apex.audit_writer import (
+    AuditRow,
+    assert_audit_row_committed,
+    canonicalize_row,
+)
 from parallax.apex.envelope import (
     Envelope,
     PayloadType,
@@ -48,11 +55,18 @@ from parallax.router.contracts import QueryRequest
 
 __all__ = ["AphelionReadAdapter", "AphelionUnreachableError"]
 
+_log = logging.getLogger(__name__)
 
 ENVELOPE_VERSION_LITERAL = "0.1"
 ENVELOPE_SCHEMA_VERSION = 1
 
 ClaimLoader = Callable[[QueryRequest], Iterable[Mapping[str, Any]]]
+
+# Zero-arg callable returning the calling thread's audit-db connection.
+# query.py wires this to ``lambda: get_thread_local_audit_conn(path)`` so the
+# connection is opened lazily inside the DualReadRouter worker thread (not the
+# request thread). See ``parallax.apex.audit_db.get_thread_local_audit_conn``.
+AuditConnProvider = Callable[[], sqlite3.Connection]
 
 
 class AphelionUnreachableError(Exception):
@@ -65,6 +79,12 @@ class AphelionUnreachableError(Exception):
       - ``"claim_schema_error"`` — v0.3 validator rejected a candidate frontmatter
       - ``"envelope_checksum_mismatch"`` — envelope round-trip failed
       - ``"audit_row_invalid"`` — canonicalize_row rejected the row
+      - ``"audit_db_write_failed"`` — write_audit_row raised AuditDbWriteError
+        (disk full / locked / commit failed); fail-closed, no envelope emitted
+      - ``"audit_db_usage_error"`` — write_audit_row raised AuditDbUsageError
+        (caller-contract violation, e.g. conn already in a transaction)
+      - ``"audit_db_integrity_error"`` — audit row INSERT hit a UNIQUE/CHECK
+        constraint (duplicate envelope_message_id); fail-closed, no envelope
       - ``"unsafe_archive"`` — Aphelion v0.2 untar safety violation (M6+ scope)
       - ``"unsigned_package"`` — Aphelion v0.5 signature missing (M6+ scope)
 
@@ -130,6 +150,16 @@ class AphelionReadAdapter:
     / ``last_audit_row`` which are overwritten on every ``query()`` call.
 
     Args:
+        audit_conn_provider: REQUIRED zero-arg callable returning the calling
+            thread's audit-db :class:`sqlite3.Connection`. ``query()`` invokes
+            it on a real claim hit to persist the audit row BEFORE the
+            envelope's ``audit_db_ref`` sha256 is computed (apex-m5-envelope
+            -spec.md §8.1 write-order invariant). Production wires this to
+            ``lambda: get_thread_local_audit_conn(app.state.audit_db_path)``;
+            the callable is evaluated inside the DualReadRouter worker thread
+            so the per-thread connection is created on the correct thread.
+            There is intentionally no default — the adapter must never emit an
+            envelope without a committed audit row.
         package_dir: Aphelion package store path (``PARALLAX_APHELION_PACKAGE_DIR``).
             Stored for M6/M7 ingest hookup; PR-D does not walk it.
         timeout_ms: Reserved for the M3 dual-read shadow timeout contract.
@@ -142,10 +172,12 @@ class AphelionReadAdapter:
     def __init__(
         self,
         *,
+        audit_conn_provider: AuditConnProvider,
         package_dir: Path | None = None,
         timeout_ms: float = 100.0,
         claim_loader: ClaimLoader | None = None,
     ) -> None:
+        self._audit_conn_provider = audit_conn_provider
         self._package_dir = package_dir
         self._timeout_ms = timeout_ms
         self._claim_loader: ClaimLoader = claim_loader or _empty_loader
@@ -258,6 +290,76 @@ class AphelionReadAdapter:
         except Exception as exc:
             raise AphelionUnreachableError("audit_row_invalid") from exc
 
+        # Spec apex-m5-envelope-spec.md §8.1 write-order invariant: the audit
+        # row MUST be committed to audit.db BEFORE the envelope's audit_db_ref
+        # sha256 is computed and the envelope is emitted — otherwise the
+        # envelope carries a hash of a row no one ever wrote. write_audit_row
+        # failures are fail-closed: the secondary is treated as unreachable
+        # (DualReadRouter falls back to primary) and NO envelope is emitted,
+        # so last_envelope / last_audit_row stay None (cleared at the top of
+        # this method). No queue / retry — a retried row cannot re-emit an
+        # already-abandoned envelope, so retry has no semantic value here.
+        #
+        # The except fence below is total on purpose: ANY exception escaping
+        # this block reaches DualReadRouter as an *unexpected* exception, which
+        # it classifies as "primary_only" — silently losing the
+        # "aphelion_unreachable" signal AND the circuit-breaker increment. So
+        # every failure mode (the provider raising, write_audit_row's
+        # un-wrapped INSERT-step sqlite errors, its belt-and-braces
+        # canonicalize re-validation ValueError, anything else) is funnelled
+        # into AphelionUnreachableError.
+        committed = False
+        try:
+            write_audit_row(self._audit_conn_provider(), audit_row)
+            committed = True
+        except sqlite3.IntegrityError as exc:
+            _log.error(
+                "audit_db_integrity_error: audit row INSERT hit a UNIQUE/CHECK "
+                "constraint (envelope_message_id=%s); secondary unreachable",
+                envelope_message_id,
+                exc_info=True,
+            )
+            raise AphelionUnreachableError("audit_db_integrity_error") from exc
+        except AuditDbUsageError as exc:
+            _log.error(
+                "audit_db_usage_error: write_audit_row caller-contract "
+                "violation (%s); secondary unreachable",
+                exc,
+                exc_info=True,
+            )
+            raise AphelionUnreachableError("audit_db_usage_error") from exc
+        except (AuditDbWriteError, sqlite3.Error) as exc:
+            # AuditDbWriteError = BEGIN/COMMIT failures write_audit_row wraps;
+            # a bare sqlite3.Error = an INSERT-step failure it re-raises
+            # un-wrapped (e.g. OperationalError on disk-full mid-statement).
+            _log.error(
+                "audit_db_write_failed: audit row write failed (%s); "
+                "secondary unreachable",
+                exc,
+                exc_info=True,
+            )
+            raise AphelionUnreachableError("audit_db_write_failed") from exc
+        except Exception as exc:  # noqa: BLE001 — see the fence rationale above
+            # The audit-conn provider raising (e.g. open_audit_db hitting
+            # AuditDbConfigError on a worker thread), or any other unforeseen
+            # failure. Must NOT escape as "primary_only".
+            _log.error(
+                "audit_db_write_failed: unexpected audit write error (%s); "
+                "secondary unreachable",
+                exc,
+                exc_info=True,
+            )
+            raise AphelionUnreachableError("audit_db_write_failed") from exc
+
+        # Explicit write-order guard (survives ``python -O`` — see
+        # audit_writer.assert_audit_row_committed). ``committed`` is set True
+        # ONLY after write_audit_row returns normally above, so a future
+        # refactor that drops the write, or moves this guard / the envelope
+        # assembly ahead of it, trips AuditWriteOrderViolation instead of
+        # emitting an envelope for an uncommitted row. Passing a literal here
+        # would make the guard a no-op.
+        assert_audit_row_committed(committed)
+
         payload: dict[str, Any] = {
             "subject": subject,
             "conflict_class": result.conflict_class.value,
@@ -273,6 +375,7 @@ class AphelionReadAdapter:
             "message_id": envelope_message_id,
             "created_at": emit_ts,
             "source": Source.APHELION.value,
+            # sha256 of the row already committed above (write-order invariant).
             "audit_db_ref": audit_row.sha256_hex(),
             "payload_type": PayloadType.QUERY_RESULT.value,
             "payload": payload,

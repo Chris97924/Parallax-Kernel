@@ -957,6 +957,31 @@ def _cmd_serve(*, host: str, port: int, log_level: str, reload: bool) -> int:
             file=sys.stderr,
         )
         return _EXIT_USER_ERROR
+
+    # Apex M5 audit-db preflight (spec §4): validate PARALLAX_AUDIT_DB_PATH
+    # BEFORE uvicorn binds. parallax.server.lifespan re-runs this same check
+    # and stashes app.state.audit_db_path for the write path — but a
+    # lifespan-raised exception is swallowed by uvicorn into a non-78 process
+    # exit, so this preflight is what makes the canonical launcher exit with
+    # the deterministic EX_CONFIG (78) on a broken audit path.
+    import contextlib  # noqa: PLC0415 — lazy import; serve-only
+
+    from parallax.apex.audit_db import (  # noqa: PLC0415 — lazy import; serve-only
+        EX_CONFIG,
+        AuditDbConfigError,
+        open_audit_db,
+        resolve_audit_db_path,
+    )
+
+    try:
+        # contextlib.closing releases the preflight connection even if a later
+        # line raises — open_audit_db runs the §4 gates; nothing else to do.
+        with contextlib.closing(open_audit_db(resolve_audit_db_path(), validate=True)):
+            pass
+    except AuditDbConfigError as exc:
+        print(f"parallax serve: audit-db preflight failed: {exc}", file=sys.stderr)
+        return EX_CONFIG
+
     uvicorn.run(
         "parallax.server.app:app",
         host=host,

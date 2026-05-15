@@ -54,3 +54,20 @@ def conn(tmp_path: pathlib.Path) -> Iterator[sqlite3.Connection]:
         yield c
     finally:
         c.close()
+
+
+@pytest.fixture(autouse=True)
+def _audit_db_path_env(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point ``PARALLAX_AUDIT_DB_PATH`` at a per-test tmp ``audit.db``.
+
+    The Apex M5 server lifespan (:func:`parallax.server.lifespan.parallax_lifespan`)
+    validates ``PARALLAX_AUDIT_DB_PATH`` at startup and refuses to boot
+    without it (audit-db-path-config.md §4). This autouse fixture gives
+    every test that spins up the app (``TestClient`` / ``create_app``) a
+    valid, writable, absolute audit path so the boot gate passes
+    transparently. Tests that specifically exercise the boot-fail path
+    ``monkeypatch.delenv`` it inside the test body (later monkeypatch wins).
+    """
+    monkeypatch.setenv("PARALLAX_AUDIT_DB_PATH", str(tmp_path / "audit.db"))

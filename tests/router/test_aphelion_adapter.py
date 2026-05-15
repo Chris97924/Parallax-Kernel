@@ -13,12 +13,15 @@ Spec anchors:
 
 from __future__ import annotations
 
+import pathlib
 import re
-from collections.abc import Iterable, Mapping
+import sqlite3
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 import pytest
 
+from parallax.apex.audit_db import open_audit_db
 from parallax.apex.envelope import Envelope, PayloadType, Source, parse_envelope
 from parallax.router.aphelion_adapter import (
     AphelionReadAdapter,
@@ -78,27 +81,56 @@ def _request(
     return QueryRequest(query_type=query_type, user_id=user_id, q=q)
 
 
+@pytest.fixture()
+def audit_conn_provider(
+    tmp_path: pathlib.Path,
+) -> Iterator[Callable[[], sqlite3.Connection]]:
+    """Real audit-db connection provider backed by a disposable tmp audit.db.
+
+    Mirrors what :func:`parallax.apex.audit_db.get_thread_local_audit_conn`
+    hands the adapter in production: a zero-arg callable returning a working
+    :class:`sqlite3.Connection` with the ``audit_row`` schema applied.
+    ``validate=False`` skips the boot-time quick_check / write probe (the
+    server lifespan owns that gate); the WAL pragmas + schema still apply.
+    """
+    conn = open_audit_db(tmp_path / "audit.db", validate=False)
+    try:
+        yield lambda: conn
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Construction + Protocol conformance
 # ---------------------------------------------------------------------------
 
 
-def test_constructor_defaults() -> None:
-    adapter = AphelionReadAdapter()
+def test_constructor_defaults(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
+    adapter = AphelionReadAdapter(audit_conn_provider=audit_conn_provider)
     assert adapter._timeout_ms == 100.0
     assert adapter._package_dir is None
     assert adapter.last_envelope is None
     assert adapter.last_audit_row is None
 
 
-def test_constructor_custom_args(tmp_path: Any) -> None:
-    adapter = AphelionReadAdapter(package_dir=tmp_path, timeout_ms=50.0)
+def test_constructor_custom_args(
+    tmp_path: Any, audit_conn_provider: Callable[[], sqlite3.Connection]
+) -> None:
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider,
+        package_dir=tmp_path,
+        timeout_ms=50.0,
+    )
     assert adapter._package_dir == tmp_path
     assert adapter._timeout_ms == 50.0
 
 
-def test_conforms_to_query_port_protocol() -> None:
-    adapter = AphelionReadAdapter()
+def test_conforms_to_query_port_protocol(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
+    adapter = AphelionReadAdapter(audit_conn_provider=audit_conn_provider)
     assert isinstance(adapter, QueryPort)
 
 
@@ -121,6 +153,9 @@ def test_unreachable_error_reason_attribute() -> None:
         "claim_schema_error",
         "envelope_checksum_mismatch",
         "audit_row_invalid",
+        "audit_db_write_failed",
+        "audit_db_usage_error",
+        "audit_db_integrity_error",
     ],
 )
 def test_unreachable_error_reason_values(reason: str) -> None:
@@ -133,14 +168,16 @@ def test_unreachable_error_reason_values(reason: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_query_returns_empty_evidence_on_not_found() -> None:
+def test_query_returns_empty_evidence_on_not_found(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """Default empty loader → NOT_FOUND, empty hits, no envelope emission.
 
     PR-D scope-cut: no real ``package_id`` to anchor an audit row, so the
     adapter intentionally skips envelope emission for NOT_FOUND. M6/M7
     ingest pipeline will revisit this once package metadata is available.
     """
-    adapter = AphelionReadAdapter()
+    adapter = AphelionReadAdapter(audit_conn_provider=audit_conn_provider)
     evidence = adapter.query(_request())
 
     assert evidence.hits == ()
@@ -155,7 +192,9 @@ def test_query_returns_empty_evidence_on_not_found() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_r4_supersession_surfaces_active_claim_and_emits_envelope() -> None:
+def test_r4_supersession_surfaces_active_claim_and_emits_envelope(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """Newer claim with `supersedes: [old]` → primary == newer; envelope emitted."""
     older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
     newer = _claim(
@@ -166,7 +205,9 @@ def test_r4_supersession_surfaces_active_claim_and_emits_envelope() -> None:
     def loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
         return [older, newer]
 
-    adapter = AphelionReadAdapter(claim_loader=loader)
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider, claim_loader=loader
+    )
     evidence = adapter.query(_request())
 
     env = adapter.last_envelope
@@ -181,14 +222,19 @@ def test_r4_supersession_surfaces_active_claim_and_emits_envelope() -> None:
     assert evidence.hits[0]["id"] == newer["claim_id"]
 
 
-def test_audit_db_ref_matches_canonical_sha256() -> None:
+def test_audit_db_ref_matches_canonical_sha256(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """envelope.audit_db_ref MUST equal the canonical sha256 of the audit row."""
     older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
     newer = _claim(
         claim_id="01963f7d-7000-7000-8000-000000000011",
         supersedes=["01963f7d-7000-7000-8000-000000000010"],
     )
-    adapter = AphelionReadAdapter(claim_loader=lambda _r: [older, newer])
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider,
+        claim_loader=lambda _r: [older, newer],
+    )
     adapter.query(_request())
 
     env = adapter.last_envelope
@@ -198,8 +244,10 @@ def test_audit_db_ref_matches_canonical_sha256() -> None:
     assert env.audit_db_ref == row.sha256_hex()
 
 
-def test_audit_row_ts_matches_envelope_created_at() -> None:
-    """Spec ``audit-db-path-config.md`` §6.1 (``ts`` field): audit row ``ts`` MUST equal envelope ``created_at``.
+def test_audit_row_ts_matches_envelope_created_at(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
+    """Audit row ``ts`` MUST equal envelope ``created_at`` (audit-db-path-config.md §6.1).
 
     Regression for Codex P2 review on PR #51: the previous implementation
     populated ``audit_row.ts`` from ``result.used_query_time`` (reader time)
@@ -212,7 +260,10 @@ def test_audit_row_ts_matches_envelope_created_at() -> None:
         claim_id="01963f7d-7000-7000-8000-000000000011",
         supersedes=["01963f7d-7000-7000-8000-000000000010"],
     )
-    adapter = AphelionReadAdapter(claim_loader=lambda _r: [older, newer])
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider,
+        claim_loader=lambda _r: [older, newer],
+    )
     adapter.query(_request())
 
     env = adapter.last_envelope
@@ -221,14 +272,19 @@ def test_audit_row_ts_matches_envelope_created_at() -> None:
     assert row.data["ts"] == env.created_at
 
 
-def test_envelope_round_trips_through_parse_envelope() -> None:
+def test_envelope_round_trips_through_parse_envelope(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """Emitted envelope passes parse_envelope without raising."""
     older = _claim(claim_id="01963f7d-7000-7000-8000-000000000010")
     newer = _claim(
         claim_id="01963f7d-7000-7000-8000-000000000011",
         supersedes=["01963f7d-7000-7000-8000-000000000010"],
     )
-    adapter = AphelionReadAdapter(claim_loader=lambda _r: [older, newer])
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider,
+        claim_loader=lambda _r: [older, newer],
+    )
     adapter.query(_request())
 
     env = adapter.last_envelope
@@ -253,7 +309,9 @@ def test_envelope_round_trips_through_parse_envelope() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_error_surfaces_as_unreachable() -> None:
+def test_schema_error_surfaces_as_unreachable(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """Validator rejects a reserved field → AphelionUnreachableError(claim_schema_error).
 
     ``conflict_class`` is a reserved derivation field (spec §7) that MUST NOT
@@ -271,13 +329,17 @@ def test_schema_error_surfaces_as_unreachable() -> None:
             }
         ]
 
-    adapter = AphelionReadAdapter(claim_loader=bad_loader)
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider, claim_loader=bad_loader
+    )
     with pytest.raises(AphelionUnreachableError) as excinfo:
         adapter.query(_request())
     assert excinfo.value.reason == "claim_schema_error"
 
 
-def test_loader_runtime_error_surfaces_as_unreachable() -> None:
+def test_loader_runtime_error_surfaces_as_unreachable(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """A claim_loader that raises a non-contract exception must be wrapped.
 
     Without wrapping, DualReadRouter classifies the failure as ``primary_only``
@@ -288,25 +350,33 @@ def test_loader_runtime_error_surfaces_as_unreachable() -> None:
     def crashing_loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
         raise RuntimeError("synthetic loader I/O failure")
 
-    adapter = AphelionReadAdapter(claim_loader=crashing_loader)
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider, claim_loader=crashing_loader
+    )
     with pytest.raises(AphelionUnreachableError) as excinfo:
         adapter.query(_request())
     assert excinfo.value.reason == "claim_loader_error"
 
 
-def test_loader_unreachable_passthrough_preserves_reason() -> None:
+def test_loader_unreachable_passthrough_preserves_reason(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """Loader-side AphelionUnreachableError keeps its reason verbatim."""
 
     def precise_loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
         raise AphelionUnreachableError("unsafe_archive")
 
-    adapter = AphelionReadAdapter(claim_loader=precise_loader)
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider, claim_loader=precise_loader
+    )
     with pytest.raises(AphelionUnreachableError) as excinfo:
         adapter.query(_request())
     assert excinfo.value.reason == "unsafe_archive"
 
 
-def test_failed_query_clears_last_envelope_and_last_audit_row() -> None:
+def test_failed_query_clears_last_envelope_and_last_audit_row(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
     """A failing query MUST reset cached envelope/audit state.
 
     Regression for Codex P2 review on PR #51: the previous implementation
@@ -328,7 +398,9 @@ def test_failed_query_clears_last_envelope_and_last_audit_row() -> None:
     def loader(_req: QueryRequest) -> Iterable[Mapping[str, Any]]:
         return state["claims"]
 
-    adapter = AphelionReadAdapter(claim_loader=loader)
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider, claim_loader=loader
+    )
 
     # First call: successful supersession query populates the cache.
     adapter.query(_request())

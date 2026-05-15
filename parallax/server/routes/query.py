@@ -10,6 +10,7 @@ SessionStart hook plugin consumes.
 
 from __future__ import annotations
 
+import pathlib
 import sqlite3
 from contextlib import closing
 from typing import Annotated, Any, cast
@@ -17,9 +18,11 @@ from typing import Annotated, Any, cast
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from parallax import retrieve as R
+from parallax.apex.audit_db import get_thread_local_audit_conn
 from parallax.injector import build_session_reminder
 from parallax.obs.log import get_logger as _get_logger
 from parallax.obs.metrics import get_counter as _get_counter
+from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router import (
     QueryRequest as RouterQueryRequest,
 )
@@ -53,7 +56,7 @@ class _FactoryRealMemoryRouter:
     def __init__(self, db_factory: DBFactory) -> None:
         self._db_factory = db_factory
 
-    def query(self, request: RouterQueryRequest):
+    def query(self, request: RouterQueryRequest) -> RetrievalEvidence:
         with closing(self._db_factory()) as conn:
             return RealMemoryRouter(conn).query(request)
 
@@ -118,6 +121,7 @@ def _dispatch_with_router(
     conn: sqlite3.Connection,
     *,
     db_factory: DBFactory,
+    audit_db_path: pathlib.Path,
     kind: RetrieveKind,
     user_id: str,
     q: str,
@@ -146,7 +150,15 @@ def _dispatch_with_router(
         dual_read_override if dual_read_override is not None else is_dual_read_enabled()
     )
     primary = _FactoryRealMemoryRouter(db_factory) if dual_read_enabled else RealMemoryRouter(conn)
-    mem_router = DualReadRouter(primary=primary, secondary=AphelionReadAdapter())
+    # The audit_conn_provider lambda is evaluated by AphelionReadAdapter.query()
+    # inside the DualReadRouter ThreadPoolExecutor worker thread (not this
+    # request thread), so get_thread_local_audit_conn opens the per-thread
+    # connection on the correct thread. audit_db_path was validated + stashed
+    # on app.state by parallax.server.lifespan at boot.
+    secondary = AphelionReadAdapter(
+        audit_conn_provider=lambda: get_thread_local_audit_conn(audit_db_path),
+    )
+    mem_router = DualReadRouter(primary=primary, secondary=secondary)
     try:
         result = mem_router.query(
             request,
@@ -241,9 +253,21 @@ def get_query(
             DBFactory,
             getattr(request.app.state, "db_factory", default_db_factory),
         )
+        # Validated + stashed on app.state by parallax.server.lifespan at boot;
+        # the dual-read worker thread opens its per-thread audit connection from
+        # this path. getattr-guarded (consistent with db_factory above) so an
+        # app constructed without running the lifespan fails with a clear 500
+        # rather than an opaque AttributeError.
+        audit_db_path = getattr(request.app.state, "audit_db_path", None)
+        if audit_db_path is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="audit_db_path not initialised — server lifespan did not run",
+            )
         dtos = _dispatch_with_router(
             conn,
             db_factory=db_factory,
+            audit_db_path=audit_db_path,
             kind=kind,
             user_id=resolved_user_id,
             q=q,

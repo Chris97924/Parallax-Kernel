@@ -454,7 +454,19 @@ def test_aphelion_unreachable_reason_propagates_to_router(
             }
         ]
 
-    secondary = AphelionReadAdapter(claim_loader=_bad_loader)
+    # audit_conn_provider must never be reached here: _bad_loader trips the
+    # v0.3 validator → AphelionUnreachableError("claim_schema_error") long
+    # before the audit-write block. Use a provider that raises if that
+    # assumption ever breaks, rather than silently handing over a bad conn.
+    def _provider_must_not_be_called() -> object:
+        raise AssertionError(
+            "audit_conn_provider should not be reached: _bad_loader fails first"
+        )
+
+    secondary = AphelionReadAdapter(
+        audit_conn_provider=_provider_must_not_be_called,  # type: ignore[arg-type]
+        claim_loader=_bad_loader,
+    )
     r = _router(primary, secondary).query(_request())
     assert r.outcome == "aphelion_unreachable"
     assert r.aphelion_unreachable_reason == "claim_schema_error"

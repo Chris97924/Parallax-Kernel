@@ -23,11 +23,13 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Final
 
 from fastapi import FastAPI
 from prometheus_client import Counter
 
+from parallax.apex.audit_db import open_audit_db, resolve_audit_db_path
 from parallax.router.inflight import get_inflight_count
 
 __all__ = [
@@ -104,15 +106,33 @@ async def _drain_inflight(
 
 
 @contextlib.asynccontextmanager
-async def parallax_lifespan(app: FastAPI):  # type: ignore[type-arg]
+async def parallax_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager.
 
-    Startup: nothing special (future migrations / connection-pool warming
-    can go here).
+    Startup: Apex M5 audit-db boot validation — resolve
+    ``PARALLAX_AUDIT_DB_PATH``, run the spec §4 startup gates via
+    :func:`open_audit_db` with ``validate=True``, then close the
+    validation connection (the lifespan holds no runtime connection — the
+    write path opens its own per-thread connections via
+    :func:`parallax.apex.audit_db.get_thread_local_audit_conn`). The
+    validated path is stashed on ``app.state.audit_db_path`` for the query
+    route to hand to the thread-local provider.
 
     Shutdown: drain in-flight requests up to ``DRAIN_TIMEOUT_SECONDS``.
     """
-    # Startup
+    # Startup — Apex M5 audit-db boot validation (spec §4). A misconfigured
+    # or unwritable audit path raises AuditDbConfigError here and the server
+    # refuses to serve traffic. NOTE: uvicorn swallows a lifespan-startup
+    # exception into a non-78 process exit; ``parallax serve`` (parallax.cli
+    # ._cmd_serve) runs the same check as a preflight BEFORE uvicorn.run() so
+    # the canonical launcher exits with the deterministic EX_CONFIG (78).
+    audit_db_path = resolve_audit_db_path()
+    # contextlib.closing guarantees the validation connection is released even
+    # if a later line raises — the lifespan holds no runtime connection.
+    with contextlib.closing(open_audit_db(audit_db_path, validate=True)):
+        pass  # boot-time §4 gates run inside open_audit_db; nothing else to do
+    app.state.audit_db_path = audit_db_path
+
     yield
     # Shutdown — drain
     await _drain_inflight(timeout_seconds=DRAIN_TIMEOUT_SECONDS)

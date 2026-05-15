@@ -31,6 +31,7 @@ import logging
 import os
 import pathlib
 import sqlite3
+import threading
 import time
 from collections.abc import Mapping
 from typing import Any, Final
@@ -58,6 +59,7 @@ __all__ = [
     "AuditDbConfigError",
     "AuditDbUsageError",
     "AuditDbWriteError",
+    "get_thread_local_audit_conn",
     "open_audit_db",
     "resolve_audit_db_path",
     "write_audit_row",
@@ -595,3 +597,58 @@ def write_audit_row(conn: sqlite3.Connection, row: AuditRow) -> None:
         raise AuditDbWriteError(
             f"audit_db commit failed (disk full or locked): {exc}"
         ) from exc
+
+
+# Per-thread audit-db connection cache. sqlite3 connections are not
+# thread-safe, and the Apex M5 write path (AphelionReadAdapter.query) runs
+# inside DualReadRouter's ThreadPoolExecutor worker threads — so each worker
+# thread gets its own connection, matching this module's "each producer
+# thread/process gets its own connection" contract and SQLite's WAL design
+# (concurrent writers, one connection each, no shared-connection lock).
+#
+# NOTE(apex-m5): there is no explicit per-thread close hook. A connection is
+# released when its owning worker thread terminates, or at process exit.
+# Under the current wiring DualReadRouter is constructed per-request in
+# query._dispatch_with_router, so its ThreadPoolExecutor (and worker threads)
+# are short-lived — connections are reclaimed as those threads die, but the
+# per-thread *reuse* this cache is built for only fully pays off once a
+# shared, long-lived executor is wired. That executor-lifecycle change is the
+# deferred per-request-construction refactor (see progress.txt); an explicit
+# shutdown hook is out of scope for this M5 persistence follow-up.
+_thread_local = threading.local()
+
+
+def get_thread_local_audit_conn(path: pathlib.Path | str) -> sqlite3.Connection:
+    """Return the calling thread's audit-db connection, opening it lazily.
+
+    The first call on a given thread opens the connection via
+    :func:`open_audit_db` with ``validate=False`` — the expensive spec §4
+    startup gates (``PRAGMA quick_check`` within a 30 s budget, the
+    ``BEGIN IMMEDIATE`` write probe) already ran once at server boot in
+    :func:`parallax.server.lifespan.parallax_lifespan`, so re-running them
+    per worker thread would be pure latency with no added safety. The WAL
+    pragmas and the idempotent ``CREATE TABLE IF NOT EXISTS`` schema are
+    still applied on every open. Subsequent calls on the same thread return
+    the cached connection.
+
+    The process is expected to use a single audit-db path for its lifetime
+    (``app.state.audit_db_path``, set once at boot). ``path`` is therefore
+    only consumed on the first call per thread; a later call on the same
+    thread with a *different* path raises :class:`AuditDbUsageError` rather
+    than silently returning a connection to the wrong database.
+    """
+    resolved = pathlib.Path(path)
+    conn = getattr(_thread_local, "audit_conn", None)
+    if conn is None:
+        conn = open_audit_db(resolved, validate=False)
+        _thread_local.audit_conn = conn
+        _thread_local.audit_path = resolved
+        return conn
+    cached_path = getattr(_thread_local, "audit_path", None)
+    if cached_path != resolved:
+        raise AuditDbUsageError(
+            f"get_thread_local_audit_conn called with {str(resolved)!r} but this "
+            f"thread already cached a connection for {str(cached_path)!r}; the "
+            "process must use a single audit-db path for its lifetime"
+        )
+    return conn

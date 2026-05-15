@@ -30,11 +30,33 @@ from __future__ import annotations
 import dataclasses
 import datetime as _dt
 import enum
+import logging
+import os
 from collections.abc import Iterable
 from typing import Final
 
 from parallax.canary.audit_log import AuditLog
 from parallax.canary.outcomes import KNOWN_STAGES, OutcomeStore
+
+_LOG = logging.getLogger(__name__)
+
+# Operator-set env var declaring that the synthetic/natural traffic-source
+# split has actually shipped on this deployment. The PRIMARY signal for the
+# DoD gate after the 2026-05-15 Codex round-2 finding (P1).
+#
+# Why env var is primary, not Prometheus introspection:
+# ``parallax canary --dod`` runs in a SEPARATE process from the parallax
+# server. The producer of ``parallax_aphelion_total`` lives in
+# ``parallax.router.discrepancy_live`` and is registered into
+# ``prometheus_client.REGISTRY`` only when that module is imported — which
+# the canary CLI never does. So ``REGISTRY.collect()`` in the CLI process
+# will NEVER see the metric even while the running server is emitting it.
+# The env var is the deployment claim the operator makes after verifying
+# ``curl /metrics | grep 'parallax_aphelion_total{traffic_source='`` on the
+# live server. Prometheus introspection is kept as an advisory fallback for
+# the rare in-process case (FastAPI test client / integration tests where
+# the producer module is imported alongside the evaluator).
+SPLIT_OVERRIDE_ENV = "PARALLAX_SPLIT_IMPLEMENTED"
 
 __all__ = [
     "DodMetric",
@@ -160,27 +182,127 @@ def _quantile(sorted_values: list[float], q: float) -> float:
     return sorted_values[min(rank - 1, len(sorted_values) - 1)]
 
 
-def _split_implemented(conn: object) -> bool:
+def _env_override_set() -> bool:
+    """Return True when ``PARALLAX_SPLIT_IMPLEMENTED`` is set to a truthy value.
+
+    Accepted truthy values (case-insensitive): ``"1"``, ``"true"``, ``"yes"``,
+    ``"on"``. Anything else (including unset, empty string, whitespace) is
+    False. This is intentionally narrow — the kill-switch is for explicit
+    operator opt-in, not for accidental defaulting.
+    """
+    raw = os.environ.get(SPLIT_OVERRIDE_ENV, "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _metric_family_has_traffic_source_label(
+    registry: object | None = None,
+) -> bool:
+    """Return True when ``registry`` (default: global REGISTRY) exposes the
+    M4 split label on the ``parallax_aphelion`` Counter family.
+
+    **ADVISORY fallback only — see SPLIT_OVERRIDE_ENV comment above.**
+    For the production canary CLI path this ALWAYS returns False because the
+    producer module is not imported in that process; this introspection only
+    helps the in-process integration test path where the FastAPI test client
+    imports both the evaluator and the producer.
+
+    Inspects the registry for the ``parallax_aphelion`` Counter family
+    (which renders as ``parallax_aphelion_total`` samples) and checks its
+    label name set for ``traffic_source``. A prometheus_client
+    ``Counter("parallax_aphelion", ...)`` exposes
+    ``Metric.name == "parallax_aphelion"`` via ``REGISTRY.collect()``,
+    while each sample's name carries the ``_total`` suffix. We accept
+    either spelling because both forms appear in the ecosystem (raw
+    counters vs counters built via wrapper helpers).
+
+    Args:
+        registry: Optional Prometheus registry to inspect (any object with a
+            ``.collect()`` method yielding metric families). Defaults to
+            ``prometheus_client.REGISTRY``. Tests pass a fresh
+            ``CollectorRegistry()`` instance to avoid mutating the
+            process-global registry shared with the producer module.
+
+    Robust to multi-version prometheus_client API drift: walks
+    ``Metric.samples[*].labels`` (modern), the older
+    ``Metric._labelnames`` backstop, and the sample-level name suffix.
+    Any unexpected exception is caught and logged so a registry quirk
+    cannot crash the DoD evaluator on a critical-path gate.
+
+    Returns False when prometheus_client is not importable AND no registry
+    was injected (e.g. CI sandbox without HTTP deps); callers should rely
+    on the env-var override in that environment.
+    """
+    if registry is None:
+        try:
+            from prometheus_client import REGISTRY  # type: ignore[import-untyped]
+        except ImportError:
+            _LOG.debug("prometheus_client not importable; split signal=False")
+            return False
+        registry = REGISTRY
+
+    target_names = {"parallax_aphelion", "parallax_aphelion_total"}
+    try:
+        for metric in registry.collect():
+            metric_name = getattr(metric, "name", "")
+            sample_names = {
+                getattr(s, "name", "") for s in getattr(metric, "samples", ())
+            }
+            if metric_name not in target_names and not (
+                target_names & sample_names
+            ):
+                continue
+            # Modern API: walk samples; each sample has a labels dict.
+            for sample in getattr(metric, "samples", ()):
+                labels = getattr(sample, "labels", None) or {}
+                if "traffic_source" in labels:
+                    return True
+            # Older API backstop: introspect declared label names.
+            for attr in ("_labelnames", "label_names"):
+                names = getattr(metric, attr, None)
+                if names and "traffic_source" in names:
+                    return True
+        return False
+    except Exception as exc:  # noqa: BLE001 — see fence rationale in docstring
+        # Log at ERROR with a structured ``gate_disabled`` marker because a
+        # registry quirk here silently disables the M4 DoD B1/B2 evaluation
+        # (the gate is forced into PENDING_IMPLEMENTATION until the override
+        # env var is set or the introspection succeeds). Monitoring should
+        # alert on ``gate_disabled=True`` rather than treat the WARNING as
+        # noise.
+        _LOG.error(
+            "prometheus introspection failed (%s: %s); gate_disabled=True "
+            "split signal=False — set %s=1 to force-open if appropriate",
+            exc.__class__.__name__, exc, SPLIT_OVERRIDE_ENV,
+            extra={"gate_disabled": True, "exc_class": exc.__class__.__name__},
+        )
+        return False
+
+
+def _split_implemented(_conn: object | None = None) -> bool:
     """Return True when the synthetic/natural traffic-source split has landed.
 
-    The split is considered implemented end-to-end when the ``audit_log``
-    table carries a ``traffic_source`` column — the column is added by item
-    4.2 of ``docs/m4-prep/traffic-gap-resolution.md``. Until that column
-    exists, the DoD evaluator cannot distinguish synthetic from natural
-    traffic and MUST return PENDING_IMPLEMENTATION for the B1/B2 metrics
-    (error_rate and discrepancy_rate) per spec §3.4.
+    Decision tree (in order):
 
-    Uses PRAGMA table_info rather than a try/SELECT to avoid mutating state
-    and to remain safe inside the audit_log's read-only DoD context.
+    1. ``PARALLAX_SPLIT_IMPLEMENTED`` env var truthy -> True (explicit
+       operator opt-in / kill-switch for environments where prometheus
+       introspection is unavailable).
+    2. ``prometheus_client.REGISTRY`` has ``parallax_aphelion_total`` with
+       a ``traffic_source`` label dimension -> True. This is the actual
+       ship artifact of item 4.2 (PR #54).
+    3. Otherwise -> False; B1/B2 metrics return PENDING_IMPLEMENTATION
+       per spec §3.4.
+
+    Previously (pre-2026-05-15) this checked the ``audit_log`` SQLite
+    table for a ``traffic_source`` column. That signal never matched the
+    actual implementation — PR #54 attached the label to Prometheus
+    metrics, not to the canary audit DB. The ``_conn`` argument is kept
+    for backwards compatibility with callers in ``compute_dod`` but is
+    ignored. See xcouncil 2026-05-15 Q1 verdict A.
     """
-    import sqlite3 as _sqlite3
-
-    try:
-        rows = conn.execute("PRAGMA table_info(audit_log)").fetchall()
-    except _sqlite3.Error:
-        # If we can't query the schema at all, treat split as not implemented.
-        return False
-    return any(row["name"] == "traffic_source" for row in rows)
+    if _env_override_set():
+        _LOG.info("split gate opened via %s env override", SPLIT_OVERRIDE_ENV)
+        return True
+    return _metric_family_has_traffic_source_label()
 
 
 def _verdict_for(metric: DodMetric, observed: float, sample_size: int) -> DodVerdict:
@@ -289,10 +411,12 @@ def compute_dod(
     sample_size = len(audit_rows)
 
     # Step 1.5 — check whether the synthetic/natural split has landed.
-    # Per spec §3.4: until items 4.7 AND 4.8 are merged, the DoD evaluator
-    # cannot distinguish synthetic from natural traffic. The two metrics that
-    # depend on this split (B1=error_rate, B2=discrepancy_rate) must be
-    # stamped PENDING_IMPLEMENTATION rather than evaluated against raw data.
+    # Per spec §3.4: until items 4.2/4.7/4.8 are end-to-end live, the DoD
+    # evaluator cannot distinguish synthetic from natural traffic, so the
+    # two metrics that depend on this split (B1=error_rate, B2=discrepancy_rate)
+    # must be stamped PENDING_IMPLEMENTATION rather than evaluated against
+    # raw data. The signal is the Prometheus metric label (PR #54 ship
+    # artifact); see _split_implemented docstring for the kill-switch.
     split_ready = _split_implemented(conn_audit)
 
     # Step 2 — per-metric computation.

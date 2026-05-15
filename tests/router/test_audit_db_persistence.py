@@ -375,3 +375,68 @@ def test_envelope_parse_failure_after_commit_leaves_row_on_disk_no_envelope(
         assert conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. Phase-4 critic finding: assert_audit_row_committed must be inside the
+#     total fence so a write-order violation does not silently misclassify
+#     as "primary_only" via the unwrapped-exception path.
+# ---------------------------------------------------------------------------
+
+
+def test_assert_audit_row_committed_violation_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """If ``assert_audit_row_committed`` ever raises ``AuditWriteOrderViolation``,
+    it MUST be caught and re-raised as ``AphelionUnreachableError`` — not
+    leak as an unexpected exception that DualReadRouter would classify as
+    ``primary_only``.
+
+    Practically: write_audit_row succeeds (so the real bool ``committed``
+    is True and the guard would pass), but we monkeypatch the guard itself
+    to force a violation. This proves the fence is in place independent of
+    the bool wiring.
+    """
+    from parallax.apex.audit_writer import AuditWriteOrderViolation
+    from parallax.router import aphelion_adapter as adapter_mod
+
+    conn = open_audit_db(tmp_path / "audit.db", validate=False)
+
+    def _exploding_guard(_committed: bool) -> None:
+        raise AuditWriteOrderViolation("synthetic guard failure")
+
+    monkeypatch.setattr(
+        adapter_mod, "assert_audit_row_committed", _exploding_guard
+    )
+
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=lambda: conn,
+        claim_loader=lambda _r: _supersession_claims(),
+    )
+    try:
+        with pytest.raises(AphelionUnreachableError) as excinfo:
+            adapter.query(_request())
+        assert excinfo.value.reason == "audit_write_order_violation"
+        # No envelope leaked.
+        assert adapter.last_envelope is None
+        assert adapter.last_audit_row is None
+        # The audit row was actually committed (the guard fires AFTER the
+        # write succeeds in the new ordering), so the row IS on disk —
+        # this is the §8.1-compatible "row committed, envelope abandoned"
+        # mode. Replay can recover from it; primary_only misclassification
+        # cannot.
+        assert conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+# The DualReadRouter end-to-end version of the above is left implicit:
+# - test_write_failure_via_dual_read_router_falls_back_to_primary already
+#   proves that DualReadRouter classifies any AphelionUnreachableError from
+#   the secondary as ``aphelion_unreachable`` (not ``primary_only``).
+# - test_assert_audit_row_committed_violation_is_fail_closed above proves
+#   the adapter wraps AuditWriteOrderViolation in AphelionUnreachableError.
+# The composition is therefore covered; adding a real DualReadRouter test
+# here would require a thread-safe conn fixture and adds no semantic
+# coverage beyond what the existing pair already provides.

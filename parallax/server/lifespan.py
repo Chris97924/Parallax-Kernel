@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Final
 
 from fastapi import FastAPI
@@ -105,7 +106,7 @@ async def _drain_inflight(
 
 
 @contextlib.asynccontextmanager
-async def parallax_lifespan(app: FastAPI):  # type: ignore[type-arg]
+async def parallax_lifespan(app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan context manager.
 
     Startup: Apex M5 audit-db boot validation — resolve

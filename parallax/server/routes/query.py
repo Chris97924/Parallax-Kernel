@@ -22,6 +22,7 @@ from parallax.apex.audit_db import get_thread_local_audit_conn
 from parallax.injector import build_session_reminder
 from parallax.obs.log import get_logger as _get_logger
 from parallax.obs.metrics import get_counter as _get_counter
+from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router import (
     QueryRequest as RouterQueryRequest,
 )
@@ -55,7 +56,7 @@ class _FactoryRealMemoryRouter:
     def __init__(self, db_factory: DBFactory) -> None:
         self._db_factory = db_factory
 
-    def query(self, request: RouterQueryRequest):
+    def query(self, request: RouterQueryRequest) -> RetrievalEvidence:
         with closing(self._db_factory()) as conn:
             return RealMemoryRouter(conn).query(request)
 

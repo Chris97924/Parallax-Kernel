@@ -40,6 +40,7 @@ from aphelion.v03_validator import validate_v03_fields
 from parallax.apex.audit_db import AuditDbUsageError, AuditDbWriteError, write_audit_row
 from parallax.apex.audit_writer import (
     AuditRow,
+    AuditWriteOrderViolation,
     assert_audit_row_committed,
     canonicalize_row,
 )
@@ -358,7 +359,26 @@ class AphelionReadAdapter:
         # assembly ahead of it, trips AuditWriteOrderViolation instead of
         # emitting an envelope for an uncommitted row. Passing a literal here
         # would make the guard a no-op.
-        assert_audit_row_committed(committed)
+        #
+        # The guard MUST run inside the same total-fence semantic as the
+        # write-audit-row block: a guard failure means we are about to emit an
+        # envelope whose audit_db_ref is decoupled from any actually-committed
+        # row. Letting that escape unwrapped would reach DualReadRouter as an
+        # *unexpected* exception, get classified as "primary_only", and lose
+        # the aphelion_unreachable signal + the circuit-breaker increment —
+        # the exact silent-failure mode the fence above was written to
+        # prevent. Wrap the guard so a write-order violation is fail-closed.
+        try:
+            assert_audit_row_committed(committed)
+        except AuditWriteOrderViolation as exc:
+            _log.error(
+                "audit_write_order_violation: assert_audit_row_committed "
+                "tripped — write-order invariant broken (committed=%r); "
+                "secondary unreachable",
+                committed,
+                exc_info=True,
+            )
+            raise AphelionUnreachableError("audit_write_order_violation") from exc
 
         payload: dict[str, Any] = {
             "subject": subject,

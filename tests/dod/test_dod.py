@@ -582,8 +582,10 @@ def test_pending_implementation_when_split_not_implemented(
         until=_FIXED_NOW,
     )
 
-    # The audit_log table in test fixtures has no traffic_source column, so
-    # split_implemented() returns False and B1/B2 must be PENDING.
+    # The test environment has no PARALLAX_SPLIT_IMPLEMENTED override and
+    # no parallax_aphelion_total metric registered with a traffic_source
+    # label, so _split_implemented() returns False and B1/B2 must be
+    # PENDING_IMPLEMENTATION.
     b1 = next(m for m in report.metrics if m.metric == DodMetric.ERROR_RATE)
     b2 = next(m for m in report.metrics if m.metric == DodMetric.DISCREPANCY_RATE)
 
@@ -638,22 +640,26 @@ def test_non_split_metrics_still_pass_when_split_not_implemented(
 
 def test_pass_fail_metrics_work_when_split_implemented(
     tmp_path: pathlib.Path,
+    monkeypatch,
 ) -> None:
-    """Regression: when traffic_source column IS present, ERROR_RATE and
+    """Regression: when the split signal is true, ERROR_RATE and
     DISCREPANCY_RATE resume normal PASS/FAIL evaluation — the split gate
     does NOT permanently block evaluation once implemented.
-    """
-    import sqlite3
 
+    Pre-2026-05-15 this test simulated split-implemented by adding a
+    ``traffic_source`` column to the audit_log table. Post xcouncil
+    Q1 verdict A, the gate signal is Prometheus introspection (or the
+    ``PARALLAX_SPLIT_IMPLEMENTED`` env override); the SQLite column is
+    no longer consulted.
+    """
     shared_db = tmp_path / "split_ready.db"
     audit = AuditLog(db_path=shared_db)
     outcomes = OutcomeStore(db_path=shared_db)
 
-    # Manually add the traffic_source column to simulate item 4.2 landing.
-    conn = sqlite3.connect(str(shared_db))
-    conn.execute("ALTER TABLE audit_log ADD COLUMN traffic_source TEXT")
-    conn.commit()
-    conn.close()
+    # Use the kill-switch env override to simulate split-implemented.
+    # The override is the deterministic test path; Prometheus introspection
+    # has its own targeted tests further below.
+    monkeypatch.setenv("PARALLAX_SPLIT_IMPLEMENTED", "1")
 
     try:
         _populate(audit=audit, outcomes=outcomes, stage="m4_1pct", count=200)
@@ -684,3 +690,167 @@ def test_pass_fail_metrics_work_when_split_implemented(
         f"overall should be PASS when split implemented and all healthy, "
         f"got {report.overall.value}"
     )
+
+
+# ----------------------------------------------------------------------
+# Q1 (xcouncil 2026-05-15): _split_implemented signal refactor
+# ----------------------------------------------------------------------
+
+
+def test_split_implemented_env_override_truthy_values(monkeypatch):
+    """PARALLAX_SPLIT_IMPLEMENTED accepts 1/true/yes/on (case-insensitive)."""
+    from parallax.canary.dod import _split_implemented
+
+    for value in ("1", "true", "TRUE", "True", "yes", "YES", "on", "ON"):
+        monkeypatch.setenv("PARALLAX_SPLIT_IMPLEMENTED", value)
+        assert _split_implemented() is True, f"value={value!r} should open gate"
+
+
+def test_split_implemented_env_override_falsy_values(monkeypatch):
+    """Falsy/unset/garbage env values must not flip the gate open.
+
+    Without a Prometheus metric registered with traffic_source label, the
+    gate should remain closed for any non-truthy env value. Whitespace and
+    typos like "ture" must be rejected.
+    """
+    from parallax.canary.dod import _split_implemented
+
+    # We can't fully isolate from a real prometheus registry here, but in
+    # the test process the parallax_aphelion_total metric is not registered
+    # (no live server), so the secondary check will also return False.
+    for value in ("", "   ", "0", "false", "no", "off", "ture", "maybe"):
+        monkeypatch.setenv("PARALLAX_SPLIT_IMPLEMENTED", value)
+        assert _split_implemented() is False, (
+            f"value={value!r} must NOT open gate"
+        )
+
+
+def test_split_implemented_env_override_unset_falls_through(monkeypatch):
+    """Unset env defers to Prometheus introspection — no metric -> False."""
+    from parallax.canary.dod import _split_implemented
+
+    monkeypatch.delenv("PARALLAX_SPLIT_IMPLEMENTED", raising=False)
+    assert _split_implemented() is False
+
+
+def test_split_implemented_via_prometheus_label_present(monkeypatch):
+    """When parallax_aphelion_total is registered with traffic_source label,
+    the gate opens via the Prometheus introspection path (no env override).
+    """
+    monkeypatch.delenv("PARALLAX_SPLIT_IMPLEMENTED", raising=False)
+
+    from prometheus_client import REGISTRY, Counter
+
+    from parallax.canary.dod import _split_implemented
+
+    # Register a temporary counter with the traffic_source label dimension.
+    # Use a unique name to avoid colliding with the real producer when tests
+    # run in-process alongside the server module.
+    counter = Counter(
+        "parallax_aphelion_total_test_q1",
+        "test-only counter for Q1 introspection test",
+        ["traffic_source"],
+    )
+    try:
+        counter.labels(traffic_source="synthetic").inc()
+        # The real metric name parallax_aphelion_total is what the gate
+        # looks for; register it as well to drive the introspection path.
+        from prometheus_client import Counter as _Counter
+        if "parallax_aphelion_total" not in {
+            getattr(m, "name", None) for m in REGISTRY.collect()
+        }:
+            real = _Counter(
+                "parallax_aphelion",  # _total suffix added by client
+                "test-only producer for introspection",
+                ["traffic_source"],
+            )
+            real.labels(traffic_source="synthetic").inc()
+        try:
+            assert _split_implemented() is True
+        finally:
+            # Unregister real metric if we added it.
+            for collector in list(REGISTRY._collector_to_names):  # noqa: SLF001
+                names = REGISTRY._collector_to_names.get(collector, set())  # noqa: SLF001
+                if "parallax_aphelion_total" in names:
+                    try:
+                        REGISTRY.unregister(collector)
+                    except KeyError:
+                        pass
+                    break
+    finally:
+        try:
+            REGISTRY.unregister(counter)
+        except KeyError:
+            pass
+
+
+def test_split_implemented_via_prometheus_metric_absent(monkeypatch):
+    """When parallax_aphelion_total is NOT registered, gate stays closed."""
+    monkeypatch.delenv("PARALLAX_SPLIT_IMPLEMENTED", raising=False)
+    # Ensure the metric is genuinely absent in this test process.
+    from prometheus_client import REGISTRY
+
+    from parallax.canary.dod import _split_implemented
+    for collector in list(REGISTRY._collector_to_names):  # noqa: SLF001
+        names = REGISTRY._collector_to_names.get(collector, set())  # noqa: SLF001
+        if "parallax_aphelion_total" in names:
+            REGISTRY.unregister(collector)
+
+    assert _split_implemented() is False
+
+
+def test_split_implemented_ignores_conn_argument():
+    """The legacy ``conn`` argument is kept for back-compat with compute_dod
+    callers but is ignored — passing anything (including None or a broken
+    object) must not affect the verdict.
+    """
+    from parallax.canary.dod import _split_implemented
+
+    # All four invocations should yield the same result (False here because
+    # neither env override nor Prometheus metric is set up).
+    sentinel = object()
+    base = _split_implemented()
+    assert _split_implemented(None) is base
+    assert _split_implemented(sentinel) is base
+
+
+def test_split_implemented_prometheus_unimportable_returns_false(monkeypatch):
+    """If prometheus_client cannot be imported (offline CI), gate is False
+    unless the env override is set. Verified by injecting an ImportError.
+    """
+    monkeypatch.delenv("PARALLAX_SPLIT_IMPLEMENTED", raising=False)
+    import builtins
+
+    from parallax.canary.dod import _split_implemented
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, *args, **kwargs):
+        if name == "prometheus_client":
+            raise ImportError("simulated absence")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+    assert _split_implemented() is False
+
+
+def test_split_implemented_prometheus_unimportable_but_env_override_set(
+    monkeypatch,
+):
+    """Env override wins even when prometheus_client is unimportable —
+    the kill-switch is exactly for the offline-CI / sandbox case.
+    """
+    monkeypatch.setenv("PARALLAX_SPLIT_IMPLEMENTED", "1")
+    import builtins
+
+    from parallax.canary.dod import _split_implemented
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, *args, **kwargs):
+        if name == "prometheus_client":
+            raise ImportError("simulated absence")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+    assert _split_implemented() is True

@@ -196,6 +196,45 @@ def test_cli_serve_preflight_returns_ex_config_when_audit_path_unset(
     assert rc == 78
 
 
+def test_cli_serve_preflight_returns_ex_config_on_raw_sqlite_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """``_cmd_serve`` returns EX_CONFIG (78) when ``open_audit_db(validate=True)``
+    raises a raw ``sqlite3.Error`` (not just ``AuditDbConfigError``).
+
+    Codex 2026-05-15 round-2 P2: the preflight previously only caught
+    ``AuditDbConfigError``, but ``open_audit_db`` wraps the initial
+    ``sqlite3.connect()`` in that type and lets the subsequent PRAGMA /
+    schema-apply steps re-raise raw ``sqlite3.Error`` subclasses. A
+    readonly / corrupt / partially-locked DB therefore terminated with an
+    uncaught traceback instead of the deterministic EX_CONFIG promise.
+    """
+    audit_path = tmp_path / "audit.db"
+    monkeypatch.setenv("PARALLAX_AUDIT_DB_PATH", str(audit_path))
+
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.run = lambda *a, **k: pytest.fail(  # type: ignore[attr-defined]
+        "uvicorn.run must not be reached when audit-db preflight fails"
+    )
+    monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
+
+    # Patch open_audit_db to raise a bare sqlite3.OperationalError so we
+    # hit the new except branch (not the AuditDbConfigError branch).
+    def _raise_op_error(path: Any, *, validate: bool = False) -> Any:
+        raise sqlite3.OperationalError("synthetic: PRAGMA quick_check failed")
+
+    monkeypatch.setattr(audit_db_mod, "open_audit_db", _raise_op_error)
+
+    from parallax.cli import _cmd_serve
+
+    rc = _cmd_serve(host="127.0.0.1", port=8765, log_level="info", reload=False)
+    assert rc == 78, (
+        f"raw sqlite3.OperationalError from open_audit_db must yield "
+        f"EX_CONFIG (78), got {rc}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 3. write_audit_row failure is fail-closed
 # ---------------------------------------------------------------------------

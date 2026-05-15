@@ -40,11 +40,22 @@ from parallax.canary.outcomes import KNOWN_STAGES, OutcomeStore
 
 _LOG = logging.getLogger(__name__)
 
-# Env-var kill-switch / override for the split-implemented gate. Set to
-# "1" to force the gate open when the Prometheus introspection cannot
-# observe the metric family (e.g. inside an offline CI sandbox or while
-# investigating a prometheus_client version drift). See ``_split_implemented``
-# docstring and ``xcouncil`` 2026-05-15 Q1 verdict (A + kill-switch).
+# Operator-set env var declaring that the synthetic/natural traffic-source
+# split has actually shipped on this deployment. The PRIMARY signal for the
+# DoD gate after the 2026-05-15 Codex round-2 finding (P1).
+#
+# Why env var is primary, not Prometheus introspection:
+# ``parallax canary --dod`` runs in a SEPARATE process from the parallax
+# server. The producer of ``parallax_aphelion_total`` lives in
+# ``parallax.router.discrepancy_live`` and is registered into
+# ``prometheus_client.REGISTRY`` only when that module is imported — which
+# the canary CLI never does. So ``REGISTRY.collect()`` in the CLI process
+# will NEVER see the metric even while the running server is emitting it.
+# The env var is the deployment claim the operator makes after verifying
+# ``curl /metrics | grep 'parallax_aphelion_total{traffic_source='`` on the
+# live server. Prometheus introspection is kept as an advisory fallback for
+# the rare in-process case (FastAPI test client / integration tests where
+# the producer module is imported alongside the evaluator).
 SPLIT_OVERRIDE_ENV = "PARALLAX_SPLIT_IMPLEMENTED"
 
 __all__ = [
@@ -183,20 +194,33 @@ def _env_override_set() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _metric_family_has_traffic_source_label() -> bool:
-    """Return True when the Prometheus registry exposes the M4 split label.
+def _metric_family_has_traffic_source_label(
+    registry: object | None = None,
+) -> bool:
+    """Return True when ``registry`` (default: global REGISTRY) exposes the
+    M4 split label on the ``parallax_aphelion`` Counter family.
 
-    Inspects ``prometheus_client.REGISTRY`` for the ``parallax_aphelion``
-    Counter family (which renders as ``parallax_aphelion_total`` samples)
-    and checks its label name set for ``traffic_source``. This is the
-    actual ship artifact of item 4.2 (PR #54) — the SQLite ``audit_log``
-    column referenced by the previous docstring was never created.
+    **ADVISORY fallback only — see SPLIT_OVERRIDE_ENV comment above.**
+    For the production canary CLI path this ALWAYS returns False because the
+    producer module is not imported in that process; this introspection only
+    helps the in-process integration test path where the FastAPI test client
+    imports both the evaluator and the producer.
 
-    A prometheus_client ``Counter("parallax_aphelion", ...)`` exposes
+    Inspects the registry for the ``parallax_aphelion`` Counter family
+    (which renders as ``parallax_aphelion_total`` samples) and checks its
+    label name set for ``traffic_source``. A prometheus_client
+    ``Counter("parallax_aphelion", ...)`` exposes
     ``Metric.name == "parallax_aphelion"`` via ``REGISTRY.collect()``,
     while each sample's name carries the ``_total`` suffix. We accept
     either spelling because both forms appear in the ecosystem (raw
     counters vs counters built via wrapper helpers).
+
+    Args:
+        registry: Optional Prometheus registry to inspect (any object with a
+            ``.collect()`` method yielding metric families). Defaults to
+            ``prometheus_client.REGISTRY``. Tests pass a fresh
+            ``CollectorRegistry()`` instance to avoid mutating the
+            process-global registry shared with the producer module.
 
     Robust to multi-version prometheus_client API drift: walks
     ``Metric.samples[*].labels`` (modern), the older
@@ -204,19 +228,21 @@ def _metric_family_has_traffic_source_label() -> bool:
     Any unexpected exception is caught and logged so a registry quirk
     cannot crash the DoD evaluator on a critical-path gate.
 
-    Returns False when prometheus_client is not importable (e.g. CI
-    sandbox without HTTP deps); callers should rely on the env-var
-    override in that environment.
+    Returns False when prometheus_client is not importable AND no registry
+    was injected (e.g. CI sandbox without HTTP deps); callers should rely
+    on the env-var override in that environment.
     """
-    try:
-        from prometheus_client import REGISTRY  # type: ignore[import-untyped]
-    except ImportError:
-        _LOG.debug("prometheus_client not importable; split signal=False")
-        return False
+    if registry is None:
+        try:
+            from prometheus_client import REGISTRY  # type: ignore[import-untyped]
+        except ImportError:
+            _LOG.debug("prometheus_client not importable; split signal=False")
+            return False
+        registry = REGISTRY
 
     target_names = {"parallax_aphelion", "parallax_aphelion_total"}
     try:
-        for metric in REGISTRY.collect():
+        for metric in registry.collect():
             metric_name = getattr(metric, "name", "")
             sample_names = {
                 getattr(s, "name", "") for s in getattr(metric, "samples", ())

@@ -10,12 +10,11 @@ Round-5 additions:
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
-import importlib.util
-import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "burn-in-synth-loader.py"
@@ -558,3 +557,221 @@ def test_transport_error_resets_4xx_streak():
         f"expected 0 (ConnectError resets 4xx streak; trailing 401 is streak=1), "
         f"got {result}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Q2 (xcouncil 2026-05-15): PARALLAX_BURN_IN_TOKEN bearer auth
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_bearer_token_prefers_burn_in_var(monkeypatch):
+    """PARALLAX_BURN_IN_TOKEN takes precedence over PARALLAX_TOKEN."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "burn-in-secret")
+    monkeypatch.setenv("PARALLAX_TOKEN", "prod-secret")
+    assert loader._resolve_bearer_token() == "burn-in-secret"
+
+
+def test_resolve_bearer_token_falls_back_to_parallax_token(monkeypatch):
+    """When PARALLAX_BURN_IN_TOKEN is absent, fall back to PARALLAX_TOKEN."""
+    loader = _load_module()
+    monkeypatch.delenv("PARALLAX_BURN_IN_TOKEN", raising=False)
+    monkeypatch.setenv("PARALLAX_TOKEN", "prod-secret")
+    assert loader._resolve_bearer_token() == "prod-secret"
+
+
+def test_resolve_bearer_token_none_when_both_unset(monkeypatch):
+    """When neither token var is set, return None (no Authorization header)."""
+    loader = _load_module()
+    monkeypatch.delenv("PARALLAX_BURN_IN_TOKEN", raising=False)
+    monkeypatch.delenv("PARALLAX_TOKEN", raising=False)
+    assert loader._resolve_bearer_token() is None
+
+
+def test_resolve_bearer_token_treats_whitespace_as_unset(monkeypatch):
+    """A whitespace-only token is treated as unset (operator typo defense)."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "   ")
+    monkeypatch.delenv("PARALLAX_TOKEN", raising=False)
+    assert loader._resolve_bearer_token() is None
+
+
+def test_resolve_bearer_token_whitespace_falls_through_to_fallback(monkeypatch):
+    """Whitespace-only ``PARALLAX_BURN_IN_TOKEN`` must fall through to
+    ``PARALLAX_TOKEN`` (Codex 2026-05-15 round-2 P1).
+
+    The previous one-liner ``A or B`` short-circuited on the truthy
+    whitespace string before ``B`` was ever consulted; the new
+    implementation strips each candidate independently and only falls
+    through when the current one is empty after stripping. This is the
+    real-world misconfiguration case where ops leaves the burn-in var
+    blank but a valid prod token IS configured."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "   ")
+    monkeypatch.setenv("PARALLAX_TOKEN", "prod-secret")
+    assert loader._resolve_bearer_token() == "prod-secret"
+
+
+def test_resolve_bearer_token_empty_falls_through_to_fallback(monkeypatch):
+    """Empty-string ``PARALLAX_BURN_IN_TOKEN`` must fall through to
+    ``PARALLAX_TOKEN`` (same precedence rule as the whitespace case)."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "")
+    monkeypatch.setenv("PARALLAX_TOKEN", "prod-secret")
+    assert loader._resolve_bearer_token() == "prod-secret"
+
+
+def test_resolve_bearer_token_whitespace_in_fallback_also_returns_none(monkeypatch):
+    """When BOTH vars are whitespace-only, the function returns None
+    (no Authorization header). The fall-through chain stops at the end."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "   ")
+    monkeypatch.setenv("PARALLAX_TOKEN", "\t  \n")
+    assert loader._resolve_bearer_token() is None
+
+
+def test_resolve_bearer_token_strips_surrounding_whitespace(monkeypatch):
+    """A token with leading/trailing whitespace is stripped, not rejected
+    (operator may accidentally include trailing newline from CLI paste)."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "  burn-in-secret  \n")
+    monkeypatch.delenv("PARALLAX_TOKEN", raising=False)
+    assert loader._resolve_bearer_token() == "burn-in-secret"
+
+
+def test_build_headers_without_token_omits_authorization():
+    """No token -> headers carry only the synthetic markers."""
+    loader = _load_module()
+    headers = loader._build_headers(None)
+    assert "Authorization" not in headers
+    assert headers["X-Parallax-Traffic-Source"] == "synthetic"
+    assert headers["X-Parallax-Synth-Marker"] == "burn-in-loader-v1"
+
+
+def test_build_headers_with_token_includes_bearer():
+    """When a token is supplied, headers carry Authorization: Bearer <token>."""
+    loader = _load_module()
+    headers = loader._build_headers("abc123")
+    assert headers["Authorization"] == "Bearer abc123"
+    assert headers["X-Parallax-Traffic-Source"] == "synthetic"
+
+
+def test_build_headers_isolated_from_base_headers():
+    """_build_headers must not mutate the module-level BASE_HEADERS."""
+    loader = _load_module()
+    headers = loader._build_headers("abc123")
+    headers["X-Custom"] = "leak"
+    assert "X-Custom" not in loader.BASE_HEADERS
+    assert "Authorization" not in loader.BASE_HEADERS
+
+
+def test_preflight_401_returns_exit_noperm():
+    """A 401 at preflight is fatal — return EXIT_NOPERM (77) immediately."""
+    loader = _load_module()
+    mock_client = _mock_client_factory([_make_response(401)])
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.preflight_check(
+            endpoint="http://127.0.0.1:8000/query",
+            headers={"Authorization": "Bearer bad"},
+            user_id="test-user",
+            sample_key="key1",
+        )
+    assert result == loader.EXIT_NOPERM == 77
+
+
+def test_preflight_200_allows_proceed():
+    """A 200 at preflight returns 0 — caller proceeds to run_loader."""
+    loader = _load_module()
+    mock_client = _mock_client_factory([_make_response(200)])
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.preflight_check(
+            endpoint="http://127.0.0.1:8000/query",
+            headers={"Authorization": "Bearer good"},
+            user_id="test-user",
+            sample_key="key1",
+        )
+    assert result == 0
+
+
+def test_preflight_5xx_allows_proceed():
+    """A 5xx at preflight is NOT fatal — the loop's budget handles transient
+    failures. Only 401 is fatal-fast."""
+    loader = _load_module()
+    mock_client = _mock_client_factory([_make_response(503)])
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.preflight_check(
+            endpoint="http://127.0.0.1:8000/query",
+            headers={"Authorization": "Bearer good"},
+            user_id="test-user",
+            sample_key="key1",
+        )
+    assert result == 0
+
+
+def test_preflight_network_error_allows_proceed():
+    """A transport error at preflight defers to the loop's budget logic
+    rather than fast-failing — burn-in clock survives a tunnel blip."""
+    loader = _load_module()
+    mock_client = MagicMock()
+    mock_client.__enter__ = lambda s: s
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client.get.side_effect = httpx.ConnectError("connection refused")
+    with patch.object(loader.httpx, "Client", return_value=mock_client):
+        result = loader.preflight_check(
+            endpoint="http://127.0.0.1:8000/query",
+            headers={"Authorization": "Bearer good"},
+            user_id="test-user",
+            sample_key="key1",
+        )
+    assert result == 0
+
+
+def test_run_loader_uses_injected_headers():
+    """When ``headers`` kwarg is passed, httpx.Client is built with them."""
+    loader = _load_module()
+    responses = [_make_response(200)] * 3
+    mock_client = _mock_client_factory(responses)
+    custom_headers = {
+        "X-Parallax-Traffic-Source": "synthetic",
+        "Authorization": "Bearer test-token",
+    }
+    captured_kwargs: dict = {}
+
+    def _capture_client(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return mock_client
+
+    with patch.object(loader.httpx, "Client", side_effect=_capture_client):
+        result = loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1"],
+            user_id="test-user",
+            interval_seconds=0,
+            iterations=2,
+            headers=custom_headers,
+        )
+    assert result == 0
+    assert captured_kwargs["headers"] == custom_headers
+
+
+def test_run_loader_defaults_to_base_headers_when_no_headers_kwarg():
+    """Backward compat: omitting ``headers=`` falls back to BASE_HEADERS
+    (no Authorization), keeping the pre-Q2 loader behavior."""
+    loader = _load_module()
+    mock_client = _mock_client_factory([_make_response(200)])
+    captured_kwargs: dict = {}
+
+    def _capture_client(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return mock_client
+
+    with patch.object(loader.httpx, "Client", side_effect=_capture_client):
+        loader.run_loader(
+            endpoint="http://127.0.0.1:8000/query",
+            sample_keys=["key1"],
+            user_id="test-user",
+            interval_seconds=0,
+            iterations=1,
+        )
+    assert captured_kwargs["headers"] == loader.BASE_HEADERS
+    assert "Authorization" not in captured_kwargs["headers"]

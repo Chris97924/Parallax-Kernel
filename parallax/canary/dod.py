@@ -236,11 +236,18 @@ def _metric_family_has_traffic_source_label() -> bool:
                 if names and "traffic_source" in names:
                     return True
         return False
-    except Exception as exc:  # registry shape drift / version skew
-        _LOG.warning(
-            "prometheus introspection failed (%s: %s); split signal=False — "
-            "set %s=1 to force-open if appropriate",
+    except Exception as exc:  # noqa: BLE001 — see fence rationale in docstring
+        # Log at ERROR with a structured ``gate_disabled`` marker because a
+        # registry quirk here silently disables the M4 DoD B1/B2 evaluation
+        # (the gate is forced into PENDING_IMPLEMENTATION until the override
+        # env var is set or the introspection succeeds). Monitoring should
+        # alert on ``gate_disabled=True`` rather than treat the WARNING as
+        # noise.
+        _LOG.error(
+            "prometheus introspection failed (%s: %s); gate_disabled=True "
+            "split signal=False — set %s=1 to force-open if appropriate",
             exc.__class__.__name__, exc, SPLIT_OVERRIDE_ENV,
+            extra={"gate_disabled": True, "exc_class": exc.__class__.__name__},
         )
         return False
 

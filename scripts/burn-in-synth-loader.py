@@ -136,9 +136,22 @@ def _resolve_bearer_token() -> str | None:
     burn-in env var lets ops grant the synth loader a separate credential
     from production traffic (smaller blast radius, easier rotation per
     xcouncil 2026-05-15 Q2 verdict B).
+
+    Whitespace-only values are treated as unset and DO fall through to the
+    next variable in the precedence chain (Codex 2026-05-15 round-2 P1
+    finding): a previous one-liner used ``A or B`` which short-circuits on
+    truthy-but-whitespace strings before ``B`` is ever consulted. We now
+    strip each candidate independently and only fall through to the next
+    when the current one is empty after stripping.
     """
-    token = os.environ.get("PARALLAX_BURN_IN_TOKEN") or os.environ.get("PARALLAX_TOKEN")
-    return token.strip() if token and token.strip() else None
+    for env_name in ("PARALLAX_BURN_IN_TOKEN", "PARALLAX_TOKEN"):
+        raw = os.environ.get(env_name)
+        if raw is None:
+            continue
+        stripped = raw.strip()
+        if stripped:
+            return stripped
+    return None
 
 
 def _build_headers(token: str | None) -> dict[str, str]:

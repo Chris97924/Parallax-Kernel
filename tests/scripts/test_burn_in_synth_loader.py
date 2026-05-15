@@ -596,6 +596,49 @@ def test_resolve_bearer_token_treats_whitespace_as_unset(monkeypatch):
     assert loader._resolve_bearer_token() is None
 
 
+def test_resolve_bearer_token_whitespace_falls_through_to_fallback(monkeypatch):
+    """Whitespace-only ``PARALLAX_BURN_IN_TOKEN`` must fall through to
+    ``PARALLAX_TOKEN`` (Codex 2026-05-15 round-2 P1).
+
+    The previous one-liner ``A or B`` short-circuited on the truthy
+    whitespace string before ``B`` was ever consulted; the new
+    implementation strips each candidate independently and only falls
+    through when the current one is empty after stripping. This is the
+    real-world misconfiguration case where ops leaves the burn-in var
+    blank but a valid prod token IS configured."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "   ")
+    monkeypatch.setenv("PARALLAX_TOKEN", "prod-secret")
+    assert loader._resolve_bearer_token() == "prod-secret"
+
+
+def test_resolve_bearer_token_empty_falls_through_to_fallback(monkeypatch):
+    """Empty-string ``PARALLAX_BURN_IN_TOKEN`` must fall through to
+    ``PARALLAX_TOKEN`` (same precedence rule as the whitespace case)."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "")
+    monkeypatch.setenv("PARALLAX_TOKEN", "prod-secret")
+    assert loader._resolve_bearer_token() == "prod-secret"
+
+
+def test_resolve_bearer_token_whitespace_in_fallback_also_returns_none(monkeypatch):
+    """When BOTH vars are whitespace-only, the function returns None
+    (no Authorization header). The fall-through chain stops at the end."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "   ")
+    monkeypatch.setenv("PARALLAX_TOKEN", "\t  \n")
+    assert loader._resolve_bearer_token() is None
+
+
+def test_resolve_bearer_token_strips_surrounding_whitespace(monkeypatch):
+    """A token with leading/trailing whitespace is stripped, not rejected
+    (operator may accidentally include trailing newline from CLI paste)."""
+    loader = _load_module()
+    monkeypatch.setenv("PARALLAX_BURN_IN_TOKEN", "  burn-in-secret  \n")
+    monkeypatch.delenv("PARALLAX_TOKEN", raising=False)
+    assert loader._resolve_bearer_token() == "burn-in-secret"
+
+
 def test_build_headers_without_token_omits_authorization():
     """No token -> headers carry only the synthetic markers."""
     loader = _load_module()

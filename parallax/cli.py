@@ -108,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Parallax Kernel CLI — backup / restore / inspect the canonical store.",
     )
     sub = parser.add_subparsers(
-        dest="command", metavar="{backup,restore,serve,inspect,token,router,canary}"
+        dest="command", metavar="{backup,restore,serve,inspect,token,router,canary,ingest}"
     )
 
     p_backup = sub.add_parser("backup", help="Write a tar.gz backup archive.")
@@ -310,6 +310,34 @@ def build_parser() -> argparse.ArgumentParser:
     from parallax.canary.cli import register_canary_subparser
 
     register_canary_subparser(sub)
+
+    # ----- ingest -----------------------------------------------------------
+    p_ingest = sub.add_parser(
+        "ingest",
+        help="Ingest a .aphelion.tar package — writes one audit row per claim.",
+    )
+    p_ingest.add_argument(
+        "package_path",
+        type=pathlib.Path,
+        help="Path to .aphelion.tar (must resolve under PARALLAX_APHELION_PACKAGE_DIR)",
+    )
+    p_ingest.add_argument(
+        "--audit-db",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Override PARALLAX_AUDIT_DB_PATH for this invocation (testing). "
+            "Defensive guard rejects 'parallax-kernel/db'."
+        ),
+    )
+    p_ingest.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run all validation + verify_package + claim extract but DO NOT write audit rows. "
+            "Returns 0 on success, non-zero on validation failure."
+        ),
+    )
 
     return parser
 
@@ -924,6 +952,197 @@ def _cmd_router_backfill_apply(*, user_id: str, yes: bool) -> int:
     return _EXIT_OK
 
 
+# ----- ingest --------------------------------------------------------------
+
+
+def _cmd_ingest(
+    *,
+    package_path: pathlib.Path,
+    audit_db_override: pathlib.Path | None,
+    dry_run: bool,
+) -> int:
+    """Ingest a .aphelion.tar package into the audit DB.
+
+    ``--dry-run`` mode opens the real audit DB (so spec §4 startup gates run
+    via ``validate=True``) but routes ``ingest_package`` writes to an
+    in-memory SQLite clone seeded with the same audit-row schema. No
+    SAVEPOINT is used — ``write_audit_row`` requires an autocommit
+    connection (``in_transaction == False``) and raises
+    ``AuditDbUsageError`` otherwise, so we must hand the writer a clean
+    autocommit conn. The production audit DB is never written to in
+    ``--dry-run``; the in-memory conn is closed at the end and discarded.
+    Structured-log shape follows spec §6.4 (``package_path`` /
+    ``signer_id`` / ``underlying``); the older ``path`` field name was
+    drift from the spec and has been removed.
+    """
+    import sqlite3  # noqa: PLC0415 — lazy import; ingest-only
+    import time  # noqa: PLC0415 — lazy import; ingest-only
+    import uuid  # noqa: PLC0415 — lazy import; ingest-only
+
+    from parallax.apex.aphelion_ingest import (  # noqa: PLC0415 — lazy import; ingest-only
+        ParallaxIngestError,
+        ingest_package,
+    )
+    from parallax.apex.audit_db import (  # noqa: PLC0415 — lazy import; ingest-only
+        _SCHEMA_STATEMENTS,
+        AuditDbConfigError,
+        open_audit_db,
+    )
+    from parallax.obs.log import get_logger  # noqa: PLC0415 — lazy import; ingest-only
+
+    _log = get_logger(__name__)
+    pkg_path_str = str(package_path)
+
+    # --- Resolve env vars (fail loud on missing, per rules/python/security.md) ---
+    try:
+        pkg_dir_raw = os.environ["PARALLAX_APHELION_PACKAGE_DIR"]
+    except KeyError:
+        _log.error(
+            "parallax_ingest_failed",
+            extra={
+                "event": "parallax_ingest_failed",
+                "reason_code": "pkg.dir_unset",
+                "package_path": pkg_path_str,
+                "signer_id": "",
+                "underlying": "PARALLAX_APHELION_PACKAGE_DIR env var is unset",
+            },
+        )
+        return 78  # EX_CONFIG
+
+    try:
+        trust_store_raw = os.environ["PARALLAX_APHELION_TRUST_STORE"]
+    except KeyError:
+        _log.error(
+            "parallax_ingest_failed",
+            extra={
+                "event": "parallax_ingest_failed",
+                "reason_code": "pkg.trust_store_missing",
+                "package_path": pkg_path_str,
+                "signer_id": "",
+                "underlying": "PARALLAX_APHELION_TRUST_STORE env var is unset",
+            },
+        )
+        return 78  # EX_CONFIG
+
+    # Resolve audit DB path: --audit-db override takes precedence over env var.
+    if audit_db_override is not None:
+        audit_db_path = audit_db_override
+    else:
+        try:
+            audit_db_path = pathlib.Path(os.environ["PARALLAX_AUDIT_DB_PATH"])
+        except KeyError:
+            _log.error(
+                "parallax_ingest_failed",
+                extra={
+                    "event": "parallax_ingest_failed",
+                    "reason_code": "disk.audit_db_unset",
+                    "package_path": pkg_path_str,
+                    "signer_id": "",
+                    "underlying": "PARALLAX_AUDIT_DB_PATH env var is unset",
+                },
+            )
+            return 78  # EX_CONFIG
+
+    # Defensive --audit-db guard (P2 backlog #5): reject production DB path
+    # when --audit-db is set AND --dry-run is active.  Protects against
+    # accidental writes to the production DB during test/dry-run invocations.
+    if audit_db_override is not None and dry_run:
+        if "parallax-kernel/db" in str(audit_db_path):
+            _log.error(
+                "parallax_ingest_failed",
+                extra={
+                    "event": "parallax_ingest_failed",
+                    "reason_code": "disk.audit_db_unset",
+                    "package_path": pkg_path_str,
+                    "signer_id": "",
+                    "underlying": (
+                        f"production audit.db rejected by --db guard: "
+                        f"{audit_db_path}"
+                    ),
+                },
+            )
+            raise SystemExit(70)
+
+    # --- Open audit DB (validate=True runs §4 startup gates on the real DB) ---
+    # Codex round-2 P1: catch raw sqlite3.Error from PRAGMA/quick_check/schema
+    # apply, not just AuditDbConfigError. Both surface as operator-config
+    # failures (broken DB file, readonly/locked/corrupt) and MUST exit
+    # EX_CONFIG (78) per spec §6.3, not the generic exit-1 top-level path.
+    try:
+        audit_conn = open_audit_db(audit_db_path, validate=True)
+    except (AuditDbConfigError, sqlite3.Error) as exc:
+        _log.error(
+            "parallax_ingest_failed",
+            extra={
+                "event": "parallax_ingest_failed",
+                "reason_code": (
+                    "disk.audit_db_unset"
+                    if isinstance(exc, AuditDbConfigError)
+                    else "disk.permission"
+                ),
+                "package_path": pkg_path_str,
+                "signer_id": "",
+                "underlying": f"{type(exc).__name__}: {exc}"[:256],
+            },
+        )
+        return 78  # EX_CONFIG
+
+    # --- Dry-run: route writes to an in-memory clone with the same schema. ---
+    # P1-1 fix: previous SAVEPOINT approach was incompatible with
+    # write_audit_row, which requires conn.in_transaction == False
+    # (raises AuditDbUsageError otherwise — see audit_db.py:540). The
+    # in-memory clone keeps the production DB untouched while still
+    # exercising the full ingest path through canonicalize_row +
+    # write_audit_row. We close the on-disk conn first so dry-run never
+    # holds two handles open against the real DB at once.
+    write_conn = audit_conn
+    if dry_run:
+        audit_conn.close()
+        write_conn = sqlite3.connect(":memory:", isolation_level=None)
+        write_conn.row_factory = sqlite3.Row
+        for stmt in _SCHEMA_STATEMENTS:
+            write_conn.execute(stmt)
+
+    try:
+        session_id = f"ingest:{int(time.time())}:{uuid.uuid4()}"
+        try:
+            report = ingest_package(
+                package_path=package_path,
+                audit_conn=write_conn,
+                package_dir=pathlib.Path(pkg_dir_raw),
+                trust_store_dir=pathlib.Path(trust_store_raw),
+                session_id=session_id,
+            )
+        except ParallaxIngestError as exc:
+            _log.error(
+                "parallax_ingest_failed",
+                extra={
+                    "event": "parallax_ingest_failed",
+                    "reason_code": exc.reason_code,
+                    "package_path": pkg_path_str,
+                    "signer_id": "",
+                    "underlying": f"{type(exc).__name__}: {exc}"[:256],
+                },
+            )
+            return exc.exit_code
+    finally:
+        write_conn.close()
+
+    _log.info(
+        "parallax_ingest_succeeded",
+        extra={
+            "event": "parallax_ingest_succeeded",
+            "claim_count": report.claims_ingested,
+            "audit_rows_written": 0 if dry_run else report.audit_rows_written,
+            "signer_id": report.signer_id,
+            "package_id": report.package_id,
+            "package_path": pkg_path_str,
+            "dry_run": dry_run,
+        },
+    )
+    return 0
+
+
 # ----- dispatcher -----------------------------------------------------------
 
 
@@ -1053,6 +1272,12 @@ def _dispatch(argv: Sequence[str] | None) -> int:
         from parallax.canary.cli import cmd_canary
 
         return cmd_canary(args)
+    if args.command == "ingest":
+        return _cmd_ingest(
+            package_path=args.package_path,
+            audit_db_override=args.audit_db,
+            dry_run=args.dry_run,
+        )
     if args.command == "inspect":
         user_id = args.user_id if args.user_id is not None else _default_user()
         if args.inspect_cmd == "events":

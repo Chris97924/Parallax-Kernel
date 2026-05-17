@@ -165,7 +165,7 @@ Likely 2026-06-04 ~ 2026-06-22 depending on:
 
 1. ~~v0.6 envelope ⟷ v0.3 R1-R4 reconcile~~ — ✅ RESOLVED 2026-05-09 (Option α): Apex M5 envelope MVP belongs to Parallax-Kernel repo; Aphelion v0.3 R1-R4 stays in Aphelion-Graph#7. Two separate artifacts.
 2. **Aphelion v0.3 R5 (manifest vs claim.md arbitration)** — if not ready by M5 start, Parallax pins to manifest. Confirm with Aphelion-side timing.
-3. **`PARALLAX_APHELION_PACKAGE_DIR` ingest pipeline** — who/what writes `.aphelion` packages into the dir on ZenBook? Current Parallax `/ingest/memory_md` is for raw markdown, not Aphelion packages. Out-of-scope for M5 implementation, but blocks M5 having any read traffic — flag for M6 or earlier ingest work.
+3. **`PARALLAX_APHELION_PACKAGE_DIR` ingest pipeline** — ✅ **RESOLVED 2026-05-17** in `docs/m6-prep/m6-ingest-contract-spec.md` (v0.1-frozen-2026-05-17). Decision: manual CLI invocation (`parallax ingest <package_path>`) per Q-M6.1 — operator places `.aphelion.tar` into `PARALLAX_APHELION_PACKAGE_DIR` and invokes the CLI; no watcher / poll / daemon in M6. Out-of-scope for M5 itself; M6 ingest impl lands the CLI subcommand.
 4. **Dual-write conflict back to package** — M5 entry writes back to Parallax event log on conflict. Does M5 also write back to a NEW `.aphelion` package, or only to Parallax store? (Notion canonical roadmap M5 says "Lane C US-010 衝突回寫 Parallax event" — so Parallax-side only; Aphelion stays read-only in M5.)
 5. **Aphelion v0.4 evidence schema** — M5 uses v0.3 minimal evidence. If v0.4 lands during M5 implementation, do we delay or ship-then-upgrade? Default: ship-then-upgrade.
 6. **Signer key distribution** — how does ZenBook get the verifier public key(s) to validate signatures? Chris owns this op decision.

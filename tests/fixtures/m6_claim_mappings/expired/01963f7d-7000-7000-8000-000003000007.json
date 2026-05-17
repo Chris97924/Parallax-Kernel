@@ -1,0 +1,8 @@
+{
+  "claim_id": "01963f7d-7000-7000-8000-000003000007",
+  "package_id": "01963f7d-7000-7000-8000-801900000007",
+  "polarity": "affirm",
+  "subject": "subject:expired:topic_07",
+  "valid_from": "2025-01-01T00:00:00Z",
+  "valid_until": "2025-06-01T00:00:00Z"
+}

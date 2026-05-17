@@ -1,0 +1,9 @@
+{
+  "claim_id": "01963f7d-7000-7000-8000-000002000013",
+  "package_id": "01963f7d-7000-7000-8000-204100000009",
+  "polarity": "affirm",
+  "subject": "subject:supersede:topic_09",
+  "supersedes": [
+    "01963f7d-7000-7000-8000-000002000012"
+  ]
+}

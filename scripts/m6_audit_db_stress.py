@@ -125,6 +125,12 @@ def run_stress(conn: sqlite3.Connection, n_rows: int) -> dict[str, object]:
 
     latencies_ms: list[float] = []
     error_count = 0
+    # Capture the first 3 distinct error messages so a CI failure surfaces
+    # *why* the stress run lost rows instead of just a count. Bounded so a
+    # cascading failure (e.g. disk full at row 500k) does not balloon the
+    # report file with N near-identical strings.
+    error_samples: list[str] = []
+    seen_errors: set[str] = set()
 
     t_start = time.perf_counter()
 
@@ -135,8 +141,12 @@ def run_stress(conn: sqlite3.Connection, n_rows: int) -> dict[str, object]:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(_INSERT_SQL, row_vals)
             conn.execute("COMMIT")
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             error_count += 1
+            msg = f"{type(exc).__name__}: {exc}"[:256]
+            if msg not in seen_errors and len(error_samples) < 3:
+                error_samples.append(msg)
+                seen_errors.add(msg)
             try:
                 conn.execute("ROLLBACK")
             except Exception:  # noqa: BLE001
@@ -178,6 +188,7 @@ def run_stress(conn: sqlite3.Connection, n_rows: int) -> dict[str, object]:
         "p99_ms": round(p99, 3),
         "max_ms": round(max_ms, 3),
         "error_count": error_count,
+        "error_samples": error_samples,
         "slo_pass": slo_pass,
     }
 

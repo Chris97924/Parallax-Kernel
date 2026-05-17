@@ -89,7 +89,16 @@ _REASON_TO_EXIT: Final[Mapping[str, int]] = {
     # signer.*
     "signer.signature_invalid": _EX_DATAERR,
     "signer.untrusted": _EX_DATAERR,
-    "signer.fingerprint_mismatch": _EX_DATAERR,
+    # NOTE: spec §3.4 also defines ``signer.fingerprint_mismatch`` to
+    # distinguish "matching <signer_id>.pem present but fingerprint
+    # differs" from the broader ``signer.untrusted`` (no matching .pem at
+    # all). The M6 trust store implementation here is filename-irrelevant
+    # — fingerprints are aggregated over every ``*.pem`` byte payload —
+    # so the precondition for detecting the mismatch case (a .pem named
+    # ``<signer_id>.pem``) is absent. ``signer.fingerprint_mismatch`` is
+    # therefore intentionally NOT in this map; emitting it would be
+    # dead-code reachable only via misuse. Documented as a follow-up spec
+    # gap for round-2 (filename convention + mismatch detection).
     "signer.manifest_missing": _EX_DATAERR,
     "signer.multi_sig_unsupported": _EX_DATAERR,
     "signer.trust_pem_invalid": _EX_CONFIG,
@@ -267,7 +276,19 @@ def _load_trust_store(trust_store_dir: Path) -> set[str]:
     per spec §3.4.
     """
     fingerprints: set[str] = set()
-    pem_files = sorted(p for p in trust_store_dir.iterdir() if p.suffix == ".pem")
+    # iterdir() can raise OSError (PermissionError, BlockingIOError, FS
+    # going read-only, etc.) before we even see the first .pem. Guard
+    # explicitly so the caller sees ``disk.permission`` (exit 71) rather
+    # than an unwrapped OSError leaking through the public API.
+    try:
+        pem_files = sorted(
+            p for p in trust_store_dir.iterdir() if p.suffix == ".pem"
+        )
+    except OSError as exc:
+        raise ParallaxIngestError(
+            "disk.permission",
+            f"trust store directory unreadable: {trust_store_dir}: {exc}",
+        ) from exc
     for pem in pem_files:
         try:
             raw = pem.read_bytes()
@@ -407,6 +428,15 @@ def _run_aphelion_verify(tar_path: Path) -> VerifyResult:
             ) from exc
         raise ParallaxIngestError(
             "claim.format_invalid", f"claim schema violation: {exc}"
+        ) from exc
+    except OSError as exc:
+        # PermissionError is already handled above. Any other OSError
+        # (FileNotFoundError shadowed earlier, BlockingIOError, transient
+        # read failures inside verify_package's tempdir unpack, etc.)
+        # surfaces as ``disk.permission`` (exit 71) per spec §6.2 disk.*
+        # bucket rather than escaping the public API uncaught.
+        raise ParallaxIngestError(
+            "disk.permission", f"OS-level read failure during verify: {exc}"
         ) from exc
 
 

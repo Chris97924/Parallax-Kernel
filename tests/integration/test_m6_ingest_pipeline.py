@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -1025,12 +1026,14 @@ class TestM6IngestGateFailures:
                 )
         finally:
             conn.close()
-        # Aphelion's validate_signatures rejects this earlier as a missing
-        # signer manifest — surfaces as signer.* class.
-        assert excinfo.value.reason_code in {
-            "signer.manifest_missing",
-            "signer.signature_invalid",
-        }
+        # Aphelion's validate_signatures runs BEFORE the M6 trust-store
+        # ``_verify_trust`` walk that would emit ``signer.manifest_missing``,
+        # so empirically the missing ``signers/<id>.json`` surfaces as
+        # ``signer.signature_invalid`` (E_SIGNER_MISSING). Pinned to ONE
+        # reason_code per reviewer-round-1 (no dual-accept): if Aphelion
+        # changes the failure ordering, this test must fail loudly so the
+        # M6 ``_verify_trust`` path becomes reachable for this case.
+        assert excinfo.value.reason_code == "signer.signature_invalid"
         assert excinfo.value.exit_code == 65
 
     def test_tampered_package_hash_raises_signature_invalid(
@@ -1074,13 +1077,13 @@ class TestM6IngestGateFailures:
                 )
         finally:
             conn.close()
-        # Aphelion may surface this as VerificationError (hash mismatch) or
-        # SignerVerificationError (the package-hash check at sign time).
-        assert excinfo.value.reason_code in {
-            "pkg.hash_mismatch",
-            "pkg.semantic_invalid",
-            "signer.signature_invalid",
-        }
+        # Empirically Aphelion's verify_package raises ``VerificationError``
+        # with ``PX_E_5001 hash mismatch`` for a claim file mutated after
+        # the manifest's recorded hash — surfaces here as ``pkg.hash_mismatch``.
+        # Pinned to ONE reason_code per reviewer-round-1 (no dual/triple
+        # accept): if Aphelion changes the failure ordering, this test
+        # must fail loudly so the mapping table can be re-audited.
+        assert excinfo.value.reason_code == "pkg.hash_mismatch"
         assert excinfo.value.exit_code == 65
         assert _audit_row_count(m6_ingest_env["audit_db_path"]) == 0
 
@@ -1090,3 +1093,544 @@ class TestM6IngestGateFailures:
         rather than silently defaulting to exit 0."""
         with pytest.raises(ValueError, match="unknown reason_code"):
             ParallaxIngestError("bogus.namespace.bad", "msg")
+
+
+# ---------------------------------------------------------------------------
+# Reviewer-round-1 spec-gap coverage (5/17). Each test pins ONE empirically
+# confirmed reason_code → exit_code mapping for a §6.2 row the original PR
+# missed. Probed values (2026-05-17 against aphelion-graph 0.4.x): see
+# in-test docstrings for the failure path traced through Aphelion +
+# aphelion_ingest. NO MOCKS — every test drives ``ingest_package`` against
+# a real signed package.
+# ---------------------------------------------------------------------------
+
+
+def _sign_existing_pack(
+    src_dir: Path,
+    tar_path: Path,
+    *,
+    signer_secret: bytes,
+    signer_id: str,
+) -> None:
+    """Write ``signatures.jsonl`` + ``signers/<id>.json`` onto an
+    already-built canonical tar.
+
+    Helper shared by the spec-gap tests below — replicates the signing
+    suffix of :func:`_build_aphelion_package` but allows the caller to
+    construct the source dir freely (multi-claim, missing-claim-file,
+    empty-claims, etc.). The base tar at ``tar_path`` MUST already exist
+    (e.g. via :func:`aphelion_pack`).
+    """
+    manifest_obj = canonical_normalize(
+        json.loads((src_dir / "manifest.json").read_bytes())
+    )
+    claims_tuples = [
+        (c["claim_id"], c["claim_instance_id"], c["hash"])
+        for c in manifest_obj["claims"]
+    ]
+    pkg_hash = compute_package_canonical_hash(
+        format_version=manifest_obj["format_version"],
+        package_id=manifest_obj["package_id"],
+        claims=claims_tuples,
+    )
+    signer = HMACSigner(signer_id=signer_id, secret=signer_secret)
+    envelope = signer.sign(
+        package_canonical_hash=pkg_hash, signed_at_iso=_BUILDER_SIGNED_AT
+    )
+    mr = signer.manifest()
+    sig_bytes = write_signatures_jsonl([envelope])
+    sm_bytes = canonical_dumps(
+        canonical_normalize(
+            {
+                "algorithm": mr.algorithm,
+                "key_fingerprint": mr.key_fingerprint,
+                "notary_uri": None,
+                "public_key_b64": mr.public_key_b64,
+                "signer_id": mr.signer_id,
+            }
+        )
+    )
+    existing = read_members(tar_path.read_bytes())
+    extra = [
+        TarMember(path="signatures.jsonl", data=sig_bytes, is_dir=False),
+        TarMember(path=f"signers/{signer_id}.json", data=sm_bytes, is_dir=False),
+    ]
+    tar_path.write_bytes(tar_pack(existing + extra))
+
+
+@pytest.mark.integration
+class TestM6IngestSpecGapCoverage:
+    """Per-row §6.2 reason_code coverage missed by US-203's original sweep."""
+
+    def test_pkg_archive_unsafe_path_traversal_rejects(
+        self, m6_ingest_env: dict[str, Path]
+    ) -> None:
+        """A ``../escape.txt`` member trips Aphelion's unpacker safety
+        guard → ``SecurityError(PATH_TRAVERSAL)`` → mapped to
+        ``pkg.archive_unsafe`` exit 65. Verified NO audit rows written."""
+        from aphelion.packer import pack as aphelion_pack
+
+        _assert_disposable(m6_ingest_env["audit_db_path"])
+        package_id = "01963f7d-7000-7000-8000-deadbeefc001"
+        src = m6_ingest_env["package_dir"] / "src_traversal"
+        claim_id = "01963f7d-7000-7000-8000-c1a17ace0001"
+        instance_id = "01963f7d-7000-7000-8000-11117ace0001"
+        _build_source_dir(
+            src,
+            claim_id=claim_id,
+            instance_id=instance_id,
+            package_id=package_id,
+        )
+        tar_path = m6_ingest_env["package_dir"] / "traversal.aphelion.tar"
+        aphelion_pack(src, tar_path)
+        _sign_existing_pack(
+            src,
+            tar_path,
+            signer_secret=_BUILDER_SECRET,
+            signer_id=_BUILDER_SIGNER_ID,
+        )
+
+        # Inject the unsafe ``../escape.txt`` member AFTER signing so the
+        # signed manifest stays internally consistent — Aphelion's unpacker
+        # rejects on the path-traversal check BEFORE manifest validation.
+        existing = read_members(tar_path.read_bytes())
+        extra = [TarMember(path="../escape.txt", data=b"evil", is_dir=False)]
+        tar_path.write_bytes(tar_pack(existing + extra))
+
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            with pytest.raises(ParallaxIngestError) as excinfo:
+                ingest_package(
+                    package_path=tar_path,
+                    audit_conn=conn,
+                    package_dir=m6_ingest_env["package_dir"],
+                    trust_store_dir=m6_ingest_env["trust_store_dir"],
+                    session_id="ingest:traversal",
+                )
+        finally:
+            conn.close()
+
+        assert excinfo.value.reason_code == "pkg.archive_unsafe"
+        assert excinfo.value.exit_code == 65
+        assert _audit_row_count(m6_ingest_env["audit_db_path"]) == 0
+
+    def test_pkg_semantic_invalid_missing_claim_file_rejects(
+        self, m6_ingest_env: dict[str, Path]
+    ) -> None:
+        """manifest.json references ``claims/<id>.md`` but the file is
+        absent from the tar → Aphelion ``SemanticError(FILESET_DIVERGENCE)``
+        → ``pkg.semantic_invalid`` exit 65. NO audit rows."""
+        from aphelion.packer import pack as aphelion_pack
+
+        _assert_disposable(m6_ingest_env["audit_db_path"])
+        package_id = "01963f7d-7000-7000-8000-deadbeeff001"
+        src = m6_ingest_env["package_dir"] / "src_missing_file"
+        src.mkdir(parents=True)
+        (src / "claims").mkdir()
+        claim_id = "01963f7d-7000-7000-8000-c1a1deadbef0"
+        instance_id = "01963f7d-7000-7000-8000-1111deadbef0"
+        claim_rel = f"claims/{claim_id}.md"
+        claim_bytes = _claim_md(claim_id=claim_id)
+        # Write the file so the manifest can record an accurate hash, then
+        # delete from the tar AFTER signing — signed-but-incomplete archive.
+        (src / claim_rel).write_bytes(claim_bytes)
+        manifest = {
+            "aphelion_spec_version": "0.4.0",
+            "claims": [
+                {
+                    "claim_id": claim_id,
+                    "claim_instance_id": instance_id,
+                    "hash": hashlib.sha256(claim_bytes).hexdigest(),
+                    "path": claim_rel,
+                    "state": "active",
+                }
+            ],
+            "created_at": "2026-05-17T00:00:00Z",
+            "format_version": "2.0",
+            "license": "Apache-2.0",
+            "package_id": package_id,
+            "producer": "parallax-m6-test",
+            "provenance_path": "provenance.jsonl",
+        }
+        (src / "manifest.json").write_bytes(
+            canonical_dumps(canonical_normalize(manifest))
+        )
+        (src / "provenance.jsonl").write_bytes(b"")
+
+        tar_path = m6_ingest_env["package_dir"] / "missing_file.aphelion.tar"
+        aphelion_pack(src, tar_path)
+        _sign_existing_pack(
+            src,
+            tar_path,
+            signer_secret=_BUILDER_SECRET,
+            signer_id=_BUILDER_SIGNER_ID,
+        )
+        # Strip the claim file member from the tar.
+        existing = read_members(tar_path.read_bytes())
+        filtered = [m for m in existing if m.path != claim_rel]
+        tar_path.write_bytes(tar_pack(filtered))
+
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            with pytest.raises(ParallaxIngestError) as excinfo:
+                ingest_package(
+                    package_path=tar_path,
+                    audit_conn=conn,
+                    package_dir=m6_ingest_env["package_dir"],
+                    trust_store_dir=m6_ingest_env["trust_store_dir"],
+                    session_id="ingest:missing_file",
+                )
+        finally:
+            conn.close()
+
+        assert excinfo.value.reason_code == "pkg.semantic_invalid"
+        assert excinfo.value.exit_code == 65
+        assert _audit_row_count(m6_ingest_env["audit_db_path"]) == 0
+
+    def test_pkg_empty_package_rejects_with_exit_65(
+        self, m6_ingest_env: dict[str, Path]
+    ) -> None:
+        """A signed tar with ``manifest['claims'] == []`` → operator-mistake
+        guard fires → ``pkg.empty_package`` exit 65. NO audit rows."""
+        from aphelion.packer import pack as aphelion_pack
+
+        _assert_disposable(m6_ingest_env["audit_db_path"])
+        package_id = "01963f7d-7000-7000-8000-deadbeefe001"
+        src = m6_ingest_env["package_dir"] / "src_empty"
+        src.mkdir(parents=True)
+        (src / "claims").mkdir()
+        manifest = {
+            "aphelion_spec_version": "0.4.0",
+            "claims": [],
+            "created_at": "2026-05-17T00:00:00Z",
+            "format_version": "2.0",
+            "license": "Apache-2.0",
+            "package_id": package_id,
+            "producer": "parallax-m6-test",
+            "provenance_path": "provenance.jsonl",
+        }
+        (src / "manifest.json").write_bytes(
+            canonical_dumps(canonical_normalize(manifest))
+        )
+        (src / "provenance.jsonl").write_bytes(b"")
+
+        tar_path = m6_ingest_env["package_dir"] / "empty.aphelion.tar"
+        aphelion_pack(src, tar_path)
+        _sign_existing_pack(
+            src,
+            tar_path,
+            signer_secret=_BUILDER_SECRET,
+            signer_id=_BUILDER_SIGNER_ID,
+        )
+
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            with pytest.raises(ParallaxIngestError) as excinfo:
+                ingest_package(
+                    package_path=tar_path,
+                    audit_conn=conn,
+                    package_dir=m6_ingest_env["package_dir"],
+                    trust_store_dir=m6_ingest_env["trust_store_dir"],
+                    session_id="ingest:empty",
+                )
+        finally:
+            conn.close()
+
+        assert excinfo.value.reason_code == "pkg.empty_package"
+        assert excinfo.value.exit_code == 65
+        assert _audit_row_count(m6_ingest_env["audit_db_path"]) == 0
+
+    def test_signer_multi_sig_unsupported_rejects_with_exit_65(
+        self, m6_ingest_env: dict[str, Path]
+    ) -> None:
+        """Two ``signatures.jsonl`` lines + two ``signers/<id>.json`` files
+        → M6 single-signer invariant trips → ``signer.multi_sig_unsupported``
+        exit 65. NO audit rows. Both signers are trusted so the rejection
+        is on the multi-sig invariant alone, not trust-store mismatch."""
+        from aphelion.packer import pack as aphelion_pack
+
+        _assert_disposable(m6_ingest_env["audit_db_path"])
+        package_id = "01963f7d-7000-7000-8000-deadbeefa001"
+        src = m6_ingest_env["package_dir"] / "src_multisig"
+        claim_id = "01963f7d-7000-7000-8000-c1a17ace0002"
+        instance_id = "01963f7d-7000-7000-8000-11117ace0002"
+        _build_source_dir(
+            src,
+            claim_id=claim_id,
+            instance_id=instance_id,
+            package_id=package_id,
+        )
+        tar_path = m6_ingest_env["package_dir"] / "multisig.aphelion.tar"
+        aphelion_pack(src, tar_path)
+
+        manifest_obj = canonical_normalize(
+            json.loads((src / "manifest.json").read_bytes())
+        )
+        claims_tuples = [
+            (c["claim_id"], c["claim_instance_id"], c["hash"])
+            for c in manifest_obj["claims"]
+        ]
+        pkg_hash = compute_package_canonical_hash(
+            format_version=manifest_obj["format_version"],
+            package_id=manifest_obj["package_id"],
+            claims=claims_tuples,
+        )
+
+        # 32-byte HMAC secrets (constructor requires exact length).
+        secret_a = b"multi-sig-A-secret-32-bytes-pad!"[:32]
+        secret_b = b"multi-sig-B-secret-32-bytes-pad!"[:32]
+        signer_a = HMACSigner(signer_id="multisig-signer-a", secret=secret_a)
+        signer_b = HMACSigner(signer_id="multisig-signer-b", secret=secret_b)
+        env_a = signer_a.sign(
+            package_canonical_hash=pkg_hash, signed_at_iso=_BUILDER_SIGNED_AT
+        )
+        env_b = signer_b.sign(
+            package_canonical_hash=pkg_hash, signed_at_iso=_BUILDER_SIGNED_AT
+        )
+        sig_bytes = write_signatures_jsonl([env_a, env_b])
+
+        def _sm_bytes(rec: Any) -> bytes:
+            return canonical_dumps(
+                canonical_normalize(
+                    {
+                        "algorithm": rec.algorithm,
+                        "key_fingerprint": rec.key_fingerprint,
+                        "notary_uri": None,
+                        "public_key_b64": rec.public_key_b64,
+                        "signer_id": rec.signer_id,
+                    }
+                )
+            )
+
+        existing = read_members(tar_path.read_bytes())
+        extra = [
+            TarMember(path="signatures.jsonl", data=sig_bytes, is_dir=False),
+            TarMember(
+                path="signers/multisig-signer-a.json",
+                data=_sm_bytes(signer_a.manifest()),
+                is_dir=False,
+            ),
+            TarMember(
+                path="signers/multisig-signer-b.json",
+                data=_sm_bytes(signer_b.manifest()),
+                is_dir=False,
+            ),
+        ]
+        tar_path.write_bytes(tar_pack(existing + extra))
+
+        # Trust BOTH signers so rejection is exclusively on the multi-sig path.
+        (m6_ingest_env["trust_store_dir"] / "multisig-signer-a.pem").write_bytes(
+            secret_a
+        )
+        (m6_ingest_env["trust_store_dir"] / "multisig-signer-b.pem").write_bytes(
+            secret_b
+        )
+
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            with pytest.raises(ParallaxIngestError) as excinfo:
+                ingest_package(
+                    package_path=tar_path,
+                    audit_conn=conn,
+                    package_dir=m6_ingest_env["package_dir"],
+                    trust_store_dir=m6_ingest_env["trust_store_dir"],
+                    session_id="ingest:multisig",
+                )
+        finally:
+            conn.close()
+
+        assert excinfo.value.reason_code == "signer.multi_sig_unsupported"
+        assert excinfo.value.exit_code == 65
+        assert _audit_row_count(m6_ingest_env["audit_db_path"]) == 0
+
+    def test_claim_duplicate_in_package_rejects_with_exit_65(
+        self, m6_ingest_env: dict[str, Path]
+    ) -> None:
+        """Two claims sharing ``(subject, polarity, valid_from)`` →
+        in-package R4 duplicate guard fires → ``claim.duplicate_in_package``
+        exit 65. NO audit rows."""
+        from aphelion.packer import pack as aphelion_pack
+
+        _assert_disposable(m6_ingest_env["audit_db_path"])
+        package_id = "01963f7d-7000-7000-8000-deadbeefd001"
+        src = m6_ingest_env["package_dir"] / "src_dup_r4"
+        src.mkdir(parents=True)
+        (src / "claims").mkdir()
+        r4 = {
+            "polarity": "affirm",
+            "subject": "test",
+            "valid_from": "2024-01-01T00:00:00Z",
+        }
+        claims_meta: list[dict[str, Any]] = []
+        for i in (1, 2):
+            cid = f"01963f7d-7000-7000-8000-c1a10000000{i}"
+            inst = f"01963f7d-7000-7000-8000-1111000000{i:02d}"
+            rel = f"claims/{cid}.md"
+            cb = _claim_md(claim_id=cid, extra_fields=r4)
+            (src / rel).write_bytes(cb)
+            claims_meta.append(
+                {
+                    "claim_id": cid,
+                    "claim_instance_id": inst,
+                    "hash": hashlib.sha256(cb).hexdigest(),
+                    "path": rel,
+                    "state": "active",
+                }
+            )
+        manifest = {
+            "aphelion_spec_version": "0.4.0",
+            "claims": claims_meta,
+            "created_at": "2026-05-17T00:00:00Z",
+            "format_version": "2.0",
+            "license": "Apache-2.0",
+            "package_id": package_id,
+            "producer": "parallax-m6-test",
+            "provenance_path": "provenance.jsonl",
+        }
+        (src / "manifest.json").write_bytes(
+            canonical_dumps(canonical_normalize(manifest))
+        )
+        events = b"\n".join(
+            canonical_dumps(
+                canonical_normalize(
+                    {
+                        "actor": "m6-test",
+                        "claim_id": c["claim_id"],
+                        "claim_instance_id": c["claim_instance_id"],
+                        "event_id": f"01963f7d-7000-7000-8000-eeee0000000{idx}",
+                        "event_type": "create",
+                        "timestamp": "2026-05-17T00:00:00Z",
+                    }
+                )
+            )
+            for idx, c in enumerate(claims_meta, start=1)
+        )
+        (src / "provenance.jsonl").write_bytes(events)
+
+        tar_path = m6_ingest_env["package_dir"] / "dup_r4.aphelion.tar"
+        aphelion_pack(src, tar_path)
+        _sign_existing_pack(
+            src,
+            tar_path,
+            signer_secret=_BUILDER_SECRET,
+            signer_id=_BUILDER_SIGNER_ID,
+        )
+
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            with pytest.raises(ParallaxIngestError) as excinfo:
+                ingest_package(
+                    package_path=tar_path,
+                    audit_conn=conn,
+                    package_dir=m6_ingest_env["package_dir"],
+                    trust_store_dir=m6_ingest_env["trust_store_dir"],
+                    session_id="ingest:dup_r4",
+                )
+        finally:
+            conn.close()
+
+        assert excinfo.value.reason_code == "claim.duplicate_in_package"
+        assert excinfo.value.exit_code == 65
+        assert _audit_row_count(m6_ingest_env["audit_db_path"]) == 0
+
+    def test_claim_subject_required_for_r4_rejects_with_exit_65(
+        self, m6_ingest_env: dict[str, Path]
+    ) -> None:
+        """A claim with R4-trigger field (``valid_from``) but no ``subject``
+        → v0.3 validator raises ``SchemaError(CLAIM_SUBJECT_REQUIRED_FOR_CONFLICT)``
+        → translated to ``claim.subject_required_for_r4`` exit 65 (separate
+        from generic ``claim.format_invalid`` per spec §6.2)."""
+        _assert_disposable(m6_ingest_env["audit_db_path"])
+        # R4-trigger field present, ``subject`` absent.
+        tar_path, _ = _build_aphelion_package(
+            tmp_path=m6_ingest_env["package_dir"],
+            package_id="01963f7d-7000-7000-8000-deadbeefb001",
+            signer_secret=_BUILDER_SECRET,
+            signer_id=_BUILDER_SIGNER_ID,
+            out_name="r4_no_subject.aphelion.tar",
+            extra_fields={
+                "polarity": "affirm",
+                "valid_from": "2024-01-01T00:00:00Z",
+            },
+        )
+
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            with pytest.raises(ParallaxIngestError) as excinfo:
+                ingest_package(
+                    package_path=tar_path,
+                    audit_conn=conn,
+                    package_dir=m6_ingest_env["package_dir"],
+                    trust_store_dir=m6_ingest_env["trust_store_dir"],
+                    session_id="ingest:r4_no_subject",
+                )
+        finally:
+            conn.close()
+
+        assert excinfo.value.reason_code == "claim.subject_required_for_r4"
+        assert excinfo.value.exit_code == 65
+        assert _audit_row_count(m6_ingest_env["audit_db_path"]) == 0
+
+    def test_cli_disk_audit_db_unset_exits_78(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CLI-layer gate: ``PARALLAX_AUDIT_DB_PATH`` unset → exit 78
+        with structured-log ``reason_code=disk.audit_db_unset`` (spec §7.5,
+        §6.4). Spawns a real subprocess so the argparse + env-resolution
+        path in :func:`parallax.cli._cmd_ingest` is exercised end-to-end.
+        """
+        import subprocess
+        import sys as _sys
+
+        # Build a minimal env: PARALLAX_AUDIT_DB_PATH explicitly NOT set.
+        # Keep the OS-level minimum (PATH, SYSTEMROOT for Windows) so
+        # subprocess + sqlite3 can still load.
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            in {
+                "PATH",
+                "SYSTEMROOT",
+                "USERPROFILE",
+                "TEMP",
+                "TMP",
+                "PYTHONIOENCODING",
+                "PYTHONPATH",
+            }
+        }
+        clean_env["PARALLAX_APHELION_PACKAGE_DIR"] = str(tmp_path)
+        clean_env["PARALLAX_APHELION_TRUST_STORE"] = str(tmp_path)
+        # Deliberately do NOT set PARALLAX_AUDIT_DB_PATH.
+        clean_env.pop("PARALLAX_AUDIT_DB_PATH", None)
+
+        dummy_pkg = tmp_path / "dummy.aphelion.tar"
+        dummy_pkg.write_bytes(b"")  # path doesn't need to be valid — env check is first
+
+        # The package ships `parallax = parallax.cli:main` as a console
+        # script (pyproject.toml [project.scripts]) but there is no
+        # `parallax/__main__.py`, so `python -m parallax` does not work.
+        # Invoke `cli.main` directly via `python -c` so the test exercises
+        # the same dispatch path as the installed console-script entry.
+        result = subprocess.run(
+            [
+                _sys.executable,
+                "-c",
+                "import sys; from parallax.cli import main; sys.exit(main())",
+                "ingest",
+                str(dummy_pkg),
+            ],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 78, (
+            f"expected exit 78, got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        # Structured log appears on stderr (default logger handler).
+        combined = result.stdout + result.stderr
+        assert "disk.audit_db_unset" in combined, (
+            f"expected reason_code 'disk.audit_db_unset' in output; got: {combined!r}"
+        )

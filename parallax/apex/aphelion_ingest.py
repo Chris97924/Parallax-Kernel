@@ -696,6 +696,14 @@ def ingest_package(
             raise ParallaxIngestError(
                 "pkg.archive_unsafe", f"re-unpack tar error: {exc}"
             ) from exc
+        except OSError as exc:
+            # Codex round-2 P2: catch generic OSError subclasses
+            # (ENOSPC, EIO, ESTALE, transient FS faults) that escape
+            # PermissionError/TarError narrowing. Map to disk.permission
+            # so the failure becomes deterministic per spec §6.2.
+            raise ParallaxIngestError(
+                "disk.permission", f"re-unpack OS error: {exc}"
+            ) from exc
 
         try:
             manifest = canonical_loads((unpacked / "manifest.json").read_bytes())

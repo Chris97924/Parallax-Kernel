@@ -1064,17 +1064,25 @@ def _cmd_ingest(
             raise SystemExit(70)
 
     # --- Open audit DB (validate=True runs §4 startup gates on the real DB) ---
+    # Codex round-2 P1: catch raw sqlite3.Error from PRAGMA/quick_check/schema
+    # apply, not just AuditDbConfigError. Both surface as operator-config
+    # failures (broken DB file, readonly/locked/corrupt) and MUST exit
+    # EX_CONFIG (78) per spec §6.3, not the generic exit-1 top-level path.
     try:
         audit_conn = open_audit_db(audit_db_path, validate=True)
-    except AuditDbConfigError as exc:
+    except (AuditDbConfigError, sqlite3.Error) as exc:
         _log.error(
             "parallax_ingest_failed",
             extra={
                 "event": "parallax_ingest_failed",
-                "reason_code": "disk.audit_db_unset",
+                "reason_code": (
+                    "disk.audit_db_unset"
+                    if isinstance(exc, AuditDbConfigError)
+                    else "disk.permission"
+                ),
                 "package_path": pkg_path_str,
                 "signer_id": "",
-                "underlying": str(exc)[:256],
+                "underlying": f"{type(exc).__name__}: {exc}"[:256],
             },
         )
         return 78  # EX_CONFIG

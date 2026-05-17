@@ -41,14 +41,20 @@ These are docs/specs that benefit from being in place when M5 ships, so M6 doesn
 - E.M6.1 — Self-memory dual-read scope decision (which agent context queries route through dual-read?)
 - E.M6.2 — Memory layer ingest pipeline ready (`PARALLAX_APHELION_PACKAGE_DIR` populated by SOMETHING — currently a Chris-gated open question per `apex-m5-entry-spec.md` §7.3)
 
-### 3.2 M6 design questions to flag now (not answer)
+### 3.2 M6 design questions — RESOLVED 2026-05-17 via route-A pivot reframe
 
-- **Q-M6.1**: When the Parallax instance dog-foods its own memory, does the agent's context query bypass cache or always go through dual-read? (latency vs fidelity tradeoff)
-- **Q-M6.2**: How does R-8 divergence-budget circuit-breaker behave when triggered on agent's own self-memory? (rollback to Parallax-only is safe but loses M6's dog-fooding intent)
-- **Q-M6.3**: Aphelion v0.4 evidence schema (richer evidence binding) — ship-then-upgrade or block M6 until v0.4 lands?
-- **Q-M6.4**: Cross-instance memory federation (per `feedback_workspace_cwd_convention.md` direction) — is M6 still single-instance, or does it open the federation door?
+**Status**: ✅ RESOLVED 2026-05-17 — see `m6-ingest-contract-spec.md §1` (v0.1-frozen-2026-05-17).
 
-These are NOT for autopilot to answer. They are Chris-direction calls for when M5 metric data informs the answers.
+After the 2026-05-16 noon route-A pivot (M6 critical path = `.aphelion.tar` ingest pipeline, NOT self-memory dual-read dog-fooding), the original Q-M6.1~Q-M6.4 were reframed for the ingest-pipeline scope:
+
+| Q | Original framing | Reframed decision (2026-05-17) |
+|---|---|---|
+| Q-M6.1 | Self-memory dual-read scope (bypass cache vs always dual-read) | **DEFERRED to M6.5/M7** — self-memory dual-read is downstream of the ingest pipeline. Reframed Q-M6.1 = ingest trigger model → **Manual CLI invocation** (`parallax ingest <path>`); no watcher, no poll. |
+| Q-M6.2 | R-8 divergence circuit-breaker on self-memory | **DEFERRED to M6.5/M7** along with Q-M6.1 original. Reframed Q-M6.2 = signer trust key distribution → **File-based PEM trust store** at `PARALLAX_APHELION_TRUST_STORE`, re-read per invocation. |
+| Q-M6.3 | Aphelion v0.4 evidence schema gate | **Ship-then-upgrade** — additive-only invariant verified per `v0.3-claim-semantics.md §1` + PR #51 backward-compat fixture. |
+| Q-M6.4 | Cross-instance federation | **Strictly single-instance** — federation deferred to M11+ per Orbit V2 pushback + mutual read-only invariant per `feedback_federation_peers_readonly.md`. |
+
+See `m6-ingest-contract-spec.md §1` for full decision rationale, tradeoffs, and cross-references.
 
 ### 3.3 Cross-references that will be needed at M6 entry
 

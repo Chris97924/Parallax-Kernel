@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: parallax
+    orgId: 1
+    folder: Parallax
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 60
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -111,3 +111,75 @@ groups:
             until traffic recovers. Do NOT promote stage on green-from-T1-T4
             while this alert is firing.
             Runbook: docs/m4-prep/canary-stage-runbook.md §6.4.
+
+      # ---------------------------------------------------------------
+      # Canary Shadow Observer (Apex M4 GATE 3-7 pre-req).
+      # Driven by `parallax/canary_shadow.py` — a post-`DualReadRouter`
+      # observation overlay that samples completed dual-read results into
+      # stage-labelled counters. Stage advances via PARALLAX_CANARY_SHADOW_FRACTION
+      # env var (0.0 / 0.01 / 0.10 / 0.50 / 1.00 → disabled/s1/s2/s3/s4).
+      # Spec: docs/m4-prep/canary-shadow-spec.md
+      # ---------------------------------------------------------------
+      - record: parallax_canary_shadow_discrepancy_rate
+        expr: |
+          (
+            sum by (stage, traffic_source) (
+              rate(parallax_canary_shadow_outcomes_total{outcome="diverge"}[5m])
+            )
+            /
+            (
+              sum by (stage, traffic_source) (
+                rate(parallax_canary_shadow_attempts_total[5m])
+              ) > 0
+            )
+          )
+
+      - record: parallax_canary_shadow_aphelion_unreachable_rate
+        expr: |
+          (
+            sum by (stage, traffic_source) (
+              rate(parallax_canary_shadow_outcomes_total{outcome="aphelion_unreachable"}[5m])
+            )
+            /
+            (
+              sum by (stage, traffic_source) (
+                rate(parallax_canary_shadow_attempts_total[5m])
+              ) > 0
+            )
+          )
+
+      - alert: CanaryShadowDiscrepancyHigh
+        expr: parallax_canary_shadow_discrepancy_rate > 0.005
+        for: 10m
+        labels:
+          severity: warning
+          component: parallax_m4_canary
+          trigger: shadow_discrepancy
+          rollback_class: gate
+        annotations:
+          summary: |
+            Canary stage {{ $labels.stage }} discrepancy_rate > 0.5% for 10min
+            — block stage promotion.
+          description: |
+            Observation subset for the active canary stage shows
+            dual-read discrepancy_rate above the 0.5% GATE threshold.
+            Promotion to the next stage MUST be blocked until the rate
+            recovers. Runbook: docs/m4-prep/canary-shadow-spec.md#alerts.
+
+      - alert: CanaryShadowAphelionUnreachableHigh
+        expr: parallax_canary_shadow_aphelion_unreachable_rate > 0.005
+        for: 10m
+        labels:
+          severity: warning
+          component: parallax_m4_canary
+          trigger: shadow_aphelion_unreachable
+          rollback_class: gate
+        annotations:
+          summary: |
+            Canary stage {{ $labels.stage }} aphelion_unreachable_rate
+            > 0.5% for 10min — Aphelion secondary degraded.
+          description: |
+            Observation subset shows the Aphelion read adapter failing
+            more than 0.5% of the time in the active canary stage. This
+            indicates secondary-store availability regression and blocks
+            stage promotion. Runbook: docs/m4-prep/canary-shadow-spec.md#alerts.

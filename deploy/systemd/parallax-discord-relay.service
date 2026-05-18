@@ -8,6 +8,11 @@ EnvironmentFile=/home/chris/parallax-kernel/scripts/discord-relay.env
 ExecStart=/usr/bin/python3 /home/chris/parallax-kernel/scripts/discord-relay.py
 Restart=on-failure
 RestartSec=3s
+# Stop crash-loop if DISCORD_WEBHOOK env is missing — 3 failures in 30s
+# puts the unit into `failed` state so `systemctl --user status` makes
+# the root cause obvious without filling journald.
+StartLimitBurst=3
+StartLimitIntervalSec=30s
 StandardOutput=journal
 StandardError=journal
 

@@ -74,8 +74,12 @@ _ENV = "PARALLAX_CANARY_SHADOW_FRACTION"
 
 @pytest.fixture(autouse=True)
 def _clean_env_and_module() -> Iterator[None]:
-    """Pop PARALLAX_CANARY_SHADOW_FRACTION before/after each test to avoid leakage."""
+    """Pop PARALLAX_CANARY_SHADOW_FRACTION + reset dedup sentinel per test."""
+    from parallax import canary_shadow as _canary_module
+
     original = os.environ.pop(_ENV, None)
+    saved_sentinel = _canary_module._last_warned_invalid_raw
+    _canary_module._last_warned_invalid_raw = None
     try:
         yield
     finally:
@@ -83,6 +87,7 @@ def _clean_env_and_module() -> Iterator[None]:
             os.environ.pop(_ENV, None)
         else:
             os.environ[_ENV] = original
+        _canary_module._last_warned_invalid_raw = saved_sentinel
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +124,44 @@ def test_get_shadow_fraction_malformed_falls_back_to_zero(raw: str) -> None:
     from parallax import canary_shadow
 
     assert canary_shadow.get_shadow_fraction() == 0.0
+
+
+def test_get_shadow_fraction_warning_dedup_under_repeat(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex PR-59 P2: malformed env must not log a warning per call.
+
+    Repeated reads of the same bad value emit one warning; changing the bad
+    value to a *different* bad value re-emits exactly once.
+    """
+    from parallax import canary_shadow
+
+    # Reset the module-level dedup sentinel so this test is independent of
+    # whatever previous tests left behind.
+    canary_shadow._last_warned_invalid_raw = None
+
+    os.environ[_ENV] = "abc"
+    with caplog.at_level("WARNING", logger="parallax.canary_shadow"):
+        for _ in range(50):
+            canary_shadow.get_shadow_fraction()
+    abc_warnings = [
+        r for r in caplog.records if "canary_shadow_fraction_invalid" in r.message
+    ]
+    assert len(abc_warnings) == 1, (
+        f"expected exactly one warning for repeated 'abc' reads; got {len(abc_warnings)}"
+    )
+
+    caplog.clear()
+    os.environ[_ENV] = "1.5"  # different out-of-range value
+    with caplog.at_level("WARNING", logger="parallax.canary_shadow"):
+        for _ in range(50):
+            canary_shadow.get_shadow_fraction()
+    next_warnings = [
+        r for r in caplog.records if "canary_shadow_fraction_invalid" in r.message
+    ]
+    assert len(next_warnings) == 1, (
+        f"expected exactly one warning when env value changes; got {len(next_warnings)}"
+    )
 
 
 @pytest.mark.parametrize(

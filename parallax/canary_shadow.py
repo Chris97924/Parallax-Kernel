@@ -104,6 +104,34 @@ _canary_outcomes_counter = _get_or_create_counter(
     ["stage", "outcome", "user_id", "traffic_source"],
 )
 
+# Module-level sentinel used to deduplicate ``canary_shadow_fraction_invalid``
+# warnings. ``observe()`` calls ``get_shadow_fraction()`` once per request, so
+# a misconfigured env value would otherwise emit one warning per request and
+# bury the ``canary_shadow_observe_failed`` signal under log volume. Storing
+# the most recently warned raw string lets us re-emit only when the operator
+# changes the env value (e.g. mid-stage typo fix). Python string assignment
+# is atomic under the GIL so a race here can at worst double-log a single
+# transition — never amplify steady-state volume.
+_last_warned_invalid_raw: str | None = None
+
+
+def _warn_invalid_fraction_once(raw: str, reason: str) -> None:
+    """Emit ``canary_shadow_fraction_invalid`` only when the raw value changes.
+
+    ``reason`` is the human-readable cause (``"not a float"``,
+    ``"out of range [0,1]"``). The structured ``event`` label stays constant
+    so log queries do not need to enumerate reasons.
+    """
+    global _last_warned_invalid_raw
+    if raw == _last_warned_invalid_raw:
+        return
+    _last_warned_invalid_raw = raw
+    _log.warning(
+        "canary_shadow_fraction_invalid: %s, falling back to 0.0",
+        reason,
+        extra={"event": "canary_shadow_fraction_invalid", "raw": raw, "reason": reason},
+    )
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -114,7 +142,9 @@ def get_shadow_fraction() -> float:
     """Return ``PARALLAX_CANARY_SHADOW_FRACTION`` parsed as float in [0.0, 1.0].
 
     Returns 0.0 on missing, malformed, out-of-range, or non-finite input.
-    Logs a warning on the first malformed value so the operator notices.
+    Logs ``canary_shadow_fraction_invalid`` only when the raw env value
+    *changes* — see ``_warn_invalid_fraction_once`` — so a long-running
+    misconfiguration cannot bury other observer warnings.
     """
     raw = os.environ.get(CANARY_SHADOW_FRACTION_ENV)
     if raw is None or raw == "":
@@ -122,16 +152,10 @@ def get_shadow_fraction() -> float:
     try:
         value = float(raw)
     except ValueError:
-        _log.warning(
-            "canary_shadow_fraction_invalid: not a float, falling back to 0.0",
-            extra={"event": "canary_shadow_fraction_invalid", "raw": raw},
-        )
+        _warn_invalid_fraction_once(raw, "not a float")
         return 0.0
     if not math.isfinite(value) or value < 0.0 or value > 1.0:
-        _log.warning(
-            "canary_shadow_fraction_invalid: out of range [0,1], falling back to 0.0",
-            extra={"event": "canary_shadow_fraction_invalid", "raw": raw},
-        )
+        _warn_invalid_fraction_once(raw, "out of range [0,1]")
         return 0.0
     return value
 

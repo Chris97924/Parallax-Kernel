@@ -105,8 +105,9 @@ sudo systemctl restart parallax-server.service
 1. `observe()` MUST NOT mutate the supplied `DualReadResult`. (The dataclass is frozen but defence-in-depth applies.)
 2. `observe()` MUST NOT raise out. Internal exceptions are logged and swallowed.
 3. `observe()` MUST NOT register new collectors at call time; collectors are module-scope and re-import safe via `_get_or_create_counter`.
-4. Failure to parse `PARALLAX_CANARY_SHADOW_FRACTION` MUST log `event=canary_shadow_fraction_invalid` and fall back to `0.0` (disabled).
-5. The fraction value is the **configured rollout sampling rate**, not a per-user determinism gate. Stage advance is driven by the env var; per-request gating is `random.random() < fraction`. Sticky-per-user sampling is YAGNI in v0.1; revisit if Stage 5 introduces user-targeted canaries.
+4. Failure to parse `PARALLAX_CANARY_SHADOW_FRACTION` MUST log `event=canary_shadow_fraction_invalid` and fall back to `0.0` (disabled). The warning is **deduplicated** by raw value to avoid log flooding under a long-running misconfiguration. The dedup sentinel is **cleared** on every valid / unset read so a recurring bad value (`bad → good → bad`) re-emits exactly once.
+5. `observe()` MUST NOT count `outcome="skipped"` toward either counter. `skipped` means dual-read did not happen (flag off, ADR-007 CHANGE_TRACE.legacy_kind=bug short-circuit), so it is not a canary observation. Counting it would inflate the recording-rule denominator and dilute `parallax_canary_shadow_discrepancy_rate`.
+6. The fraction value is the **configured rollout sampling rate**, not a per-user determinism gate. Stage advance is driven by the env var; per-request gating is `random.random() < fraction`. Sticky-per-user sampling is YAGNI in v0.1; revisit if Stage 5 introduces user-targeted canaries.
 
 ## 9. Non-goals
 

@@ -126,6 +126,58 @@ def test_get_shadow_fraction_malformed_falls_back_to_zero(raw: str) -> None:
     assert canary_shadow.get_shadow_fraction() == 0.0
 
 
+def test_get_shadow_fraction_dedup_resets_after_valid_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex PR-59 round-2 P2: bad -> good -> bad must re-warn on the second bad.
+
+    Without the sentinel reset, a recurring config regression would be
+    silently swallowed because the sentinel still equals the bad value.
+    """
+    from parallax import canary_shadow
+
+    canary_shadow._last_warned_invalid_raw = None
+
+    os.environ[_ENV] = "abc"
+    with caplog.at_level("WARNING", logger="parallax.canary_shadow"):
+        canary_shadow.get_shadow_fraction()
+    first = [r for r in caplog.records if "canary_shadow_fraction_invalid" in r.message]
+    assert len(first) == 1
+
+    caplog.clear()
+    os.environ[_ENV] = "0.5"  # valid -> clears sentinel
+    with caplog.at_level("WARNING", logger="parallax.canary_shadow"):
+        canary_shadow.get_shadow_fraction()
+    mid = [r for r in caplog.records if "canary_shadow_fraction_invalid" in r.message]
+    assert len(mid) == 0, "valid read must not emit invalid warning"
+
+    caplog.clear()
+    os.environ[_ENV] = "abc"  # bad recurs -> must re-warn
+    with caplog.at_level("WARNING", logger="parallax.canary_shadow"):
+        canary_shadow.get_shadow_fraction()
+    last = [r for r in caplog.records if "canary_shadow_fraction_invalid" in r.message]
+    assert len(last) == 1, "recurring bad value must re-emit exactly once"
+
+
+def test_get_shadow_fraction_dedup_resets_after_unset(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Unsetting env clears the sentinel just like a valid read does."""
+    from parallax import canary_shadow
+
+    canary_shadow._last_warned_invalid_raw = None
+
+    os.environ[_ENV] = "abc"
+    canary_shadow.get_shadow_fraction()
+    assert canary_shadow._last_warned_invalid_raw == "abc"
+
+    os.environ.pop(_ENV)
+    canary_shadow.get_shadow_fraction()
+    assert canary_shadow._last_warned_invalid_raw is None, (
+        "unset env must clear the dedup sentinel"
+    )
+
+
 def test_get_shadow_fraction_warning_dedup_under_repeat(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -217,7 +269,7 @@ def test_observe_disabled_does_not_increment() -> None:
 
 @pytest.mark.parametrize(
     "outcome",
-    ["match", "diverge", "primary_only", "aphelion_unreachable", "skipped"],
+    ["match", "diverge", "primary_only", "aphelion_unreachable"],
 )
 def test_observe_at_full_fraction_increments_outcome(outcome: str) -> None:
     os.environ[_ENV] = "1.0"
@@ -239,7 +291,7 @@ def test_observe_at_full_fraction_increments_outcome(outcome: str) -> None:
     )
 
     canary_shadow.observe(
-        _result(outcome, secondary_ids=None if outcome == "skipped" else ("a",)),
+        _result(outcome),
         user_id=user,
         traffic_source="natural",
     )
@@ -259,6 +311,54 @@ def test_observe_at_full_fraction_increments_outcome(outcome: str) -> None:
     )
     assert after_outcome == before_outcome + 1.0
     assert after_attempts == before_attempts + 1.0
+
+
+def test_observe_skipped_outcome_does_not_increment_either_counter() -> None:
+    """Codex PR-59 round-2 P2: skipped means dual-read didn't happen.
+
+    Counting ``skipped`` as a canary attempt inflates the recording-rule
+    denominator and dilutes ``parallax_canary_shadow_discrepancy_rate``,
+    suppressing real divergence alerts.
+    """
+    os.environ[_ENV] = "1.0"
+    from parallax import canary_shadow
+
+    user = "u-skipped"
+    before_attempts = _counter_value(
+        "parallax_canary_shadow_attempts_total",
+        stage="s4",
+        user_id=user,
+        traffic_source="natural",
+    )
+    before_outcome = _counter_value(
+        "parallax_canary_shadow_outcomes_total",
+        stage="s4",
+        outcome="skipped",
+        user_id=user,
+        traffic_source="natural",
+    )
+
+    canary_shadow.observe(
+        _result("skipped", secondary_ids=None),
+        user_id=user,
+        traffic_source="natural",
+    )
+
+    after_attempts = _counter_value(
+        "parallax_canary_shadow_attempts_total",
+        stage="s4",
+        user_id=user,
+        traffic_source="natural",
+    )
+    after_outcome = _counter_value(
+        "parallax_canary_shadow_outcomes_total",
+        stage="s4",
+        outcome="skipped",
+        user_id=user,
+        traffic_source="natural",
+    )
+    assert after_attempts == before_attempts, "skipped must not bump attempts"
+    assert after_outcome == before_outcome, "skipped must not bump outcomes"
 
 
 # ---------------------------------------------------------------------------

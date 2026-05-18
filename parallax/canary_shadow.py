@@ -138,16 +138,30 @@ def _warn_invalid_fraction_once(raw: str, reason: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _reset_invalid_dedup_sentinel() -> None:
+    """Clear the dedup sentinel so a recurring bad value re-emits a warning.
+
+    Called from the valid / unset code paths in ``get_shadow_fraction``.
+    Without this, a sequence ``bad -> good -> bad`` would warn only once,
+    hiding the second misconfiguration regression.
+    """
+    global _last_warned_invalid_raw
+    _last_warned_invalid_raw = None
+
+
 def get_shadow_fraction() -> float:
     """Return ``PARALLAX_CANARY_SHADOW_FRACTION`` parsed as float in [0.0, 1.0].
 
     Returns 0.0 on missing, malformed, out-of-range, or non-finite input.
     Logs ``canary_shadow_fraction_invalid`` only when the raw env value
     *changes* — see ``_warn_invalid_fraction_once`` — so a long-running
-    misconfiguration cannot bury other observer warnings.
+    misconfiguration cannot bury other observer warnings. The dedup
+    sentinel is cleared on every valid / unset read so a recurrence of
+    the same bad value (``bad -> good -> bad``) re-emits exactly once.
     """
     raw = os.environ.get(CANARY_SHADOW_FRACTION_ENV)
     if raw is None or raw == "":
+        _reset_invalid_dedup_sentinel()
         return 0.0
     try:
         value = float(raw)
@@ -157,6 +171,7 @@ def get_shadow_fraction() -> float:
     if not math.isfinite(value) or value < 0.0 or value > 1.0:
         _warn_invalid_fraction_once(raw, "out of range [0,1]")
         return 0.0
+    _reset_invalid_dedup_sentinel()
     return value
 
 
@@ -193,6 +208,11 @@ def observe(
         - read ``PARALLAX_CANARY_SHADOW_FRACTION``
         - if 0.0 (disabled), skip
         - else if ``random.random() >= fraction``, skip
+        - else if ``result.outcome == "skipped"``, skip — dual-read did not
+          happen for this request (flag off, ADR-007 CHANGE_TRACE bug
+          short-circuit, etc.), so it is not a canary observation. Counting
+          it would inflate the recording-rule denominator and dilute the
+          stage discrepancy_rate signal.
         - else increment attempts + outcomes counters under the stage label
     """
     try:
@@ -200,6 +220,8 @@ def observe(
         if fraction <= 0.0:
             return
         if random.random() >= fraction:
+            return
+        if result.outcome == "skipped":
             return
         stage = resolve_stage(fraction)
         _canary_attempts_counter.labels(

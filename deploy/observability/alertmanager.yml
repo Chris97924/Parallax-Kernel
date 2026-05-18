@@ -1,0 +1,42 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: deadletter
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: deadletter-critical
+      continue: false
+    - matchers:
+        - rollback_class = "auto"
+      receiver: deadletter-auto-rollback
+      continue: false
+    - matchers:
+        - trigger = "T5"
+      receiver: deadletter-t5-gate
+      continue: false
+
+receivers:
+  - name: deadletter
+    webhook_configs:
+      - url: http://127.0.0.1:9095/
+        send_resolved: true
+  - name: deadletter-critical
+    webhook_configs:
+      - url: http://127.0.0.1:9095/
+        send_resolved: true
+  - name: deadletter-auto-rollback
+    webhook_configs:
+      - url: http://127.0.0.1:9095/
+        send_resolved: true
+  - name: deadletter-t5-gate
+    webhook_configs:
+      - url: http://127.0.0.1:9095/
+        send_resolved: true
+
+inhibit_rules: []

@@ -18,6 +18,8 @@ build/
 
 # Secrets / local data
 .env
+*.env
+!*.env.example
 *.db
 db/*.db
 

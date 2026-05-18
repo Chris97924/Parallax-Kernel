@@ -17,6 +17,7 @@ from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from parallax import canary_shadow
 from parallax import retrieve as R
 from parallax.apex.audit_db import get_thread_local_audit_conn
 from parallax.injector import build_session_reminder
@@ -167,6 +168,13 @@ def _dispatch_with_router(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    # Apex M4 canary shadow observer (pure post-hoc, never raises out).
+    # See parallax/canary_shadow.py + docs/m4-prep/canary-shadow-spec.md.
+    canary_shadow.observe(
+        result,
+        user_id=user_id,
+        traffic_source=traffic_source or "natural",
+    )
     evidence = result.primary
 
     return [

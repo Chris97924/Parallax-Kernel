@@ -18,12 +18,15 @@ import importlib
 import os
 import threading
 from collections.abc import Iterator
+from typing import cast
 from unittest.mock import patch
 
+import prometheus_client
 import pytest
 
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.contracts import DualReadResult
+from parallax.router.discrepancy_live import DualReadOutcome
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,7 +47,7 @@ def _result(
 ) -> DualReadResult:
     secondary = _evidence(*secondary_ids) if secondary_ids is not None else None
     return DualReadResult(
-        outcome=outcome,  # type: ignore[arg-type]
+        outcome=cast(DualReadOutcome, outcome),
         primary=_evidence(*primary_ids),
         secondary=secondary,
         correlation_id=correlation_id,
@@ -54,23 +57,32 @@ def _result(
     )
 
 
-def _counter_value(counter, **labels) -> float:
-    """Read current value from a labelled prometheus Counter sample."""
-    metric = counter.labels(**labels)
-    return metric._value.get()  # type: ignore[attr-defined]
+def _counter_value(counter_name: str, **labels: str) -> float:
+    """Return the current value of a labelled Counter via the public API.
+
+    Uses ``prometheus_client.REGISTRY.get_sample_value`` which is the stable
+    cross-version read path for the test suite. ``counter_name`` is the
+    metric name including the ``_total`` suffix that ``Counter`` appends.
+    Returns 0.0 if the sample does not yet exist.
+    """
+    value = prometheus_client.REGISTRY.get_sample_value(counter_name, labels)
+    return 0.0 if value is None else float(value)
+
+
+_ENV = "PARALLAX_CANARY_SHADOW_FRACTION"
 
 
 @pytest.fixture(autouse=True)
 def _clean_env_and_module() -> Iterator[None]:
-    """Pop CANARY_SHADOW_FRACTION before/after each test to avoid leakage."""
-    original = os.environ.pop("CANARY_SHADOW_FRACTION", None)
+    """Pop PARALLAX_CANARY_SHADOW_FRACTION before/after each test to avoid leakage."""
+    original = os.environ.pop(_ENV, None)
     try:
         yield
     finally:
         if original is None:
-            os.environ.pop("CANARY_SHADOW_FRACTION", None)
+            os.environ.pop(_ENV, None)
         else:
-            os.environ["CANARY_SHADOW_FRACTION"] = original
+            os.environ[_ENV] = original
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +107,7 @@ def test_get_shadow_fraction_unset_returns_zero() -> None:
     ],
 )
 def test_get_shadow_fraction_valid_values(raw: str, expected: float) -> None:
-    os.environ["CANARY_SHADOW_FRACTION"] = raw
+    os.environ[_ENV] = raw
     from parallax import canary_shadow
 
     assert canary_shadow.get_shadow_fraction() == expected
@@ -103,7 +115,7 @@ def test_get_shadow_fraction_valid_values(raw: str, expected: float) -> None:
 
 @pytest.mark.parametrize("raw", ["abc", "", "-0.1", "1.5", "NaN", "inf"])
 def test_get_shadow_fraction_malformed_falls_back_to_zero(raw: str) -> None:
-    os.environ["CANARY_SHADOW_FRACTION"] = raw
+    os.environ[_ENV] = raw
     from parallax import canary_shadow
 
     assert canary_shadow.get_shadow_fraction() == 0.0
@@ -138,7 +150,7 @@ def test_observe_disabled_does_not_increment() -> None:
     from parallax import canary_shadow
 
     before_attempts = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="disabled",
         user_id="u1",
         traffic_source="natural",
@@ -147,7 +159,7 @@ def test_observe_disabled_does_not_increment() -> None:
     canary_shadow.observe(_result("match"), user_id="u1", traffic_source="natural")
 
     after_attempts = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="disabled",
         user_id="u1",
         traffic_source="natural",
@@ -165,19 +177,19 @@ def test_observe_disabled_does_not_increment() -> None:
     ["match", "diverge", "primary_only", "aphelion_unreachable", "skipped"],
 )
 def test_observe_at_full_fraction_increments_outcome(outcome: str) -> None:
-    os.environ["CANARY_SHADOW_FRACTION"] = "1.0"
+    os.environ[_ENV] = "1.0"
     from parallax import canary_shadow
 
     user = f"u-full-{outcome}"
     before_outcome = _counter_value(
-        canary_shadow._canary_outcomes_counter,
+        "parallax_canary_shadow_outcomes_total",
         stage="s4",
         outcome=outcome,
         user_id=user,
         traffic_source="natural",
     )
     before_attempts = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s4",
         user_id=user,
         traffic_source="natural",
@@ -190,14 +202,14 @@ def test_observe_at_full_fraction_increments_outcome(outcome: str) -> None:
     )
 
     after_outcome = _counter_value(
-        canary_shadow._canary_outcomes_counter,
+        "parallax_canary_shadow_outcomes_total",
         stage="s4",
         outcome=outcome,
         user_id=user,
         traffic_source="natural",
     )
     after_attempts = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s4",
         user_id=user,
         traffic_source="natural",
@@ -212,11 +224,11 @@ def test_observe_at_full_fraction_increments_outcome(outcome: str) -> None:
 
 
 def test_observe_rng_below_fraction_samples() -> None:
-    os.environ["CANARY_SHADOW_FRACTION"] = "0.5"
+    os.environ[_ENV] = "0.5"
     from parallax import canary_shadow
 
     before = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s3",
         user_id="u-rng-below",
         traffic_source="natural",
@@ -226,7 +238,7 @@ def test_observe_rng_below_fraction_samples() -> None:
         canary_shadow.observe(_result("match"), user_id="u-rng-below", traffic_source="natural")
 
     after = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s3",
         user_id="u-rng-below",
         traffic_source="natural",
@@ -235,11 +247,11 @@ def test_observe_rng_below_fraction_samples() -> None:
 
 
 def test_observe_rng_above_fraction_skips() -> None:
-    os.environ["CANARY_SHADOW_FRACTION"] = "0.5"
+    os.environ[_ENV] = "0.5"
     from parallax import canary_shadow
 
     before = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s3",
         user_id="u-rng-above",
         traffic_source="natural",
@@ -249,7 +261,7 @@ def test_observe_rng_above_fraction_skips() -> None:
         canary_shadow.observe(_result("match"), user_id="u-rng-above", traffic_source="natural")
 
     after = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s3",
         user_id="u-rng-above",
         traffic_source="natural",
@@ -264,7 +276,7 @@ def test_observe_rng_above_fraction_skips() -> None:
 
 def test_observe_swallows_internal_exception(caplog: pytest.LogCaptureFixture) -> None:
     """observe() must NOT raise even if metric backend faults."""
-    os.environ["CANARY_SHADOW_FRACTION"] = "1.0"
+    os.environ[_ENV] = "1.0"
     from parallax import canary_shadow
 
     def _boom(*_args, **_kwargs) -> None:
@@ -283,7 +295,7 @@ def test_observe_swallows_internal_exception(caplog: pytest.LogCaptureFixture) -
 
 
 def test_observe_does_not_mutate_result() -> None:
-    os.environ["CANARY_SHADOW_FRACTION"] = "1.0"
+    os.environ[_ENV] = "1.0"
     from parallax import canary_shadow
 
     result = _result("match")
@@ -305,6 +317,30 @@ def test_observe_does_not_mutate_result() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 6b. _get_or_create_counter re-raises on non-duplicate ValueError
+# ---------------------------------------------------------------------------
+
+
+def test_get_or_create_counter_reraises_unrelated_value_error() -> None:
+    """A non-duplicate ValueError must surface, not be swallowed into KeyError."""
+    from parallax import canary_shadow
+
+    sentinel = ValueError("not a duplicate timeseries error")
+
+    def _raise_unrelated(*_args: object, **_kwargs: object) -> None:
+        raise sentinel
+
+    with patch("parallax.canary_shadow.prometheus_client.Counter", side_effect=_raise_unrelated):
+        with pytest.raises(ValueError) as excinfo:
+            canary_shadow._get_or_create_counter(
+                "parallax_canary_shadow_not_registered_metric",
+                "doc",
+                ["label_a"],
+            )
+        assert excinfo.value is sentinel
+
+
+# ---------------------------------------------------------------------------
 # 7. Module re-import idempotent
 # ---------------------------------------------------------------------------
 
@@ -323,12 +359,12 @@ def test_module_reimport_does_not_crash() -> None:
 
 
 def test_observe_concurrent_threads_consistent() -> None:
-    os.environ["CANARY_SHADOW_FRACTION"] = "1.0"
+    os.environ[_ENV] = "1.0"
     from parallax import canary_shadow
 
     user = "u-concurrent"
     before = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s4",
         user_id=user,
         traffic_source="natural",
@@ -345,7 +381,7 @@ def test_observe_concurrent_threads_consistent() -> None:
         t.join()
 
     after = _counter_value(
-        canary_shadow._canary_attempts_counter,
+        "parallax_canary_shadow_attempts_total",
         stage="s4",
         user_id=user,
         traffic_source="natural",

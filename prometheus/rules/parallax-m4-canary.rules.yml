@@ -116,7 +116,7 @@ groups:
       # Canary Shadow Observer (Apex M4 GATE 3-7 pre-req).
       # Driven by `parallax/canary_shadow.py` — a post-`DualReadRouter`
       # observation overlay that samples completed dual-read results into
-      # stage-labelled counters. Stage advances via CANARY_SHADOW_FRACTION
+      # stage-labelled counters. Stage advances via PARALLAX_CANARY_SHADOW_FRACTION
       # env var (0.0 / 0.01 / 0.10 / 0.50 / 1.00 → disabled/s1/s2/s3/s4).
       # Spec: docs/m4-prep/canary-shadow-spec.md
       # ---------------------------------------------------------------

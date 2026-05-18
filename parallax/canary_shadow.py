@@ -7,7 +7,7 @@ in parallel on every request and classifies the outcome
 (``match | diverge | primary_only | aphelion_unreachable | skipped``).
 
 What this module adds: a per-request RNG gate driven by
-``CANARY_SHADOW_FRACTION`` that samples a subset of completed dual-read
+``PARALLAX_CANARY_SHADOW_FRACTION`` that samples a subset of completed dual-read
 results into stage-labelled Prometheus counters. This lets alertmanager
 target ``parallax_canary_shadow_discrepancy_rate{stage="s1"}`` (the 1%
 observation subset) instead of the global ``parallax_dual_read_discrepancy_rate``,
@@ -16,7 +16,7 @@ which is the actual M4 GATE 3-7 ACK semantic.
 Stage mapping (resolved from the env value, not request-time RNG):
 
 ==============  ==========================  =====================
-Stage           CANARY_SHADOW_FRACTION      M4 GATE
+Stage           PARALLAX_CANARY_SHADOW_FRACTION   M4 GATE
 ==============  ==========================  =====================
 disabled        0.0                         observer off
 s1              (0.0, 0.01]                 GATE 3 entry (1%)
@@ -57,7 +57,10 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-CANARY_SHADOW_FRACTION_ENV: Final[str] = "CANARY_SHADOW_FRACTION"
+# Project-wide env var prefix is ``PARALLAX_`` (see PARALLAX_AUDIT_DB_PATH,
+# PARALLAX_SPLIT_IMPLEMENTED, etc.). Keeping the prefix lets operators run
+# ``env | grep PARALLAX_`` to see the full canary state in one shot.
+CANARY_SHADOW_FRACTION_ENV: Final[str] = "PARALLAX_CANARY_SHADOW_FRACTION"
 
 CanaryStage = Literal["disabled", "s1", "s2", "s3", "s4"]
 
@@ -80,7 +83,13 @@ def _get_or_create_counter(
     try:
         return prometheus_client.Counter(name, documentation, labelnames)
     except ValueError:
-        return prometheus_client.REGISTRY._names_to_collectors[name + "_total"]  # type: ignore[return-value]
+        # Re-raise unless this is the DuplicatedTimeseries case we expect.
+        # (``Counter`` also raises ``ValueError`` for malformed names; we do
+        # not want to mask that into a confusing ``KeyError`` below.)
+        collectors = prometheus_client.REGISTRY._names_to_collectors  # type: ignore[attr-defined]
+        if name + "_total" not in collectors:
+            raise
+        return collectors[name + "_total"]  # type: ignore[return-value]
 
 
 _canary_attempts_counter = _get_or_create_counter(
@@ -102,7 +111,7 @@ _canary_outcomes_counter = _get_or_create_counter(
 
 
 def get_shadow_fraction() -> float:
-    """Return ``CANARY_SHADOW_FRACTION`` parsed as float in [0.0, 1.0].
+    """Return ``PARALLAX_CANARY_SHADOW_FRACTION`` parsed as float in [0.0, 1.0].
 
     Returns 0.0 on missing, malformed, out-of-range, or non-finite input.
     Logs a warning on the first malformed value so the operator notices.
@@ -157,7 +166,7 @@ def observe(
     backend fault) is logged and swallowed.
 
     Sampling rule:
-        - read ``CANARY_SHADOW_FRACTION``
+        - read ``PARALLAX_CANARY_SHADOW_FRACTION``
         - if 0.0 (disabled), skip
         - else if ``random.random() >= fraction``, skip
         - else increment attempts + outcomes counters under the stage label
@@ -181,8 +190,12 @@ def observe(
             traffic_source=traffic_source,
         ).inc()
     except Exception as exc:  # noqa: BLE001 - observer must never bubble up
+        # exc_info=True preserves the stack trace so a metric-backend fault
+        # is diagnosable from the log alone; the swallow is what the spec
+        # asks for, not the silence.
         _log.warning(
             "canary_shadow_observe_failed: %s",
             exc,
+            exc_info=True,
             extra={"event": "canary_shadow_observe_failed", "error": str(exc)},
         )

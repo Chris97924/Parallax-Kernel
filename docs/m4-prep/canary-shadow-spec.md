@@ -19,7 +19,7 @@ Solution: a tiny post-`DualReadRouter` hook that, for a configurable fraction of
 
 ## 3. Stage mapping
 
-| Stage      | `CANARY_SHADOW_FRACTION` range | M4 GATE          |
+| Stage      | `PARALLAX_CANARY_SHADOW_FRACTION` range | M4 GATE          |
 |------------|--------------------------------|------------------|
 | `disabled` | exactly `0.0`                  | observer off     |
 | `s1`       | `(0.0, 0.01]`                  | GATE 3 entry     |
@@ -69,7 +69,7 @@ Not bundled in this change. Defer to the next ZenBook deploy window after the M5
 
 ```bash
 # 1. /etc/parallax/canary.env (chmod 600 chris:chris)
-CANARY_SHADOW_FRACTION=0.0
+PARALLAX_CANARY_SHADOW_FRACTION=0.0
 
 # 2. ~/.config/systemd/user/parallax-server.service.d/canary.conf
 [Service]
@@ -89,14 +89,14 @@ docker compose kill -s HUP prometheus
 Stage advance is a single `sed` + `systemctl restart` (≤ 10s downtime, well inside the 30s rollback window required by `m4-m5-readiness-spec.md`):
 
 ```bash
-sudo sed -i 's/^CANARY_SHADOW_FRACTION=.*/CANARY_SHADOW_FRACTION=0.01/' /etc/parallax/canary.env
+sudo sed -i 's/^PARALLAX_CANARY_SHADOW_FRACTION=.*/PARALLAX_CANARY_SHADOW_FRACTION=0.01/' /etc/parallax/canary.env
 sudo systemctl restart parallax-server.service
 ```
 
 Rollback to disabled:
 
 ```bash
-sudo sed -i 's/^CANARY_SHADOW_FRACTION=.*/CANARY_SHADOW_FRACTION=0.0/' /etc/parallax/canary.env
+sudo sed -i 's/^PARALLAX_CANARY_SHADOW_FRACTION=.*/PARALLAX_CANARY_SHADOW_FRACTION=0.0/' /etc/parallax/canary.env
 sudo systemctl restart parallax-server.service
 ```
 
@@ -105,7 +105,7 @@ sudo systemctl restart parallax-server.service
 1. `observe()` MUST NOT mutate the supplied `DualReadResult`. (The dataclass is frozen but defence-in-depth applies.)
 2. `observe()` MUST NOT raise out. Internal exceptions are logged and swallowed.
 3. `observe()` MUST NOT register new collectors at call time; collectors are module-scope and re-import safe via `_get_or_create_counter`.
-4. Failure to parse `CANARY_SHADOW_FRACTION` MUST log `event=canary_shadow_fraction_invalid` and fall back to `0.0` (disabled).
+4. Failure to parse `PARALLAX_CANARY_SHADOW_FRACTION` MUST log `event=canary_shadow_fraction_invalid` and fall back to `0.0` (disabled).
 5. The fraction value is the **configured rollout sampling rate**, not a per-user determinism gate. Stage advance is driven by the env var; per-request gating is `random.random() < fraction`. Sticky-per-user sampling is YAGNI in v0.1; revisit if Stage 5 introduces user-targeted canaries.
 
 ## 9. Non-goals

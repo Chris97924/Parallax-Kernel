@@ -107,7 +107,23 @@ The binary emits one structured log line per failure with `event=parallax_ingest
 | `reason_code=pkg.idempotency_duplicate` exit 70 | UUID v4 collision on `envelope_message_id` (1 in 2^122 — if you see it twice, something is wrong) | file a bug; do NOT retry blindly |
 | Hung process (no log, no exit) | WAL checkpoint stall under contention | check for other writers holding `audit.db`: `lsof $PARALLAX_AUDIT_DB_PATH` (Linux) or `handle.exe $PARALLAX_AUDIT_DB_PATH` (Windows). M6 is single-instance only — see §3 |
 
-When a write fails at any point in `_write_batch`, the entire batch is rejected via `ParallaxIngestError`, and the M5 §4.7 write-order fence guarantees that NO partial-batch rows survive — the failure is atomic at the package level.
+**Partial-batch caveat (operator-critical)**: phase [8] of the pipeline (`_write_batch` in [aphelion_ingest.py:569-597](../../parallax/apex/aphelion_ingest.py)) is **not atomic at the batch level**. Each row goes through its own `BEGIN IMMEDIATE` → `INSERT` → `COMMIT` via `write_audit_row` ([audit_db.py:514-590](../../parallax/apex/audit_db.py)). If row N raises mid-batch, rows 1..N-1 are **already committed** to `audit.db` even though the ingest invocation exits with `ParallaxIngestError` for row N. The M5 §4.7 write-order fence is per-row, NOT per-package — see impl-spec §5.3 + §9.10 for the binary follow-up.
+
+**Recovery on phase-[8] mid-batch failure**:
+
+1. Inspect the failing log line: `reason_code`, `package_path`, `package_id` (the package_id appears in the structured-log `extra` dict).
+2. Query the audit DB for how many rows already landed:
+   ```
+   sqlite3 $PARALLAX_AUDIT_DB_PATH \
+     "SELECT COUNT(*) FROM audit_row WHERE package_id = '<package_id>';"
+   ```
+3. Compare against `manifest["claims"]` length inside the package (`tar -tf <pkg>.aphelion.tar | grep claims/`). If the DB count < manifest count → partial batch exists.
+4. **Do NOT re-run `parallax ingest` blindly** — re-ingest produces fresh `envelope_message_id` UUIDs, so all claims get a second audit row (the existing N-1 rows are NOT updated; you would end up with N-1 + N rows total, not N).
+5. Decide based on operational needs:
+   - **If audit chain must reflect the full package**: manually `DELETE FROM audit_row WHERE package_id = '<package_id>'` (preserve a backup first), then re-ingest cleanly. Append-only invariant is broken at this step; document the manual repair.
+   - **If partial chain is acceptable**: leave the N-1 rows in place; the missing claims simply have no audit record. Downstream `AphelionReadAdapter` will not surface them.
+
+This partial-batch behaviour is tracked as a binary follow-up at impl-spec §9.10 — when the recommended fix lands (wrap `_write_batch` in a single transaction), this section can be reduced back to "the failure is atomic at the package level".
 
 ### 2.3 Tar corrupt / unpack safety violations
 

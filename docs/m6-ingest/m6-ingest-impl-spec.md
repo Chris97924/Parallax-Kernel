@@ -223,7 +223,7 @@ A rejection produced inside `_verify_trust` propagates to a `ParallaxIngestError
 
 ### 5.3 Pipeline phase states (internal, not persisted)
 
-Conceptually the ingest pipeline traverses these phases per invocation; failure at any phase is terminal (no partial commit):
+Conceptually the ingest pipeline traverses these phases per invocation:
 
 ```
 [1] env+path gates           (§3 + §5.2 gates 1-6 + gates 7-9 trust-dir)
@@ -237,7 +237,11 @@ Conceptually the ingest pipeline traverses these phases per invocation; failure 
 [9] structured log success   (parallax_ingest_succeeded)
 ```
 
-Per contract §2 I-2.3, the pipeline is atomic across [1]-[9]: any error at any phase → ZERO audit rows persisted for that package (the M5 write-order fence at §4.7 ensures partial-batch persistence is structurally impossible).
+**Atomicity is per-phase, not per-package.** Phases [1]-[7] are read-only or in-memory only, so a failure at any of them leaves `audit.db` byte-identical to its pre-invocation state — partial-success is structurally impossible up to and including the canonicalize step. Per contract §2 I-2.3, this matches the "verify-or-reject" contract for the verification pipeline.
+
+Phase [8] is **not atomic at the batch level.** `_write_batch` ([aphelion_ingest.py:569-597](../../parallax/apex/aphelion_ingest.py)) iterates rows one at a time, calling `write_audit_row` per row. `write_audit_row` ([audit_db.py:514-590](../../parallax/apex/audit_db.py)) wraps each INSERT in its own `BEGIN IMMEDIATE` → `INSERT` → `COMMIT` against an autocommit-state connection — the M5 §4.7 write-order fence is **per row**, not per batch. If row N raises `AuditDbWriteError` / `PermissionError` / `sqlite3.IntegrityError`, rows 1..N-1 are **already committed** and survive in `audit.db`; only row N's own transaction is rolled back. The ingest invocation then exits with the `ParallaxIngestError` for row N, and the caller observes `IngestReport`-less failure even though some audit rows from that package_id are now persisted.
+
+Operators MUST treat phase-[8] mid-batch failures as **partial-write**, not as atomic rollback — see the runbook §2.2 recovery section. The structural-impossibility-of-partial-batch language in earlier drafts was wrong and has been removed. This is tracked as a binary follow-up at §9.10 (proposed fix: wrap `_write_batch` in a single `BEGIN IMMEDIATE` so the M5 per-row fence escalates to a per-batch fence).
 
 ---
 
@@ -340,6 +344,16 @@ The defensive guard at [parallax/cli.py:1046-1064](../../parallax/cli.py) only f
 ### 9.9 `cli.py:1064` `SystemExit(70)` + `reason_code=disk.audit_db_unset` binary inconsistency
 
 At [parallax/cli.py:1051-1064](../../parallax/cli.py) the `--audit-db + --dry-run + parallax-kernel/db` guard emits a structured log line tagged `reason_code=disk.audit_db_unset` but raises `SystemExit(70)`. Per §4.2 and the `_REASON_TO_EXIT` mapping at [aphelion_ingest.py:112](../../parallax/apex/aphelion_ingest.py), `disk.audit_db_unset` should map to exit 78 (`EX_CONFIG`), not 70 (`EX_SOFTWARE`). The combination is a binary-level inconsistency: an operator who reads the log expects exit 78, but the actual process exit is 70. **Follow-up**: open a separate GitHub issue against the implementation to either (a) change the exit code to 78 (matches the map), or (b) introduce a new reason code such as `disk.audit_db_path_invalid` mapped to 70. This doc PR does NOT modify the implementation per the doc-only retrofit scope.
+
+### 9.10 Phase-[8] partial-batch persistence (codex round-2 finding)
+
+`_write_batch` ([aphelion_ingest.py:569-597](../../parallax/apex/aphelion_ingest.py)) iterates audit rows one at a time, calling `write_audit_row` ([audit_db.py:514-590](../../parallax/apex/audit_db.py)) per row. `write_audit_row` wraps each INSERT in its own `BEGIN IMMEDIATE` / `COMMIT` against an autocommit-state connection. Consequence: if row N raises mid-batch, rows 1..N-1 are already committed and survive in `audit.db`; the M5 §4.7 write-order fence is **per row**, not per package. The ingest invocation then exits with the row-N `ParallaxIngestError`, and the operator sees a "failed ingest" log line even though some audit rows for that `package_id` are now persisted.
+
+The contract spec §2 I-2.3 said "partial-success is rejected" but the scope of that invariant covers verify_package phases [1]-[6] only — the contract did not specify atomic-batch semantics for the audit-write phase. The implementation honours the contract; the over-claim was in the impl spec's earlier draft of §5.3 (now fixed). The runbook §2.2 carries the operator-side recovery procedure for partial-batch scenarios.
+
+**Recommended binary fix** (separate implementation PR, NOT this doc PR): wrap the row loop in `_write_batch` inside a single `BEGIN IMMEDIATE` / `COMMIT` so the per-row `write_audit_row` calls run inside a parent transaction; any row failure would then rollback the entire batch. This is a small surgical change but requires careful handling of `write_audit_row`'s precondition check (`conn.in_transaction must be False`) at [audit_db.py:539](../../parallax/apex/audit_db.py) — likely the cleanest path is a new sibling helper `write_audit_rows_atomic(conn, rows)` rather than mutating the per-row contract.
+
+Credit: codex round-2 review on PR #61 flagged this as P2 (2× same-finding inline comments on impl-spec §5.3 line 240).
 
 ---
 

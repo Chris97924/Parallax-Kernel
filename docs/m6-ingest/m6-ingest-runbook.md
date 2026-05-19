@@ -70,7 +70,8 @@ What runs, in order (the impl-spec §5.3 phase list):
 | 9 | Structured-log success: `event=parallax_ingest_succeeded`, `package_id`, `claim_count`, `audit_rows_written`, `signer_id`, `elapsed_ms` | `aphelion_ingest.ingest_package` (tail) |
 
 On success: exit 0, one log line, one or more rows in `audit.db`.
-On failure at any phase: exit ∈ {65, 70, 71, 78}, one structured-log error line, ZERO partial rows persisted.
+
+On failure: exit ∈ {65, 70, 71, 78}, one structured-log error line. Failure at phases [1]-[7] is atomic — `audit.db` is byte-identical to its pre-invocation state. Failure during phase [8] is **not** atomic at the batch level: rows committed before the failing row stay persisted in `audit.db` (see §2.2 partial-batch recovery and impl-spec §5.3 + §9.10).
 
 ### 1.3 Verifying a successful ingest
 

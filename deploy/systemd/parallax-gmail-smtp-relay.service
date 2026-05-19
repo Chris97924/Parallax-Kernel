@@ -1,6 +1,14 @@
 [Unit]
 Description=Parallax Alertmanager -> Gmail SMTP relay
 After=network.target
+# Stop crash-loop if any required env (GMAIL_SMTP_USER /
+# GMAIL_SMTP_APP_PASSWORD / GMAIL_SMTP_TO) is missing — 3 failures in
+# 30s puts the unit into `failed` state so `systemctl --user status`
+# makes the root cause obvious without filling journald. These two
+# directives belong in [Unit] (since systemd 230); placing them in
+# [Service] is silently ignored on systemd >= 255.
+StartLimitBurst=3
+StartLimitIntervalSec=30s
 
 [Service]
 Type=simple
@@ -11,12 +19,6 @@ EnvironmentFile=%h/parallax-kernel/scripts/gmail-smtp-relay.env
 ExecStart=/usr/bin/python3 %h/parallax-kernel/scripts/gmail-smtp-relay.py
 Restart=on-failure
 RestartSec=3s
-# Stop crash-loop if any required env (GMAIL_SMTP_USER /
-# GMAIL_SMTP_APP_PASSWORD / GMAIL_SMTP_TO) is missing — 3 failures in
-# 30s puts the unit into `failed` state so `systemctl --user status`
-# makes the root cause obvious without filling journald.
-StartLimitBurst=3
-StartLimitIntervalSec=30s
 StandardOutput=journal
 StandardError=journal
 

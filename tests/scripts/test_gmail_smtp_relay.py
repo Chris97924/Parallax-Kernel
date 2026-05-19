@@ -154,6 +154,44 @@ def test_render_email_subject_trimmed_to_max(relay: ModuleType) -> None:
     assert len(subject) <= relay.SUBJECT_MAX
 
 
+def test_render_email_subject_strips_crlf_from_summary(relay: ModuleType) -> None:
+    """Newlines in commonAnnotations.summary must be collapsed; otherwise
+    ``EmailMessage["Subject"] = subject`` raises ValueError in stdlib."""
+    payload = _firing_payload()
+    payload["commonAnnotations"]["summary"] = "line one\nline two\r\nline three\tcol"
+    subject, _ = relay.render_email(payload)
+    assert "\n" not in subject
+    assert "\r" not in subject
+    assert "\t" not in subject
+    assert "line one line two line three col" in subject
+
+
+def test_render_email_subject_strips_crlf_from_alertname_and_severity(
+    relay: ModuleType,
+) -> None:
+    payload = _firing_payload()
+    payload["commonLabels"]["alertname"] = "weird\rname"
+    payload["commonLabels"]["severity"] = "crit\nical"
+    subject, _ = relay.render_email(payload)
+    assert "\n" not in subject
+    assert "\r" not in subject
+
+
+def test_build_message_accepts_subject_built_from_multiline_payload(
+    relay: ModuleType, cfg: Any
+) -> None:
+    """Round-trip: the subject produced by render_email must always be
+    assignable to ``EmailMessage["Subject"]`` without ValueError, regardless
+    of how badly the upstream payload is formatted."""
+    payload = _firing_payload()
+    payload["commonAnnotations"]["summary"] = "burst\nof\nnewlines\rwith CR"
+    subject, body = relay.render_email(payload)
+    # If render_email did its job, this assignment does not raise.
+    msg = relay.build_message(cfg, subject, body)
+    assert "\n" not in msg["Subject"]
+    assert "\r" not in msg["Subject"]
+
+
 def test_render_email_body_lists_each_alert_and_common_labels(relay: ModuleType) -> None:
     payload = _firing_payload(alert_count=3, severity="warning")
     _, body = relay.render_email(payload)
@@ -761,6 +799,44 @@ def test_systemd_unit_points_at_relay_script() -> None:
     # %h keeps the unit portable; a hardcoded /home/<name> would be a regression.
     assert "%h/" in unit
     assert "/home/chris/" not in unit
+
+
+def test_systemd_unit_places_start_limits_in_unit_section() -> None:
+    """``StartLimitBurst`` / ``StartLimitIntervalSec`` belong in [Unit].
+
+    systemd >= 230 reads these from the [Unit] section. Placing them in
+    [Service] silently no-ops on systemd >= 255 (verified by
+    `systemd-analyze verify`), which would defeat the crash-loop cap that
+    is the entire reason we set them.
+    """
+    unit = (REPO_ROOT / "deploy" / "systemd" / "parallax-gmail-smtp-relay.service").read_text(
+        encoding="utf-8"
+    )
+
+    # Split into ini-style sections by lines that start with "[".
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in unit.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped[1:-1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+
+    unit_lines = sections.get("Unit", [])
+    service_lines = sections.get("Service", [])
+
+    def _has_directive(lines: list[str], key: str) -> bool:
+        return any(ln.strip().startswith(f"{key}=") for ln in lines)
+
+    assert _has_directive(unit_lines, "StartLimitBurst"), "StartLimitBurst must be in [Unit]"
+    assert _has_directive(
+        unit_lines, "StartLimitIntervalSec"
+    ), "StartLimitIntervalSec must be in [Unit]"
+    # And NOT duplicated into [Service] (where systemd >=255 silently ignores them).
+    assert not _has_directive(service_lines, "StartLimitBurst")
+    assert not _has_directive(service_lines, "StartLimitIntervalSec")
 
 
 def test_alertmanager_config_registers_gmail_smtp_receiver() -> None:

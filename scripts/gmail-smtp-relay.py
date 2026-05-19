@@ -118,6 +118,18 @@ def _trim(value: str, limit: int) -> str:
     return value[: max(0, limit - 1)] + "…"
 
 
+def _single_line(value: str) -> str:
+    """Collapse any CR/LF/tab whitespace into single spaces.
+
+    Required for anything that becomes an RFC 5322 header value:
+    ``EmailMessage["Subject"] = "...\\n..."`` raises ``ValueError``
+    (header injection guard in stdlib). Alertmanager annotations are
+    free-form text and frequently contain embedded newlines, so the
+    subject pipeline must normalize before assignment.
+    """
+    return " ".join(value.split())
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     """Return ``value`` if it is a dict; otherwise an empty dict.
 
@@ -131,14 +143,16 @@ def _as_dict(value: Any) -> dict[str, Any]:
 def _format_subject(payload: dict[str, Any]) -> str:
     common_labels = _as_dict(payload.get("commonLabels"))
     common_annotations = _as_dict(payload.get("commonAnnotations"))
-    status = str(payload.get("status", "firing")).upper()
-    severity = str(common_labels.get("severity", "info"))
-    alertname = str(common_labels.get("alertname", "unknown"))
-    summary = str(common_annotations.get("summary", "") or "")
+    status = _single_line(str(payload.get("status", "firing"))).upper()
+    severity = _single_line(str(common_labels.get("severity", "info")))
+    alertname = _single_line(str(common_labels.get("alertname", "unknown")))
+    summary = _single_line(str(common_annotations.get("summary", "") or ""))
     base = f"[{status}][{severity}] {alertname}"
     if summary:
         base = f"{base} - {summary}"
-    return _trim(base, SUBJECT_MAX)
+    # _single_line on each component already strips CR/LF, but recombine
+    # defensively so a future edit can't reintroduce a newline path.
+    return _trim(_single_line(base), SUBJECT_MAX)
 
 
 def _format_alert_block(alert: dict[str, Any]) -> str:

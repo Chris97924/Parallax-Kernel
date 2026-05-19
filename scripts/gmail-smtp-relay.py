@@ -218,10 +218,18 @@ def render_email(payload: dict[str, Any]) -> tuple[str, str]:
 
 
 def build_message(cfg: RelayConfig, subject: str, body: str) -> EmailMessage:
+    """Build an :class:`EmailMessage`.
+
+    Defense-in-depth: sanitize ``subject`` here even though ``_format_subject``
+    already collapses CR/LF — direct callers (tests, future code paths) might
+    forget. ``EmailMessage["Subject"] = value`` with embedded CR/LF raises
+    ``ValueError`` in stdlib's header-injection guard; sanitizing at the
+    assignment site closes that failure mode for every call path.
+    """
     msg = EmailMessage()
     msg["From"] = cfg.smtp_user
     msg["To"] = cfg.smtp_to
-    msg["Subject"] = subject
+    msg["Subject"] = _single_line(subject)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain="parallax-alertmanager-relay")
     msg["X-Mailer"] = "parallax-alertmanager-gmail-smtp-relay/1.0"

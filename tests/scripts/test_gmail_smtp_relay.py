@@ -312,6 +312,19 @@ def test_build_message_sets_headers_and_body(relay: ModuleType, cfg: Any) -> Non
     assert msg.get_content().strip() == "body text"
 
 
+def test_build_message_sanitizes_crlf_in_subject_when_called_directly(
+    relay: ModuleType, cfg: Any
+) -> None:
+    """Defense in depth: build_message must not raise ValueError when a
+    caller hands it a subject with embedded CR/LF (bypassing
+    ``_format_subject``). Stdlib normally rejects such headers."""
+    msg = relay.build_message(cfg, "first line\nsecond line\r\nthird\ttab", "ok\n")
+    assert "\n" not in msg["Subject"]
+    assert "\r" not in msg["Subject"]
+    assert "\t" not in msg["Subject"]
+    assert msg["Subject"] == "first line second line third tab"
+
+
 # ---------------------------------------------------------------------------
 # SMTP send (mock smtplib.SMTP) — instance state is per-test, owned by the
 # ``smtp_recorder`` fixture so parallel test runners cannot collide.

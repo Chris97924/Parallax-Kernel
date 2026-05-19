@@ -132,6 +132,12 @@ route:
 `continue: true` on the first match makes the alert fall through to
 gmail-smtp as well.
 
+> The `gmail-smtp` receiver sets `max_alerts: 50` so Alertmanager will
+> split a larger group into multiple webhook POSTs rather than send one
+> oversized payload. The relay caps incoming bodies at 1 MiB; without
+> `max_alerts`, a high-fanout group would 413 and Alertmanager would
+> treat that as non-retryable, silently dropping the page.
+
 ## Smoke test
 
 With the relay running, drop a synthetic alert directly into the relay

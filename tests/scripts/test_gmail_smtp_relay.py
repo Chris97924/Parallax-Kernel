@@ -858,3 +858,40 @@ def test_alertmanager_config_registers_gmail_smtp_receiver() -> None:
     )
     assert "name: gmail-smtp" in cfg_text
     assert "http://127.0.0.1:9096/" in cfg_text
+
+
+def test_alertmanager_gmail_smtp_receiver_caps_max_alerts() -> None:
+    """The gmail-smtp webhook receiver MUST set ``max_alerts``.
+
+    Without it, Alertmanager defaults to 0 (unlimited) and bundles every
+    grouped alert into one POST. A high-fanout group could exceed the
+    relay's 1 MiB MAX_BODY_BYTES cap, the relay would return HTTP 413,
+    and Alertmanager treats 4xx as non-retryable — silently dropping the
+    page. The cap must be present and well below the byte budget.
+    """
+    cfg_text = (REPO_ROOT / "deploy" / "observability" / "alertmanager.yml").read_text(
+        encoding="utf-8"
+    )
+    # Find the gmail-smtp receiver block and inspect it line-by-line.
+    lines = cfg_text.splitlines()
+    gmail_block_lines: list[str] = []
+    in_block = False
+    for line in lines:
+        if line.strip() == "- name: gmail-smtp":
+            in_block = True
+            continue
+        if in_block:
+            # Next receiver or top-level key ends the block
+            if line.startswith("  - name:") or (line and not line.startswith(" ")):
+                break
+            gmail_block_lines.append(line)
+    block = "\n".join(gmail_block_lines)
+    assert "max_alerts:" in block, "gmail-smtp receiver must set max_alerts"
+    # Extract the value and sanity check the range.
+    cap = None
+    for ln in gmail_block_lines:
+        s = ln.strip()
+        if s.startswith("max_alerts:"):
+            cap = int(s.split(":", 1)[1].strip())
+    assert cap is not None
+    assert 1 <= cap <= 200, f"max_alerts={cap} is outside the safe range"

@@ -38,5 +38,22 @@ receivers:
     webhook_configs:
       - url: http://127.0.0.1:9095/
         send_resolved: true
+  # Gmail SMTP relay (host-local on 127.0.0.1:9096, see
+  # scripts/gmail-smtp-relay.py + deploy/systemd/parallax-gmail-smtp-relay.service).
+  # Not yet referenced from `route` — wire in after Chris validates the
+  # first end-to-end send on the ZenBook deploy.
+  #
+  # max_alerts: cap the per-webhook batch so a high-fanout group cannot
+  # exceed the relay's 1 MiB MAX_BODY_BYTES cap. Alertmanager defaults to
+  # 0 (unlimited); leaving it unset risks an oversized POST being rejected
+  # with HTTP 413 — which Alertmanager's notify.Retrier treats as
+  # non-retryable, silently dropping the page. 50 alerts × ~2 KiB each is
+  # comfortably under the relay cap. Alertmanager will split larger
+  # groups into multiple webhook POSTs.
+  - name: gmail-smtp
+    webhook_configs:
+      - url: http://127.0.0.1:9096/
+        send_resolved: true
+        max_alerts: 50
 
 inhibit_rules: []

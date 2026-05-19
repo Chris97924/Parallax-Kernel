@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import smtplib
+import ssl
 import sys
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -243,10 +244,21 @@ def send_email(cfg: RelayConfig, msg: EmailMessage) -> dict[str, tuple[int, byte
     Returns the dict of partially-refused recipients (empty when all
     recipients were accepted). Callers should treat a non-empty dict as
     a delivery failure for retry purposes.
+
+    TLS posture: we pass ``ssl.create_default_context()`` explicitly to
+    ``starttls()``. Calling ``starttls()`` with no argument is unsafe on
+    Python 3.12+ because ``smtplib`` falls back to
+    ``ssl._create_stdlib_context()``, which disables both certificate
+    verification (``CERT_NONE``) and hostname checking — letting an
+    on-path attacker between us and ``smtp.gmail.com:587`` strip TLS
+    and capture the Gmail App Password during ``login()``. The default
+    context returned here enforces ``CERT_REQUIRED`` and matches the
+    server hostname against the system trust store.
     """
+    tls_context = ssl.create_default_context()
     with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=cfg.smtp_timeout_sec) as smtp:
         smtp.ehlo()
-        smtp.starttls()
+        smtp.starttls(context=tls_context)
         # Second EHLO is required by RFC 3207 so the server re-advertises
         # its capabilities (notably AUTH) over the now-encrypted channel.
         smtp.ehlo()

@@ -22,6 +22,7 @@ import importlib.util
 import io
 import json
 import smtplib
+import ssl
 import sys
 from email.message import EmailMessage
 from pathlib import Path
@@ -368,8 +369,10 @@ class _SMTPRecorder:
         self.calls.append(("ehlo", ()))
         self._maybe_raise("ehlo")
 
-    def starttls(self) -> None:
-        self.calls.append(("starttls", ()))
+    def starttls(self, *args: Any, **kwargs: Any) -> None:
+        # Capture both positional and keyword forms so tests can verify
+        # the relay passes a verifying SSL context.
+        self.calls.append(("starttls", (args, kwargs)))
         self._maybe_raise("starttls")
 
     def login(self, user: str, password: str) -> None:
@@ -465,6 +468,35 @@ def test_send_email_propagates_smtp_auth_error(
     msg = relay.build_message(cfg, "hi", "ok\n")
     with pytest.raises(smtplib.SMTPAuthenticationError):
         relay.send_email(cfg, msg)
+
+
+def test_send_email_passes_verifying_tls_context_to_starttls(
+    relay: ModuleType, cfg: Any, smtp_recorder: _SMTPHarness
+) -> None:
+    """Critical: starttls() must receive a context with cert verification
+    enabled.
+
+    Calling ``smtp.starttls()`` with no argument falls back to
+    ``ssl._create_stdlib_context()`` on Python 3.12+, which disables
+    both certificate verification (``CERT_NONE``) and hostname checking
+    — letting an on-path attacker strip TLS and capture the App Password
+    during ``login()``. The relay must pass ``ssl.create_default_context()``
+    (or equivalent) explicitly.
+    """
+    msg = relay.build_message(cfg, "hi", "ok\n")
+    relay.send_email(cfg, msg)
+
+    rec = smtp_recorder[0]
+    starttls_calls = [c for c in rec.calls if c[0] == "starttls"]
+    assert len(starttls_calls) == 1
+    args, kwargs = starttls_calls[0][1]
+    # The context arrives via the ``context=`` keyword arg.
+    context = kwargs.get("context")
+    if context is None and args:
+        context = args[0]
+    assert isinstance(context, ssl.SSLContext), "starttls() must be called with an ssl.SSLContext"
+    assert context.verify_mode == ssl.CERT_REQUIRED, "TLS context must require certs"
+    assert context.check_hostname is True, "TLS context must check hostnames"
 
 
 def test_send_email_returns_refused_recipients_when_partial_delivery(

@@ -38,5 +38,13 @@ receivers:
     webhook_configs:
       - url: http://127.0.0.1:9095/
         send_resolved: true
+  # Gmail SMTP relay (host-local on 127.0.0.1:9096, see
+  # scripts/gmail-smtp-relay.py + deploy/systemd/parallax-gmail-smtp-relay.service).
+  # Not yet referenced from `route` — wire in after Chris validates the
+  # first end-to-end send on the ZenBook deploy.
+  - name: gmail-smtp
+    webhook_configs:
+      - url: http://127.0.0.1:9096/
+        send_resolved: true
 
 inhibit_rules: []

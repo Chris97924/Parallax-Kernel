@@ -1043,25 +1043,39 @@ def _cmd_ingest(
             )
             return 78  # EX_CONFIG
 
-    # Defensive --audit-db guard (P2 backlog #5): reject production DB path
-    # when --audit-db is set AND --dry-run is active.  Protects against
-    # accidental writes to the production DB during test/dry-run invocations.
-    if audit_db_override is not None and dry_run:
-        if "parallax-kernel/db" in str(audit_db_path):
-            _log.error(
-                "parallax_ingest_failed",
-                extra={
-                    "event": "parallax_ingest_failed",
-                    "reason_code": "disk.audit_db_unset",
-                    "package_path": pkg_path_str,
-                    "signer_id": "",
-                    "underlying": (
-                        f"production audit.db rejected by --db guard: "
-                        f"{audit_db_path}"
-                    ),
-                },
-            )
-            raise SystemExit(70)
+    # Defensive --audit-db guard (issues #63 + #64): when --audit-db is set,
+    # reject any override path containing the ``parallax-kernel/db`` substring
+    # *unconditionally* — including outside --dry-run. The previous
+    # dry-run-scoped guard left plain ``parallax ingest <pkg> --audit-db
+    # /home/chris/parallax-kernel/db/audit.db`` invocations unprotected against
+    # operator typos that would have written live ingest rows into the
+    # production audit DB. ``--audit-db`` is documented as a testing override
+    # in the impl spec, so blocking the production-DB path under any usage is
+    # consistent with intent. The reason_code is ``disk.audit_db_unsafe_path``
+    # mapped to exit 78 (EX_CONFIG) via _REASON_TO_EXIT, so the structured-log
+    # tag and the process exit agree (was the binary inconsistency at #64).
+    # ``as_posix()`` normalizes path separators so the substring guard
+    # is portable across Windows (which renders forward slashes as
+    # backslashes via ``str(Path(...))``) and POSIX hosts. Matters for
+    # the test suite and for Windows-side operator invocations.
+    if (
+        audit_db_override is not None
+        and "parallax-kernel/db" in audit_db_path.as_posix()
+    ):
+        _log.error(
+            "parallax_ingest_failed",
+            extra={
+                "event": "parallax_ingest_failed",
+                "reason_code": "disk.audit_db_unsafe_path",
+                "package_path": pkg_path_str,
+                "signer_id": "",
+                "underlying": (
+                    f"production audit.db rejected by --audit-db guard: "
+                    f"{audit_db_path}"
+                ),
+            },
+        )
+        raise SystemExit(78)
 
     # --- Open audit DB (validate=True runs §4 startup gates on the real DB) ---
     # Codex round-2 P1: catch raw sqlite3.Error from PRAGMA/quick_check/schema

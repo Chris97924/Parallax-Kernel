@@ -47,7 +47,7 @@ from aphelion.v03_validator import validate_v03_fields
 from aphelion.verifier import VerifyResult, verify_package
 from aphelion.yaml_canonical import parse_frontmatter, split_frontmatter
 
-from parallax.apex.audit_db import AuditDbWriteError, write_audit_row
+from parallax.apex.audit_db import AuditDbWriteError, write_audit_rows_atomic
 from parallax.apex.audit_writer import (
     AuditRow,
     assert_audit_row_committed,
@@ -110,6 +110,7 @@ _REASON_TO_EXIT: Final[Mapping[str, int]] = {
     "disk.permission": _EX_OSERR,
     "disk.audit_db_write_failed": _EX_OSERR,
     "disk.audit_db_unset": _EX_CONFIG,
+    "disk.audit_db_unsafe_path": _EX_CONFIG,
 }
 
 _TS_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
@@ -569,32 +570,52 @@ def _build_audit_rows(
 def _write_batch(
     audit_conn: sqlite3.Connection, batch: ClaimMappingBatch
 ) -> int:
-    """Write every row in the batch, respecting the §4.7 write-order fence."""
-    written = 0
-    for row in batch.audit_rows:
-        try:
-            write_audit_row(audit_conn, row)
-        except sqlite3.IntegrityError as exc:
-            # UNIQUE on envelope_message_id — defence-in-depth per spec
-            # §6.2 ``pkg.idempotency_duplicate`` (UUID collision = bug).
-            raise ParallaxIngestError(
-                "pkg.idempotency_duplicate",
-                f"envelope_message_id UNIQUE collision: {exc}",
-            ) from exc
-        except AuditDbWriteError as exc:
-            raise ParallaxIngestError(
-                "disk.audit_db_write_failed",
-                f"audit_db write failed: {exc}",
-            ) from exc
-        except PermissionError as exc:
-            raise ParallaxIngestError(
-                "disk.permission", f"audit_db permission denied: {exc}"
-            ) from exc
-        # M5 §8.1 fence — the row is committed iff write_audit_row returned
-        # without raising. Explicit raise guard survives `python -O`.
+    """Write every row in the batch atomically (issue #65).
+
+    Per-package atomicity is enforced via
+    :func:`parallax.apex.audit_db.write_audit_rows_atomic`: a single
+    ``BEGIN IMMEDIATE`` / ``COMMIT`` wraps the whole batch, so any row
+    failure rolls back the entire batch and ``audit.db`` is left
+    byte-identical to its pre-call state. The M5 §4.7 write-order fence
+    is therefore per-package, not per-row (see audit_db.py docstring).
+
+    ``assert_audit_row_committed`` is still emitted per row (the M5 §8.1
+    fence semantics survive the upgrade): each per-row assert fires
+    *after* its INSERT statement returns inside the batch transaction,
+    so the fence still proves "envelope emit must not precede the audit
+    INSERT attempt for the row in question". The difference vs the
+    previous per-row implementation is that the rows are not yet
+    committed at fence time — they commit together at the batch
+    boundary. Envelope assembly remains downstream of this function's
+    return, so the fence's downstream contract (no envelope before all
+    audit rows for the package have been written) is strictly tighter
+    under the new helper than the old per-row variant.
+    """
+    rows = batch.audit_rows
+    try:
+        write_audit_rows_atomic(audit_conn, rows)
+    except sqlite3.IntegrityError as exc:
+        # UNIQUE on envelope_message_id — defence-in-depth per spec
+        # §6.2 ``pkg.idempotency_duplicate`` (UUID collision = bug).
+        raise ParallaxIngestError(
+            "pkg.idempotency_duplicate",
+            f"envelope_message_id UNIQUE collision: {exc}",
+        ) from exc
+    except AuditDbWriteError as exc:
+        raise ParallaxIngestError(
+            "disk.audit_db_write_failed",
+            f"audit_db write failed: {exc}",
+        ) from exc
+    except PermissionError as exc:
+        raise ParallaxIngestError(
+            "disk.permission", f"audit_db permission denied: {exc}"
+        ) from exc
+    # M5 §8.1 fence — every row's INSERT attempt completed without
+    # raising (else write_audit_rows_atomic would have rolled back and
+    # re-raised). Explicit raise guard survives `python -O`.
+    for _row in rows:
         assert_audit_row_committed(True)
-        written += 1
-    return written
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------

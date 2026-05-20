@@ -39,6 +39,7 @@ from parallax.apex.audit_db import (
     open_audit_db,
     resolve_audit_db_path,
     write_audit_row,
+    write_audit_rows_atomic,
 )
 from parallax.apex.audit_writer import (
     OUTCOME_VALUES,
@@ -1066,4 +1067,276 @@ class TestEnvelopeSmoke:
         assert recomputed == digest, (
             f"persisted row digest {recomputed} != original {digest}; "
             f"persisted={json.dumps(persisted_dict, sort_keys=True)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Issue #65 — write_audit_rows_atomic per-package atomicity
+# ---------------------------------------------------------------------------
+
+
+def _row_with_envelope(envelope_id: str, **overrides: Any) -> AuditRow:
+    """Build a canonicalized row with a caller-supplied envelope_message_id."""
+    return canonicalize_row(
+        _valid_row(envelope_message_id=envelope_id, **overrides)
+    )
+
+
+class TestWriteRowsAtomic:
+    """Per-package atomic write helper added for issue #65.
+
+    Pre-fix bug: ``_write_batch`` called ``write_audit_row`` per row;
+    each row had its own ``BEGIN IMMEDIATE`` / ``COMMIT``. If row N
+    raised mid-batch, rows 1..N-1 were already committed. The new
+    helper wraps the entire batch in a single transaction so any
+    failure rolls back the whole package.
+    """
+
+    def test_empty_batch_is_noop(self, conn: sqlite3.Connection) -> None:
+        """Empty tuple must NOT open a BEGIN / COMMIT pair."""
+        write_audit_rows_atomic(conn, ())
+        (count,) = conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()
+        assert count == 0
+        assert conn.in_transaction is False, (
+            "empty batch must leave the connection in autocommit state"
+        )
+
+    def test_single_row_round_trip(self, conn: sqlite3.Connection) -> None:
+        """One-row batch produces exactly one committed row."""
+        row = _row_with_envelope("b3d7e2a1-4f8c-4b9d-8e3a-12c000000a01")
+        write_audit_rows_atomic(conn, (row,))
+        (count,) = conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()
+        assert count == 1
+        persisted = conn.execute(
+            "SELECT * FROM audit_row WHERE envelope_message_id = ?",
+            (row.data["envelope_message_id"],),
+        ).fetchone()
+        for col in REQUIRED_COLUMNS:
+            assert persisted[col] == row.data[col]
+
+    def test_multi_row_round_trip(self, conn: sqlite3.Connection) -> None:
+        """Five-row batch commits all five rows atomically."""
+        rows = tuple(
+            _row_with_envelope(
+                f"b3d7e2a1-4f8c-4b9d-8e3a-12c00000a{i:03x}",
+                claim_id=f"0193e2b1-0001-7000-8000-00000000a{i:03x}",
+            )
+            for i in range(5)
+        )
+        write_audit_rows_atomic(conn, rows)
+        (count,) = conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()
+        assert count == 5
+        assert conn.in_transaction is False, (
+            "connection must be in autocommit state after successful COMMIT"
+        )
+
+    def test_unique_violation_rolls_back_entire_batch(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Core issue #65 fix: a UNIQUE collision on row N must roll back
+        rows 1..N-1 and leave the table byte-identical to its pre-call state."""
+        duplicate_envelope = "b3d7e2a1-4f8c-4b9d-8e3a-12c00000fa01"
+        # Pre-seed one row using the per-row writer so the helper's batch
+        # has a UNIQUE collision waiting on its 3rd row.
+        seeded = _row_with_envelope(
+            duplicate_envelope,
+            claim_id="0193e2b1-0001-7000-8000-000000000bb1",
+        )
+        write_audit_row(conn, seeded)
+        pre_seed_count_query = conn.execute("SELECT COUNT(*) FROM audit_row")
+        (pre_count,) = pre_seed_count_query.fetchone()
+        assert pre_count == 1
+
+        # Build a 4-row batch where row index 2 collides on envelope_message_id.
+        batch_envelopes = [
+            "b3d7e2a1-4f8c-4b9d-8e3a-12c00000fb01",
+            "b3d7e2a1-4f8c-4b9d-8e3a-12c00000fb02",
+            duplicate_envelope,  # collides — must roll back rows 0 + 1
+            "b3d7e2a1-4f8c-4b9d-8e3a-12c00000fb04",
+        ]
+        batch = tuple(
+            _row_with_envelope(
+                env,
+                claim_id=f"0193e2b1-0001-7000-8000-00000000fb{i:02x}",
+            )
+            for i, env in enumerate(batch_envelopes)
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            write_audit_rows_atomic(conn, batch)
+
+        # Post-condition: still exactly the one pre-seeded row.
+        (post_count,) = conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()
+        assert post_count == 1, (
+            f"per-package atomicity violated — expected 1 row (the pre-seed), "
+            f"got {post_count}; partial-batch rows 0 + 1 survived ROLLBACK"
+        )
+        # Verify the surviving row is the pre-seed, not a partial-batch leak.
+        survivor = conn.execute(
+            "SELECT claim_id FROM audit_row WHERE envelope_message_id = ?",
+            (duplicate_envelope,),
+        ).fetchone()
+        assert survivor["claim_id"] == "0193e2b1-0001-7000-8000-000000000bb1"
+        # Connection must be back to autocommit so the next caller can BEGIN.
+        assert conn.in_transaction is False
+
+    def test_validation_failure_rolls_back_entire_batch(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """canonicalize_row failure inside the helper must also roll back.
+
+        We inject a bad row by constructing :class:`AuditRow` directly
+        with an invalid outcome — bypassing the caller-side
+        canonicalize_row. The helper's belt-and-braces re-validation
+        will raise, and rows queued before it must NOT persist.
+        """
+        from types import MappingProxyType
+
+        good_row_0 = _row_with_envelope(
+            "b3d7e2a1-4f8c-4b9d-8e3a-12c00000fc01",
+            claim_id="0193e2b1-0001-7000-8000-00000000fc01",
+        )
+        good_row_1 = _row_with_envelope(
+            "b3d7e2a1-4f8c-4b9d-8e3a-12c00000fc02",
+            claim_id="0193e2b1-0001-7000-8000-00000000fc02",
+        )
+        bad_data = _valid_row(
+            envelope_message_id="b3d7e2a1-4f8c-4b9d-8e3a-12c00000fc03",
+            outcome="not_a_real_outcome",
+        )
+        bad_row = AuditRow(data=MappingProxyType(bad_data))
+
+        with pytest.raises(AuditRowValidationError):
+            write_audit_rows_atomic(conn, (good_row_0, good_row_1, bad_row))
+
+        (count,) = conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()
+        assert count == 0, (
+            "rows 0 + 1 must have been rolled back after row 2's "
+            "validation failure inside the batch transaction"
+        )
+        assert conn.in_transaction is False
+
+    def test_caller_in_transaction_rejected(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """Caller-contract: precondition mirrors write_audit_row's.
+
+        ``conn.in_transaction must be False`` — passing an already-open
+        txn would cause the helper's BEGIN IMMEDIATE to raise
+        ``cannot start a transaction within a transaction`` and leak
+        the caller's dirty txn.
+        """
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(AuditDbUsageError, match="autocommit"):
+                write_audit_rows_atomic(
+                    conn,
+                    (_row_with_envelope("b3d7e2a1-4f8c-4b9d-8e3a-12c00000fd01"),),
+                )
+        finally:
+            conn.execute("ROLLBACK")
+
+    def test_begin_immediate_failure_wraps_as_write_error(self) -> None:
+        """Gap test (pr-test-analyzer): if the surrounding BEGIN IMMEDIATE
+        raises (e.g., 'database is locked'), the helper must wrap it as
+        AuditDbWriteError so _write_batch can map it to disk.audit_db_write_failed."""
+        begin_error = sqlite3.OperationalError("database is locked")
+
+        class LockedConn:
+            in_transaction = False
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("BEGIN"):
+                    raise begin_error
+                return None
+
+        fake = LockedConn()
+        row = _row_with_envelope("b3d7e2a1-4f8c-4b9d-8e3a-12c000010001")
+        with pytest.raises(AuditDbWriteError) as exc_info:
+            write_audit_rows_atomic(fake, (row,))  # type: ignore[arg-type]
+        assert exc_info.value.__cause__ is begin_error, (
+            "AuditDbWriteError must chain the original sqlite3 exception"
+        )
+        # No INSERT or COMMIT should have run after BEGIN failure.
+        assert fake.calls == ["BEGIN"], (
+            f"only BEGIN should have been attempted; got {fake.calls!r}"
+        )
+
+    def test_commit_failure_wraps_as_write_error_after_rollback(self) -> None:
+        """Gap test (pr-test-analyzer): COMMIT failure (e.g., disk full
+        after all INSERTs succeeded) must wrap as AuditDbWriteError and
+        attempt best-effort ROLLBACK first."""
+        commit_error = sqlite3.OperationalError("database or disk is full")
+
+        class CommitFailConn:
+            in_transaction = False
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("COMMIT"):
+                    raise commit_error
+                return None
+
+        fake = CommitFailConn()
+        rows = (
+            _row_with_envelope("b3d7e2a1-4f8c-4b9d-8e3a-12c000020001"),
+            _row_with_envelope(
+                "b3d7e2a1-4f8c-4b9d-8e3a-12c000020002",
+                claim_id="0193e2b1-0001-7000-8000-000000020002",
+            ),
+        )
+        with pytest.raises(AuditDbWriteError) as exc_info:
+            write_audit_rows_atomic(fake, rows)  # type: ignore[arg-type]
+        assert exc_info.value.__cause__ is commit_error
+        # Expected call order: BEGIN, INSERT, INSERT, COMMIT (fails), ROLLBACK.
+        assert "ROLLBACK" in fake.calls, (
+            "best-effort ROLLBACK must be attempted after COMMIT failure"
+        )
+        assert fake.calls.index("COMMIT") < fake.calls.index("ROLLBACK"), (
+            "ROLLBACK must run AFTER the failed COMMIT to clear the txn"
+        )
+
+    def test_rollback_failure_does_not_mask_primary_error(self) -> None:
+        """If the best-effort ROLLBACK after a row failure also raises,
+        the caller still sees the primary error (per per-row helper)."""
+        primary_error = sqlite3.IntegrityError(
+            "UNIQUE constraint failed: audit_row.envelope_message_id"
+        )
+        rollback_error = sqlite3.OperationalError("cannot rollback — no txn")
+
+        class FakeConn:
+            in_transaction = False  # initial autocommit state
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("BEGIN"):
+                    return None
+                if normalized.startswith("INSERT"):
+                    raise primary_error
+                if normalized.startswith("ROLLBACK"):
+                    raise rollback_error
+                return None
+
+        fake = FakeConn()
+        row = _row_with_envelope("b3d7e2a1-4f8c-4b9d-8e3a-12c00000fe01")
+        with pytest.raises(sqlite3.IntegrityError) as exc_info:
+            write_audit_rows_atomic(fake, (row,))  # type: ignore[arg-type]
+        assert exc_info.value is primary_error, (
+            "secondary ROLLBACK failure must not replace the primary INSERT failure"
+        )
+        assert "ROLLBACK" in fake.calls, (
+            "ROLLBACK must be attempted even when it is doomed to fail"
         )

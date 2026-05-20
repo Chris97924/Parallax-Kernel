@@ -66,12 +66,12 @@ What runs, in order (the impl-spec §5.3 phase list):
 | 5 | Re-unpack into a `parallax-m6-*` tempdir for manifest + claim file access | `aphelion_ingest.ingest_package` (re-unpack block) |
 | 6 | `validate_v03_fields()` per claim + in-package `(subject, polarity, valid_from)` duplicate guard | `aphelion_ingest._build_audit_rows` + `_validate_and_check_duplicates` |
 | 7 | `canonicalize_row` per claim — M5 contract preserved | `aphelion_ingest._build_audit_rows` (last loop) |
-| 8 | `write_audit_row` + `assert_audit_row_committed` per row — M5 §8.1 write-order fence | `aphelion_ingest._write_batch` |
+| 8 | `write_audit_rows_atomic` per package + `assert_audit_row_committed` per row — M5 §4.7 fence is per-package, §8.1 fence is per-row inside the batch txn | `aphelion_ingest._write_batch` |
 | 9 | Structured-log success: `event=parallax_ingest_succeeded`, `package_id`, `claim_count`, `audit_rows_written`, `signer_id`, `elapsed_ms` | `aphelion_ingest.ingest_package` (tail) |
 
 On success: exit 0, one log line, one or more rows in `audit.db`.
 
-On failure: exit ∈ {65, 70, 71, 78}, one structured-log error line. Failure at phases [1]-[7] is atomic — `audit.db` is byte-identical to its pre-invocation state. Failure during phase [8] is **not** atomic at the batch level: rows committed before the failing row stay persisted in `audit.db` (see §2.2 partial-batch recovery and impl-spec §5.3 + §9.10).
+On failure: exit ∈ {65, 70, 71, 78}, one structured-log error line. Failure at phases [1]-[7] is atomic — `audit.db` is byte-identical to its pre-invocation state. Failure during phase [8] is **also atomic at the package level** (issue #65 RESOLVED in the 2026-05-20 follow-up PR): `_write_batch` now delegates to `write_audit_rows_atomic` which wraps every row in a single `BEGIN IMMEDIATE` / `COMMIT`, so any mid-batch failure rolls the whole batch back. See impl-spec §5.3 + §9.10 for the full upgrade rationale.
 
 ### 1.3 Verifying a successful ingest
 
@@ -108,9 +108,11 @@ The binary emits one structured log line per failure with `event=parallax_ingest
 | `reason_code=pkg.idempotency_duplicate` exit 70 | UUID v4 collision on `envelope_message_id` (1 in 2^122 — if you see it twice, something is wrong) | file a bug; do NOT retry blindly |
 | Hung process (no log, no exit) | WAL checkpoint stall under contention | check for other writers holding `audit.db`: `lsof $PARALLAX_AUDIT_DB_PATH` (Linux) or `handle.exe $PARALLAX_AUDIT_DB_PATH` (Windows). M6 is single-instance only — see §3 |
 
-**Partial-batch caveat (operator-critical)**: phase [8] of the pipeline (`_write_batch` in [aphelion_ingest.py:569-597](../../parallax/apex/aphelion_ingest.py)) is **not atomic at the batch level**. Each row goes through its own `BEGIN IMMEDIATE` → `INSERT` → `COMMIT` via `write_audit_row` ([audit_db.py:514-590](../../parallax/apex/audit_db.py)). If row N raises mid-batch, rows 1..N-1 are **already committed** to `audit.db` even though the ingest invocation exits with `ParallaxIngestError` for row N. The M5 §4.7 write-order fence is per-row, NOT per-package — see impl-spec §5.3 + §9.10 for the binary follow-up.
+**Per-package atomicity (issue #65 RESOLVED, 2026-05-20)**: phase [8] of the pipeline (`_write_batch` in [aphelion_ingest.py:569-597](../../parallax/apex/aphelion_ingest.py)) now delegates to `write_audit_rows_atomic` ([audit_db.py](../../parallax/apex/audit_db.py)), which wraps every row in a single `BEGIN IMMEDIATE` / `COMMIT`. Any mid-batch failure (UNIQUE collision, write error, permission error, canonicalize failure) triggers `ROLLBACK` and `audit.db` is left byte-identical to its pre-invocation state. The M5 §4.7 write-order fence escalated from per-row to per-package; the §8.1 fence still fires per row inside the batch transaction (strictly tighter guarantee than the pre-fix per-row commit). See impl-spec §5.3 + §9.10 for the full rationale.
 
-**Recovery on phase-[8] mid-batch failure**:
+**Operator-visible consequence**: a failed-ingest log line for a multi-claim package now unambiguously implies **zero** new audit rows for that `package_id`. The pre-fix partial-batch recovery procedure (`SELECT COUNT(*) ... WHERE package_id = '<pkg>'` to determine partial vs full state, then manual `DELETE FROM audit_row ...` repair) is no longer needed for the §9.10 scenario.
+
+**The recovery procedure below is kept for the residual case** where `reason_code=disk.audit_db_write_failed` exit 71 fires but you suspect an unusual partial state (e.g., concurrent writer, manual edits to audit.db). In normal operation this should NEVER apply post-fix.
 
 1. Inspect the failing log line: `reason_code`, `package_path`, `package_id` (the package_id appears in the structured-log `extra` dict).
 2. Query the audit DB for how many rows already landed:
@@ -118,13 +120,10 @@ The binary emits one structured log line per failure with `event=parallax_ingest
    sqlite3 $PARALLAX_AUDIT_DB_PATH \
      "SELECT COUNT(*) FROM audit_row WHERE package_id = '<package_id>';"
    ```
-3. Compare against `manifest["claims"]` length inside the package (`tar -tf <pkg>.aphelion.tar | grep claims/`). If the DB count < manifest count → partial batch exists.
-4. **Do NOT re-run `parallax ingest` blindly** — re-ingest produces fresh `envelope_message_id` UUIDs, so all claims get a second audit row (the existing N-1 rows are NOT updated; you would end up with N-1 + N rows total, not N).
-5. Decide based on operational needs:
+3. Expected post-fix result: `0` (the batch rolled back). If the count is non-zero AND non-equal to the package's `manifest["claims"]` length, you are looking at the residual partial-state case — file a bug, do NOT proceed with re-ingest blindly.
+4. **Do NOT re-run `parallax ingest` blindly on a partial-state DB** — re-ingest produces fresh `envelope_message_id` UUIDs, so all claims get a second audit row (the existing rows are NOT updated; you would end up with stale + fresh rows for the same claims). If you confirm partial state, decide based on operational needs:
    - **If audit chain must reflect the full package**: manually `DELETE FROM audit_row WHERE package_id = '<package_id>'` (preserve a backup first), then re-ingest cleanly. Append-only invariant is broken at this step; document the manual repair.
-   - **If partial chain is acceptable**: leave the N-1 rows in place; the missing claims simply have no audit record. Downstream `AphelionReadAdapter` will not surface them.
-
-This partial-batch behaviour is tracked as a binary follow-up at impl-spec §9.10 — when the recommended fix lands (wrap `_write_batch` in a single transaction), this section can be reduced back to "the failure is atomic at the package level".
+   - **If partial chain is acceptable**: leave the existing rows in place; the missing claims simply have no audit record. Downstream `AphelionReadAdapter` will not surface them.
 
 ### 2.3 Tar corrupt / unpack safety violations
 
@@ -151,10 +150,9 @@ This partial-batch behaviour is tracked as a binary follow-up at impl-spec §9.1
 | `reason_code=pkg.dir_unset` exit 78 | `PARALLAX_APHELION_PACKAGE_DIR` env var unset | `export PARALLAX_APHELION_PACKAGE_DIR=...` (see §1.1) |
 | `reason_code=pkg.trust_store_missing` exit 78 | `PARALLAX_APHELION_TRUST_STORE` env var unset, OR the directory does not exist / is not readable | `export PARALLAX_APHELION_TRUST_STORE=...`; verify with `ls "$PARALLAX_APHELION_TRUST_STORE"` |
 | `reason_code=disk.audit_db_unset` exit 78 | `PARALLAX_AUDIT_DB_PATH` env var unset AND `--audit-db` flag not provided | export the env var; do NOT use `--audit-db` for production ingest (it's a testing override) |
+| `reason_code=disk.audit_db_unsafe_path` exit 78 | `--audit-db` override resolves to a path containing the substring `parallax-kernel/db` — the defensive guard rejected it regardless of `--dry-run` (issue #63 RESOLVED) | do NOT use `--audit-db` for the production DB; set `PARALLAX_AUDIT_DB_PATH` instead |
 
-> **Operator warning — `--audit-db` guard scope**: the defensive guard that rejects audit DB paths containing the substring `parallax-kernel/db` only fires when `--audit-db` is combined with `--dry-run` ([parallax/cli.py:1046-1064](../../parallax/cli.py)). A plain `parallax ingest <pkg> --audit-db /home/chris/parallax-kernel/db/audit.db` (no `--dry-run`) will write to the production DB. Do NOT use `--audit-db` for production ingest under any circumstance — the env var is the production path. See impl-spec §9.8.
->
-> **Operator warning — exit-code inconsistency**: if the `--audit-db + --dry-run + parallax-kernel/db` guard does fire, the process exits 70 even though the structured log tags `reason_code=disk.audit_db_unset` (which the impl-spec table maps to exit 78). Treat the log line as the source of truth for diagnosis; expect process exit 70. See impl-spec §9.9 — this is a tracked binary follow-up.
+> **Operator note — `--audit-db` guard (issues #63 + #64 RESOLVED, 2026-05-20)**: the defensive guard at [parallax/cli.py:1046-1071](../../parallax/cli.py) rejects any `--audit-db` override containing the substring `parallax-kernel/db` (forward-slash normalized via `Path.as_posix()` so the guard is portable across Windows/POSIX). The guard now fires **unconditionally** — `--dry-run` is no longer required to trip it. The structured log tags `reason_code=disk.audit_db_unsafe_path` and the process exits 78 (log↔exit aligned via `_REASON_TO_EXIT`). Operator guidance unchanged: `--audit-db` is a testing-only override, never use it for production ingest. See impl-spec §9.8 + §9.9.
 
 ---
 

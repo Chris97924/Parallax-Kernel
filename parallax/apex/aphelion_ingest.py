@@ -47,10 +47,9 @@ from aphelion.v03_validator import validate_v03_fields
 from aphelion.verifier import VerifyResult, verify_package
 from aphelion.yaml_canonical import parse_frontmatter, split_frontmatter
 
-from parallax.apex.audit_db import AuditDbWriteError, write_audit_row
+from parallax.apex.audit_db import AuditDbWriteError, write_audit_rows_atomic
 from parallax.apex.audit_writer import (
     AuditRow,
-    assert_audit_row_committed,
     canonicalize_row,
 )
 from parallax.obs.log import get_logger
@@ -110,6 +109,7 @@ _REASON_TO_EXIT: Final[Mapping[str, int]] = {
     "disk.permission": _EX_OSERR,
     "disk.audit_db_write_failed": _EX_OSERR,
     "disk.audit_db_unset": _EX_CONFIG,
+    "disk.audit_db_unsafe_path": _EX_CONFIG,
 }
 
 _TS_FORMAT: Final = "%Y-%m-%dT%H:%M:%SZ"
@@ -569,32 +569,51 @@ def _build_audit_rows(
 def _write_batch(
     audit_conn: sqlite3.Connection, batch: ClaimMappingBatch
 ) -> int:
-    """Write every row in the batch, respecting the §4.7 write-order fence."""
-    written = 0
-    for row in batch.audit_rows:
-        try:
-            write_audit_row(audit_conn, row)
-        except sqlite3.IntegrityError as exc:
-            # UNIQUE on envelope_message_id — defence-in-depth per spec
-            # §6.2 ``pkg.idempotency_duplicate`` (UUID collision = bug).
-            raise ParallaxIngestError(
-                "pkg.idempotency_duplicate",
-                f"envelope_message_id UNIQUE collision: {exc}",
-            ) from exc
-        except AuditDbWriteError as exc:
-            raise ParallaxIngestError(
-                "disk.audit_db_write_failed",
-                f"audit_db write failed: {exc}",
-            ) from exc
-        except PermissionError as exc:
-            raise ParallaxIngestError(
-                "disk.permission", f"audit_db permission denied: {exc}"
-            ) from exc
-        # M5 §8.1 fence — the row is committed iff write_audit_row returned
-        # without raising. Explicit raise guard survives `python -O`.
-        assert_audit_row_committed(True)
-        written += 1
-    return written
+    """Write every row in the batch atomically (issue #65).
+
+    Per-package atomicity is enforced via
+    :func:`parallax.apex.audit_db.write_audit_rows_atomic`: a single
+    ``BEGIN IMMEDIATE`` / ``COMMIT`` wraps the whole batch, so any row
+    failure rolls back the entire batch and ``audit.db`` is left
+    byte-identical to its pre-call state. The M5 §4.7 write-order fence
+    is therefore per-package, not per-row (see audit_db.py docstring).
+
+    The M5 §8.1 ``assert_audit_row_committed`` fence is enforced
+    *inside* ``write_audit_rows_atomic`` (silent-failure-hunter #2 fix):
+    a local ``committed`` flag is set True only after COMMIT returns and
+    asserted before the function exits, so the fence retains its
+    discriminating power across future refactors. This function no
+    longer needs to repeat the assertion — it would be vacuous here
+    because the call already passed the fence by the time control
+    returns.
+
+    NOTE: ``PermissionError`` is no longer caught here. SQLite wraps
+    OS-level permission errors into :class:`sqlite3.OperationalError`,
+    which ``write_audit_rows_atomic`` re-raises as
+    :class:`AuditDbWriteError`, then mapped to
+    ``disk.audit_db_write_failed`` below. The pre-fix per-row code path
+    had a ``PermissionError`` handler that mapped to ``disk.permission``;
+    after the refactor that handler became dead code, so the OS-EACCES
+    case now surfaces as ``disk.audit_db_write_failed``. Operators
+    should treat the underlying-exception string in the structured log
+    as the source of truth for distinguishing EACCES from disk-full.
+    """
+    rows = batch.audit_rows
+    try:
+        write_audit_rows_atomic(audit_conn, rows)
+    except sqlite3.IntegrityError as exc:
+        # UNIQUE on envelope_message_id — defence-in-depth per spec
+        # §6.2 ``pkg.idempotency_duplicate`` (UUID collision = bug).
+        raise ParallaxIngestError(
+            "pkg.idempotency_duplicate",
+            f"envelope_message_id UNIQUE collision: {exc}",
+        ) from exc
+    except AuditDbWriteError as exc:
+        raise ParallaxIngestError(
+            "disk.audit_db_write_failed",
+            f"audit_db write failed: {exc}",
+        ) from exc
+    return len(rows)
 
 
 # ---------------------------------------------------------------------------

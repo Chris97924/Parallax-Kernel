@@ -1043,25 +1043,69 @@ def _cmd_ingest(
             )
             return 78  # EX_CONFIG
 
-    # Defensive --audit-db guard (P2 backlog #5): reject production DB path
-    # when --audit-db is set AND --dry-run is active.  Protects against
-    # accidental writes to the production DB during test/dry-run invocations.
-    if audit_db_override is not None and dry_run:
-        if "parallax-kernel/db" in str(audit_db_path):
+    # Defensive --audit-db guard (issues #63 + #64): when --audit-db is set,
+    # reject any override path containing the ``parallax-kernel/db`` substring
+    # *unconditionally* — including outside --dry-run. The previous
+    # dry-run-scoped guard left plain ``parallax ingest <pkg> --audit-db
+    # /home/chris/parallax-kernel/db/audit.db`` invocations unprotected against
+    # operator typos. NOTE: guard is intentionally dry-run-agnostic; do NOT
+    # re-add a ``and dry_run`` clause without re-reading #63.
+    #
+    # The check defends in two layers against substring-bypass attempts:
+    #   (a) literal path as typed by the operator (catches plain typos)
+    #   (b) ``Path.resolve()`` of the literal (follows symlinks so an
+    #       attacker-supplied symlink ``/tmp/safe.db -> .../parallax-kernel/db/...``
+    #       cannot bypass — silent-failure-hunter finding #3)
+    # Comparison is lowercased so case-insensitive filesystems (NTFS, HFS+)
+    # cannot bypass via ``Parallax-Kernel/DB``. ``as_posix()`` normalizes
+    # path separators so the substring guard is portable across Windows and
+    # POSIX hosts.
+    #
+    # ``resolve(strict=False)`` returns the literal path unchanged if it
+    # cannot resolve (e.g., parent directory does not exist), so the
+    # fallback is always safe. We wrap in try/except for hardened-mode
+    # raise on OSError to be defensive — even if resolve fails, the
+    # literal-path check (a) still fires.
+    needle = "parallax-kernel/db"
+    if audit_db_override is not None:
+        literal_posix = audit_db_path.as_posix().lower()
+        try:
+            resolved_posix = audit_db_path.resolve(strict=False).as_posix().lower()
+        except (OSError, RuntimeError) as exc:
+            # resolve() failure → fall back to literal-only check; log so
+            # an operator can debug a guard-false-positive caused by a
+            # weird path that pathlib accepts but the OS rejects.
+            _log.warning(
+                "audit_db_guard_resolve_failed",
+                extra={
+                    "event": "audit_db_guard_resolve_failed",
+                    "audit_db_path": str(audit_db_path),
+                    "underlying": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            resolved_posix = literal_posix
+        if needle in literal_posix or needle in resolved_posix:
             _log.error(
                 "parallax_ingest_failed",
                 extra={
                     "event": "parallax_ingest_failed",
-                    "reason_code": "disk.audit_db_unset",
+                    "reason_code": "disk.audit_db_unsafe_path",
                     "package_path": pkg_path_str,
                     "signer_id": "",
                     "underlying": (
-                        f"production audit.db rejected by --db guard: "
-                        f"{audit_db_path}"
+                        f"production audit.db rejected by --audit-db guard: "
+                        f"literal={audit_db_path} resolved={resolved_posix}"
                     ),
                 },
             )
-            raise SystemExit(70)
+            # ``return 78`` matches the convention used by the other five
+            # EX_CONFIG sites in this function (lines 1010, 1025, 1044,
+            # 1088, 1141). The previous ``raise SystemExit(78)`` worked
+            # because SystemExit propagates past main()'s except clause,
+            # but breaks the _cmd_ingest(...) -> int contract for any
+            # direct caller (e.g., a unit test that imports the function).
+            # Per critic review of PR #66.
+            return 78
 
     # --- Open audit DB (validate=True runs §4 startup gates on the real DB) ---
     # Codex round-2 P1: catch raw sqlite3.Error from PRAGMA/quick_check/schema

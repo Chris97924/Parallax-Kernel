@@ -1634,3 +1634,173 @@ class TestM6IngestSpecGapCoverage:
         assert "disk.audit_db_unset" in combined, (
             f"expected reason_code 'disk.audit_db_unset' in output; got: {combined!r}"
         )
+
+    @pytest.mark.parametrize("with_dry_run", [False, True])
+    def test_cli_audit_db_unsafe_path_exits_78_unconditionally(
+        self, tmp_path: Path, with_dry_run: bool
+    ) -> None:
+        """Issue #63 + #64 RESOLVED: ``--audit-db`` override containing
+        ``parallax-kernel/db`` is rejected with ``SystemExit(78)`` +
+        ``reason_code=disk.audit_db_unsafe_path``, regardless of
+        ``--dry-run``. Parametrized to prove the guard fires in both
+        modes — the pre-fix bug was that it only fired when --dry-run
+        was set.
+        """
+        import subprocess
+        import sys as _sys
+
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            in {
+                "PATH",
+                "SYSTEMROOT",
+                "USERPROFILE",
+                "TEMP",
+                "TMP",
+                "PYTHONIOENCODING",
+                "PYTHONPATH",
+            }
+        }
+        clean_env["PARALLAX_APHELION_PACKAGE_DIR"] = str(tmp_path)
+        clean_env["PARALLAX_APHELION_TRUST_STORE"] = str(tmp_path)
+        # PARALLAX_AUDIT_DB_PATH is irrelevant — --audit-db override
+        # takes precedence and the guard fires before the env-var resolver.
+        clean_env["PARALLAX_AUDIT_DB_PATH"] = str(tmp_path / "irrelevant.db")
+
+        dummy_pkg = tmp_path / "dummy.aphelion.tar"
+        dummy_pkg.write_bytes(b"")
+
+        # Synthetic prod-DB path containing the canonical substring. The
+        # file does NOT need to exist — the substring guard runs before
+        # any file I/O on the override path.
+        unsafe_override = "/home/chris/parallax-kernel/db/audit.db"
+
+        argv = [
+            _sys.executable,
+            "-c",
+            "import sys; from parallax.cli import main; sys.exit(main())",
+            "ingest",
+            str(dummy_pkg),
+            "--audit-db",
+            unsafe_override,
+        ]
+        if with_dry_run:
+            argv.append("--dry-run")
+
+        result = subprocess.run(
+            argv,
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 78, (
+            f"expected exit 78 (with_dry_run={with_dry_run}), got "
+            f"{result.returncode}; stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        combined = result.stdout + result.stderr
+        assert "disk.audit_db_unsafe_path" in combined, (
+            f"expected reason_code 'disk.audit_db_unsafe_path' in output "
+            f"(with_dry_run={with_dry_run}); got: {combined!r}"
+        )
+        # Defense: prove we did NOT accidentally tag the legacy code.
+        assert "disk.audit_db_unset" not in combined, (
+            f"unsafe-path guard must NOT use the legacy disk.audit_db_unset "
+            f"reason code (binary inconsistency at issue #64); "
+            f"with_dry_run={with_dry_run}, output: {combined!r}"
+        )
+
+    def test_cli_audit_db_unsafe_path_symlink_bypass_blocked(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test for silent-failure-hunter #3: a symlink whose
+        name does NOT contain ``parallax-kernel/db`` but whose resolved
+        target does must still be rejected by the guard. Pre-fix the
+        guard only checked the literal path string; post-fix it also
+        checks the resolved path via Path.resolve()."""
+        import subprocess
+        import sys as _sys
+
+        # Create a fake "prod" file inside tmp_path that contains the
+        # forbidden substring in its path, then create an innocent-named
+        # symlink to it.
+        prod_dir = tmp_path / "parallax-kernel" / "db"
+        prod_dir.mkdir(parents=True)
+        prod_target = prod_dir / "audit.db"
+        prod_target.write_bytes(b"")
+
+        innocent_symlink = tmp_path / "safe.db"
+        try:
+            innocent_symlink.symlink_to(prod_target)
+        except (OSError, NotImplementedError):
+            # Windows non-admin invocations cannot create symlinks; skip.
+            pytest.skip(
+                "symlink creation requires elevated permissions on this "
+                "platform; cannot exercise the resolve() bypass path"
+            )
+
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            in {
+                "PATH",
+                "SYSTEMROOT",
+                "USERPROFILE",
+                "TEMP",
+                "TMP",
+                "PYTHONIOENCODING",
+                "PYTHONPATH",
+            }
+        }
+        clean_env["PARALLAX_APHELION_PACKAGE_DIR"] = str(tmp_path)
+        clean_env["PARALLAX_APHELION_TRUST_STORE"] = str(tmp_path)
+        clean_env["PARALLAX_AUDIT_DB_PATH"] = str(tmp_path / "irrelevant.db")
+
+        dummy_pkg = tmp_path / "dummy.aphelion.tar"
+        dummy_pkg.write_bytes(b"")
+
+        result = subprocess.run(
+            [
+                _sys.executable,
+                "-c",
+                "import sys; from parallax.cli import main; sys.exit(main())",
+                "ingest",
+                str(dummy_pkg),
+                "--audit-db",
+                str(innocent_symlink),
+            ],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 78, (
+            f"symlink-bypass must be blocked; got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        combined = result.stdout + result.stderr
+        assert "disk.audit_db_unsafe_path" in combined, (
+            f"resolve()-based check must trip the unsafe-path reason code; "
+            f"got: {combined!r}"
+        )
+
+    def test_reason_code_to_exit_alignment_for_unsafe_path(self) -> None:
+        """Issue #64 alignment unit-check: the new reason code is in
+        ``_REASON_TO_EXIT`` and maps to 78, matching the CLI guard's
+        ``SystemExit(78)``."""
+        from parallax.apex.aphelion_ingest import (
+            ParallaxIngestError,
+        )
+
+        err = ParallaxIngestError(
+            "disk.audit_db_unsafe_path", "synthetic test message"
+        )
+        assert err.exit_code == 78, (
+            f"disk.audit_db_unsafe_path must map to exit 78 (EX_CONFIG); "
+            f"got {err.exit_code}. The CLI guard raises SystemExit(78), "
+            f"so a mismatch here re-introduces the issue #64 binary inconsistency."
+        )

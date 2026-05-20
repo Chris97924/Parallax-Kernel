@@ -1713,6 +1713,81 @@ class TestM6IngestSpecGapCoverage:
             f"with_dry_run={with_dry_run}, output: {combined!r}"
         )
 
+    def test_cli_audit_db_unsafe_path_symlink_bypass_blocked(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test for silent-failure-hunter #3: a symlink whose
+        name does NOT contain ``parallax-kernel/db`` but whose resolved
+        target does must still be rejected by the guard. Pre-fix the
+        guard only checked the literal path string; post-fix it also
+        checks the resolved path via Path.resolve()."""
+        import subprocess
+        import sys as _sys
+
+        # Create a fake "prod" file inside tmp_path that contains the
+        # forbidden substring in its path, then create an innocent-named
+        # symlink to it.
+        prod_dir = tmp_path / "parallax-kernel" / "db"
+        prod_dir.mkdir(parents=True)
+        prod_target = prod_dir / "audit.db"
+        prod_target.write_bytes(b"")
+
+        innocent_symlink = tmp_path / "safe.db"
+        try:
+            innocent_symlink.symlink_to(prod_target)
+        except (OSError, NotImplementedError):
+            # Windows non-admin invocations cannot create symlinks; skip.
+            pytest.skip(
+                "symlink creation requires elevated permissions on this "
+                "platform; cannot exercise the resolve() bypass path"
+            )
+
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            in {
+                "PATH",
+                "SYSTEMROOT",
+                "USERPROFILE",
+                "TEMP",
+                "TMP",
+                "PYTHONIOENCODING",
+                "PYTHONPATH",
+            }
+        }
+        clean_env["PARALLAX_APHELION_PACKAGE_DIR"] = str(tmp_path)
+        clean_env["PARALLAX_APHELION_TRUST_STORE"] = str(tmp_path)
+        clean_env["PARALLAX_AUDIT_DB_PATH"] = str(tmp_path / "irrelevant.db")
+
+        dummy_pkg = tmp_path / "dummy.aphelion.tar"
+        dummy_pkg.write_bytes(b"")
+
+        result = subprocess.run(
+            [
+                _sys.executable,
+                "-c",
+                "import sys; from parallax.cli import main; sys.exit(main())",
+                "ingest",
+                str(dummy_pkg),
+                "--audit-db",
+                str(innocent_symlink),
+            ],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 78, (
+            f"symlink-bypass must be blocked; got {result.returncode}; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        combined = result.stdout + result.stderr
+        assert "disk.audit_db_unsafe_path" in combined, (
+            f"resolve()-based check must trip the unsafe-path reason code; "
+            f"got: {combined!r}"
+        )
+
     def test_reason_code_to_exit_alignment_for_unsafe_path(self) -> None:
         """Issue #64 alignment unit-check: the new reason code is in
         ``_REASON_TO_EXIT`` and maps to 78, matching the CLI guard's

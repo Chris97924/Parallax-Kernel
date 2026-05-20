@@ -50,7 +50,6 @@ from aphelion.yaml_canonical import parse_frontmatter, split_frontmatter
 from parallax.apex.audit_db import AuditDbWriteError, write_audit_rows_atomic
 from parallax.apex.audit_writer import (
     AuditRow,
-    assert_audit_row_committed,
     canonicalize_row,
 )
 from parallax.obs.log import get_logger
@@ -579,17 +578,25 @@ def _write_batch(
     byte-identical to its pre-call state. The M5 §4.7 write-order fence
     is therefore per-package, not per-row (see audit_db.py docstring).
 
-    ``assert_audit_row_committed`` is still emitted per row (the M5 §8.1
-    fence semantics survive the upgrade): each per-row assert fires
-    *after* its INSERT statement returns inside the batch transaction,
-    so the fence still proves "envelope emit must not precede the audit
-    INSERT attempt for the row in question". The difference vs the
-    previous per-row implementation is that the rows are not yet
-    committed at fence time — they commit together at the batch
-    boundary. Envelope assembly remains downstream of this function's
-    return, so the fence's downstream contract (no envelope before all
-    audit rows for the package have been written) is strictly tighter
-    under the new helper than the old per-row variant.
+    The M5 §8.1 ``assert_audit_row_committed`` fence is enforced
+    *inside* ``write_audit_rows_atomic`` (silent-failure-hunter #2 fix):
+    a local ``committed`` flag is set True only after COMMIT returns and
+    asserted before the function exits, so the fence retains its
+    discriminating power across future refactors. This function no
+    longer needs to repeat the assertion — it would be vacuous here
+    because the call already passed the fence by the time control
+    returns.
+
+    NOTE: ``PermissionError`` is no longer caught here. SQLite wraps
+    OS-level permission errors into :class:`sqlite3.OperationalError`,
+    which ``write_audit_rows_atomic`` re-raises as
+    :class:`AuditDbWriteError`, then mapped to
+    ``disk.audit_db_write_failed`` below. The pre-fix per-row code path
+    had a ``PermissionError`` handler that mapped to ``disk.permission``;
+    after the refactor that handler became dead code, so the OS-EACCES
+    case now surfaces as ``disk.audit_db_write_failed``. Operators
+    should treat the underlying-exception string in the structured log
+    as the source of truth for distinguishing EACCES from disk-full.
     """
     rows = batch.audit_rows
     try:
@@ -606,15 +613,6 @@ def _write_batch(
             "disk.audit_db_write_failed",
             f"audit_db write failed: {exc}",
         ) from exc
-    except PermissionError as exc:
-        raise ParallaxIngestError(
-            "disk.permission", f"audit_db permission denied: {exc}"
-        ) from exc
-    # M5 §8.1 fence — every row's INSERT attempt completed without
-    # raising (else write_audit_rows_atomic would have rolled back and
-    # re-raised). Explicit raise guard survives `python -O`.
-    for _row in rows:
-        assert_audit_row_committed(True)
     return len(rows)
 
 

@@ -1236,6 +1236,75 @@ class TestWriteRowsAtomic:
         finally:
             conn.execute("ROLLBACK")
 
+    def test_begin_immediate_failure_wraps_as_write_error(self) -> None:
+        """Gap test (pr-test-analyzer): if the surrounding BEGIN IMMEDIATE
+        raises (e.g., 'database is locked'), the helper must wrap it as
+        AuditDbWriteError so _write_batch can map it to disk.audit_db_write_failed."""
+        begin_error = sqlite3.OperationalError("database is locked")
+
+        class LockedConn:
+            in_transaction = False
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("BEGIN"):
+                    raise begin_error
+                return None
+
+        fake = LockedConn()
+        row = _row_with_envelope("b3d7e2a1-4f8c-4b9d-8e3a-12c000010001")
+        with pytest.raises(AuditDbWriteError) as exc_info:
+            write_audit_rows_atomic(fake, (row,))  # type: ignore[arg-type]
+        assert exc_info.value.__cause__ is begin_error, (
+            "AuditDbWriteError must chain the original sqlite3 exception"
+        )
+        # No INSERT or COMMIT should have run after BEGIN failure.
+        assert fake.calls == ["BEGIN"], (
+            f"only BEGIN should have been attempted; got {fake.calls!r}"
+        )
+
+    def test_commit_failure_wraps_as_write_error_after_rollback(self) -> None:
+        """Gap test (pr-test-analyzer): COMMIT failure (e.g., disk full
+        after all INSERTs succeeded) must wrap as AuditDbWriteError and
+        attempt best-effort ROLLBACK first."""
+        commit_error = sqlite3.OperationalError("database or disk is full")
+
+        class CommitFailConn:
+            in_transaction = False
+
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def execute(self, sql: str, params: Any = ()) -> Any:
+                normalized = sql.strip().upper()
+                self.calls.append(normalized.split()[0])
+                if normalized.startswith("COMMIT"):
+                    raise commit_error
+                return None
+
+        fake = CommitFailConn()
+        rows = (
+            _row_with_envelope("b3d7e2a1-4f8c-4b9d-8e3a-12c000020001"),
+            _row_with_envelope(
+                "b3d7e2a1-4f8c-4b9d-8e3a-12c000020002",
+                claim_id="0193e2b1-0001-7000-8000-000000020002",
+            ),
+        )
+        with pytest.raises(AuditDbWriteError) as exc_info:
+            write_audit_rows_atomic(fake, rows)  # type: ignore[arg-type]
+        assert exc_info.value.__cause__ is commit_error
+        # Expected call order: BEGIN, INSERT, INSERT, COMMIT (fails), ROLLBACK.
+        assert "ROLLBACK" in fake.calls, (
+            "best-effort ROLLBACK must be attempted after COMMIT failure"
+        )
+        assert fake.calls.index("COMMIT") < fake.calls.index("ROLLBACK"), (
+            "ROLLBACK must run AFTER the failed COMMIT to clear the txn"
+        )
+
     def test_rollback_failure_does_not_mask_primary_error(self) -> None:
         """If the best-effort ROLLBACK after a row failure also raises,
         the caller still sees the primary error (per per-row helper)."""

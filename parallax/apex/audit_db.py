@@ -40,6 +40,7 @@ from parallax.apex.audit_writer import (
     OUTCOME_VALUES,
     SOURCE_VALUES,
     AuditRow,
+    assert_audit_row_committed,
     canonicalize_row,
 )
 
@@ -652,10 +653,26 @@ def write_audit_rows_atomic(
         raise AuditDbWriteError(
             f"audit_db begin-immediate failed (locked or busy): {exc}"
         ) from exc
+    # M5 §8.1 fence — ``committed`` starts False and is only set True
+    # after the COMMIT statement returns. The assert at the bottom
+    # therefore proves the batch was committed (not merely attempted)
+    # before this function returns normally. Hardcoded ``True`` would
+    # be vacuous; the local flag preserves the fence's discriminating
+    # power across future refactors (silent-failure-hunter finding #2).
+    # The fence is intentionally outside the try/except below so that
+    # the exception paths never reach it — primary INSERT / COMMIT
+    # failures re-raise via ``raise`` and the fence is bypassed; only
+    # the success path reaches the assert.
+    committed = False
     try:
         for row in rows:
             canonicalize_row(dict(row.data))
             data = row.data
+            # Column-build is identical to write_audit_row above; the two
+            # helpers are kept separate because they have incompatible
+            # BEGIN/COMMIT scopes (per-row autocommit vs per-batch
+            # transaction). A shared private SQL-builder is acceptable
+            # future work but not required for correctness.
             columns: list[str] = []
             values: list[Any] = []
             for col in REQUIRED_COLUMNS:
@@ -672,14 +689,22 @@ def write_audit_rows_atomic(
             )
             conn.execute(sql, values)
     except Exception:
-        # ROLLBACK is best-effort; a secondary rollback failure is logged
-        # but does not mask the primary INSERT / validation exception.
+        # ROLLBACK is best-effort; a secondary rollback failure is
+        # logged but does not mask the primary INSERT / validation
+        # exception. ERROR severity (not WARNING) because the
+        # connection state is undefined after a failed ROLLBACK —
+        # operator/oncall must investigate.
         try:
             conn.execute("ROLLBACK")
         except sqlite3.Error as rb_exc:
-            _log.warning(
-                "audit_db rollback after batch-row-failure also raised: %s",
-                rb_exc,
+            _log.error(
+                "audit_db_rollback_failed",
+                extra={
+                    "event": "audit_db_rollback_failed",
+                    "stage": "row_failure",
+                    "batch_size": len(rows),
+                    "rollback_exc": f"{type(rb_exc).__name__}: {rb_exc}",
+                },
             )
         raise
     try:
@@ -688,13 +713,25 @@ def write_audit_rows_atomic(
         try:
             conn.execute("ROLLBACK")
         except sqlite3.Error as rb_exc:
-            _log.warning(
-                "audit_db rollback after batch-commit-failure also raised: %s",
-                rb_exc,
+            _log.error(
+                "audit_db_rollback_failed",
+                extra={
+                    "event": "audit_db_rollback_failed",
+                    "stage": "commit_failure",
+                    "batch_size": len(rows),
+                    "rollback_exc": f"{type(rb_exc).__name__}: {rb_exc}",
+                },
             )
         raise AuditDbWriteError(
             f"audit_db batch commit failed (disk full or locked): {exc}"
         ) from exc
+    committed = True
+    # Fence: never reached on the failure paths (they re-raise above).
+    # On the success path, ``committed`` was just set True, so this is
+    # always-passes — its purpose is to be a load-bearing comment + a
+    # runtime check that survives ``python -O`` against a future
+    # refactor that moves the assignment OR the COMMIT.
+    assert_audit_row_committed(committed)
 
 
 # Per-thread audit-db connection cache. sqlite3 connections are not

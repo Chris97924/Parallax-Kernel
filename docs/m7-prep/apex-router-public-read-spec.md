@@ -148,6 +148,15 @@ These boundaries are normative. Any future M7 implementation PR that violates th
 
 **Enforcement**: M7 router code review checklist MUST include "every read path eventually goes through `aphelion.verifier.verify_package + validator.validate_signatures`; no escape hatch for unsigned packages; `AphelionUnreachableError(reason='unsigned_package')` on signer fail; startup version assertion present and tested".
 
+**Read-path required call set**: The M7 read path MUST call the following Aphelion public symbols, in order:
+
+1. `aphelion.unpacker.unpack(path)` — untar with v0.2 §S2.5 safety rules
+2. `aphelion.verifier.verify_package(...)` — package-level signer chain validation
+3. `aphelion.validator.validate_signatures(...)` — claim-level signature check per v0.3 R1-R4
+4. `aphelion.read_adapter.AphelionReadAdapter.query(...)` — claim/evidence projection
+
+`aphelion.unpacker.extract_signer_manifests` is **OUT-OF-SCOPE** for the read path. That function is used by the M6 ingest pipeline (`parallax/apex/aphelion_ingest.py`) to enforce the operator's file-based trust store at ingest time — i.e., rejecting packages from untrusted signers before they enter `PARALLAX_APHELION_PACKAGE_DIR`. Because ingest is the gate, by the time the M7 router sees a package in the corpus it has already passed trust-store enforcement. The read path does not re-run trust-store enforcement; it only re-verifies the cryptographic signer chain via `verify_package`. Adding `extract_signer_manifests` to the read path would be redundant and would introduce an undocumented dependency on the operator's trust-store file structure. If M7 implementation review discovers a new reason to re-check the trust store on read, that decision must be escalated to Chris before the impl PR merges — it is not implied by this spec.
+
 **Cross-ref**: `docs/m6-prep/m6-ingest-contract-spec.md` v0.1-frozen-2026-05-17 (route A canonical decision); `docs/m5-prep/apex-m5-entry-spec.md` §3.1a "Signer verification" invariant; `docs/m5-prep/apex-m5-entry-spec.md` §3.1a "Untar safety" invariant (Aphelion v0.2 §S2.5 untar-safety rules carry forward unchanged).
 
 ### 3.4 Boundary 4 — Private read/write = Perihelion in-process Python API (per M6.5)
@@ -157,6 +166,8 @@ These boundaries are normative. Any future M7 implementation PR that violates th
 **Why**: This is the M6.5 P0 contract that landed in PR `Chris97924/agent-config#1` squash-merged `562af7d`. The shim is pm2-managed, runs on the same host as Perihelion (Win/WSL2 → eventual ZenBook), and exposes a loopback IPC surface that Claude Code's UserPromptSubmit/Stop hooks use. Apex router does not see this surface.
 
 **Enforcement**: This boundary is enforced by Perihelion's deployment topology, not by Apex code. M7 only honors it by *not* attempting to call Perihelion. The cross-ref ensures M7 reviewers can verify the boundary is bidirectional.
+
+**Facade host pin**: The retrieve facade shim co-locates with Perihelion on the same host (in-process `import perihelion` requires physical co-location; cross-host placement is out of scope for M7). The §4.1 diagram's "in-process Python API" arrow reflects this co-location invariant. If a future deploy separates the facade and Perihelion onto different hosts, the "never-HTTP" contract must be revisited in a new ADR before that migration — M7 makes no provisions for it.
 
 **Cross-ref**: M6.5 P0 architecture in `messier-roadmap-v0-to-v11.md` M6.5 段 "dual-write 拓撲" + `project_apex_m65_redesign`; `reference_perihelion_naming` (Perihelion never-HTTP contract).
 
@@ -231,7 +242,7 @@ The 100ms p99 is **load-tested goal**, not a hard fence — if M7 implementation
 | Empty corpus — dir IS accessible but contains zero `.aphelion.tar` files | Return empty claim list (this is a legitimate fresh-deploy state); also emit `parallax_apex_empty_corpus_total` counter at first-read-per-process boundary so a stuck-empty deployment is visible in dashboards | Facade sees `[]` and proceeds without Apex context |
 | Aphelion lib version mismatch (detected at startup per §3.3) | Hard startup error (process refuses to come up); not a per-request failure | n/a — process never enters serving state |
 | Aphelion lib raises unexpectedly mid-request | Apex wraps as `AphelionUnreachableError(reason="lib_error", exc_class=<class name>)` + increment `parallax_apex_read_errors_total{reason="lib_error", exc_class=<class name>}` counter (per §4.5) | Same as the "Package missing" row |
-| Audit ledger write failure during a divergence-telemetry read (R-10 path) | Hard raise `AphelionAuditWriteError(reason=<cause>)`; the claim list is NOT returned with a missing audit row. Also increment `parallax_apex_audit_write_failures_total{cause}` (M7-introduced, separate from M5's `parallax_audit_write_failures_total` — see §4.5 for why a new counter rather than label mutation) so the read-path audit failure is observable alongside the M5 write-path counter without label-mismatch silent-undercount | Facade logs + surfaces the error; **must not silently substitute Perihelion content for the failed read** |
+| Audit ledger write failure during a divergence-telemetry read (R-10 path) | Hard raise `AphelionAuditWriteError(reason=<cause>)`; the claim list is NOT returned with a missing audit row. Claims are NOT returned on `AphelionAuditWriteError`; the read is fully aborted with no partial state. Caller-side fallback semantics are out of scope of this spec. Also increment `parallax_apex_audit_write_failures_total{cause}` (M7-introduced, separate from M5's `parallax_audit_write_failures_total` — see §4.5 for why a new counter rather than label mutation) so the read-path audit failure is observable alongside the M5 write-path counter without label-mismatch silent-undercount | Facade logs + surfaces the error; **must not silently substitute Perihelion content for the failed read** |
 
 **Critical rule**: the §3.2 boundary forbids Apex falling back to Perihelion. The facade also must not fall back across the boundary (it composes both sides but does not substitute one for the other). This is the explicit decision in §8 Q3 below. The audit-write-during-read row above is load-bearing because the natural implementer default ("read succeeded, audit failed, return claims anyway") silently drops the divergence audit row and breaks the M5 R-10 provenance guarantee — the spec forbids that path explicitly.
 
@@ -500,6 +511,22 @@ These are listed so future readers (including LLM agents reading this in some se
 - **Does not bind M9 SDK / OSS Surface Lock decisions.** M7 ships well before M9.
 - **Does not reconcile the M11 roadmap entry.** M11's current body ("Parallax 成為 Claude Code session continuity SSoT 永久取代 MEMORY.md" + "刪 MEMORY.md.bak 跑 7 天") inherits the same 2026-05-08 era Parallax-centric framing that this spec reframes for M7. After the 2026-05-28 reconcile, M11 also needs a wording pass — Parallax alone does not replace the private layer, and there is no `.bak` to delete because the per-purpose shrink schedule (§6) doesn't produce one. The M11 reconcile is **out-of-scope for this PR** but is flagged here so a future session can pick it up. M10 DoD that says "所有 M7 條件維持 30 天" will inherit whatever M7 conditions are defined by this spec, which is the desired ripple — M10 needs no separate reconcile.
 
+### 9.1 Roadmap entry-condition reconcile note (STALE row — implementers read here, not the roadmap)
+
+The M7 entry row in `messier-roadmap-v0-to-v11.md` line 259 currently reads:
+
+> **Entry**: M6.5 DoD met（D1-D4：P0 wiring 驗證 + dual-write ≥2 週 zero data-loss + injection 品質不 regression + 不卡 emergence state；見 M6.5 段）
+
+That row is **STALE**. It predates this spec and reflects the 2026-05-08 era M7 framing (Parallax-centric read/write router). After this reframe, the load-bearing M7 entry gate is **§7 E.1-E.6** of this spec — which is richer than the roadmap row's D1-D4:
+
+- E.1 (M5 GA active) and E.2 (M6 ingest deployed) are entirely absent from the roadmap row.
+- E.3 (Perihelion M6.5 D2+D3 DoD, not just D1-D4) maps to the roadmap's D1-D4 entry but scopes differently — D2+D3 covers soak window + injection quality, while the roadmap row's D4 ("不卡 emergence state") has no equivalent in this spec's gate.
+- E.4 (no M5 rollback active), E.5 (SLA preview load test), and E.6 (§3 boundary lint) are new conditions added by this reframe.
+
+**Implementers must use §7 E.1-E.6 as the authoritative M7 entry gate. The roadmap row is retained for historical lineage only.**
+
+A roadmap pointer-add PR (adding a one-line "see `docs/m7-prep/apex-router-public-read-spec.md` for the current entry gate" to the roadmap M7 row) is a **hard prerequisite** of the M7 implementation PR. The impl PR must not open until the roadmap pointer is in place — otherwise M7 will have two divergent authoritative sources, which was the problem this reconcile spec was written to solve.
+
 ---
 
 ## 10. Cross-reference index
@@ -527,3 +554,4 @@ For future readers tracing the lineage of this reframe:
 |---|---|---|
 | 2026-05-28 | v0.1-reframe-2026-05-28 | Initial reframe. Reframes 2026-05-08 M7 entry per 2026-05-28 MIDDAY framing reconcile + 2026-05-20 Perihelion directive + 2026-05-22 roadmap ripple note. 8 sections + open questions + cross-refs. |
 | 2026-05-28 | v0.1.1-reframe-2026-05-28 | Folded internal team review feedback (architect + critic + silent-failure-hunter, all 3 doc-review mode). Changes: §3.3 fix Aphelion API names to public surface (`unpacker.unpack` + `verifier.verify_package` + `validator.validate_signatures` + `read_adapter.AphelionReadAdapter`) + require startup version assertion. §4.1 diagram match. §4.3 split empty-corpus row into accessible-vs-inaccessible; add lib-version-mismatch row; add audit-write-during-read row mandating hard raise. §4.4 carry-forward P-A2' startup validation explicit. §4.5 NEW — 9 normative Prom-shaped metrics for M7 observability. §7.1 E.3 soften Perihelion version pin (gate on M6.5 D2+D3 DoD evidence, not on a specific semver). §8.3 Q3 clarify "raise" colloquial usage + require empty-result counter for no-substitution enforcement. §8.4 Q4 add package-count ceiling caveat + stale-index window prohibition. §9 add M11 staleness ripple note. §10 add date to xcouncil reset cross-ref. §5.4 expand data-loss metric relocation + M4.5 backup track caveat. Wording: §4.1 "in parallel" → "independently" (avoid implying concurrent execution model). §3.2 grep enforcement OS-neutral. |
+| 2026-05-28 | v0.1.2-reframe-2026-05-28 | Round-3 fold. MED #1: §9.1 NEW — roadmap entry-condition reconcile note; spec §7 E.1-E.6 is the load-bearing gate; roadmap M7 row D1-D4 is STALE; pointer-add PR is hard prerequisite of impl PR. MED #2: §3.3 read-path required call set — explicit ordered call list; `extract_signer_manifests` OUT-OF-SCOPE for read path with rationale (ingest-time trust-store gate, not read-time). MED #3: §4.3 audit-write row — atomic-abort clarification ("Claims are NOT returned on `AphelionAuditWriteError`; read fully aborted; no partial state"). Bonus MED: §3.4 facade host pin — in-process import requires co-location; cross-host placement out of scope for M7; ADR prerequisite if ever changed. |

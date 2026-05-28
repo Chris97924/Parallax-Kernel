@@ -134,17 +134,19 @@ These boundaries are normative. Any future M7 implementation PR that violates th
 
 **Why**: The retrieve facade (M6.5 P0 thin shim, pm2-managed) is the only legal in-process touchpoint for Perihelion reads. Apex router calling Perihelion directly would (a) re-introduce the cross-machine in-process-import impossibility that the council rejected in M6.5 (Win/WSL2-resident Perihelion vs ZenBook-resident Apex), (b) defeat the timeout-and-fallback contract the shim guarantees (Perihelion unavailable → fall back to prefix, not raise into the public read path), and (c) entangle public-read SLA (p99 < 100ms) with private-read SLA (Perihelion can be slower because judge cascade).
 
-**Enforcement**: M7 router code review checklist MUST include `grep -E 'perihelion_(claim|episode|retrieval|ingest)' parallax/` → expected empty in router module. The shim is the *only* place Perihelion is imported.
+**Enforcement**: M7 router code review checklist MUST include a grep of the router module for `perihelion_(claim|episode|retrieval|ingest)` and a grep for any `import perihelion` line — both expected empty. (Adjust path separator and shell quoting per the reviewer's OS; the pattern is what matters, not the shell.) The shim is the *only* place Perihelion is imported.
 
 **Cross-ref**: `reference_memory_stack_architecture` §"為啥現在不能拆 — 3. Parallax retrieve quality 沒驗證夠"; M6.5 議會 推薦 (b) 獨立 thin shim 部署形態.
 
 ### 3.3 Boundary 3 — Public read = Aphelion `.aphelion.tar` package read (per M6 route A)
 
-**Rule**: All public-layer reads exposed by the Apex router go through the Aphelion-packaged file format. Concretely: the router reads from `PARALLAX_APHELION_PACKAGE_DIR` (per M5 entry spec §3.1c P-A2'), invokes `aphelion.read_package(path)` + `aphelion.validate_signatures(...)`, and returns claim list per Aphelion v0.5 lib API.
+**Rule**: All public-layer reads exposed by the Apex router go through the Aphelion-packaged file format. Concretely: the router reads from `PARALLAX_APHELION_PACKAGE_DIR` (per M5 entry spec §3.1c P-A2'), invokes the Aphelion lib public surface — `aphelion.unpacker.unpack()` (untar with v0.2 §S2.5 safety rules) + `aphelion.verifier.verify_package()` (signer chain validation) + `aphelion.read_adapter.AphelionReadAdapter` (claim/evidence projection) + `aphelion.validator.validate_signatures(...)` (claim-level signature check per v0.3 R1-R4) — and returns claim list per Aphelion v0.5+ lib API. The exact composition of these calls is implementation-detail for the M7 PR; this spec pins only the public-API surface used (no private `_*` functions, no internal modules).
 
 **Why**: This is the route-A pivot finalized 2026-05-16 noon. Route B (stub claim_loader reads JSON dir) is permanently rejected — it bypasses signer verification, evidence chains, and the canonical packaging contract. The Apex public layer's whole reason for existing is to expose *verified* knowledge; reading anything that isn't signature-verified is outside the product's value proposition.
 
-**Enforcement**: M7 router code review checklist MUST include "every read path eventually goes through `aphelion.read_package + validate_signatures`; no escape hatch for unsigned packages; `AphelionUnreachableError(reason='unsigned_package')` on signer fail".
+**Library compatibility (load-bearing)**: M7 router MUST assert `aphelion.__version__ >= REQUIRED_APHELION_MIN_VERSION` at process startup; mismatch raises a hard startup error rather than risking silent behavioral divergence (e.g., a future v0.6 lib that changes `verify_package()` return shape would otherwise be silently misinterpreted as success). `REQUIRED_APHELION_MIN_VERSION` is pinned in the M7 implementation PR — likely `"0.5.0"` per Aphelion v0.5 ship status.
+
+**Enforcement**: M7 router code review checklist MUST include "every read path eventually goes through `aphelion.verifier.verify_package + validator.validate_signatures`; no escape hatch for unsigned packages; `AphelionUnreachableError(reason='unsigned_package')` on signer fail; startup version assertion present and tested".
 
 **Cross-ref**: `docs/m6-prep/m6-ingest-contract-spec.md` v0.1-frozen-2026-05-17 (route A canonical decision); `docs/m5-prep/apex-m5-entry-spec.md` §3.1a "Signer verification" invariant; `docs/m5-prep/apex-m5-entry-spec.md` §3.1a "Untar safety" invariant (Aphelion v0.2 §S2.5 untar-safety rules carry forward unchanged).
 
@@ -183,8 +185,10 @@ Client (e.g. Claude Code UserPromptSubmit hook → retrieve facade shim)
    │      ├─→ resolve query → identify candidate .aphelion.tar package(s)
    │      │       via package-id index OR claim-key index (both maintained by M6 ingest)
    │      │
-   │      ├─→ aphelion.read_package(path)  [local FS read, no network]
-   │      ├─→ aphelion.validate_signatures(...)  [signer verification per §3.3]
+   │      ├─→ aphelion.unpacker.unpack(path)  [local FS read, no network, v0.2 §S2.5 safety]
+   │      ├─→ aphelion.verifier.verify_package(...)  [package signer chain]
+   │      ├─→ aphelion.validator.validate_signatures(...)  [claim-level sig per §3.3]
+   │      ├─→ aphelion.read_adapter.AphelionReadAdapter.query(...)  [claim/evidence project]
    │      │       │
    │      │       └─→ on fail: AphelionUnreachableError(reason="unsigned_package" |
    │      │                                                     "signer_untrusted" |
@@ -194,9 +198,12 @@ Client (e.g. Claude Code UserPromptSubmit hook → retrieve facade shim)
    │      ├─→ claim filter + evidence project per query
    │      └─→ return ranked claim list
    │
-   └─ (in parallel, NOT through Apex) retrieve facade shim also pulls
+   └─ (independently, NOT through Apex) retrieve facade shim also pulls
       Perihelion ranked claims via in-process Python API
-        — but that is M6.5's concern, not M7's
+        — but that is M6.5's concern, not M7's. "Independently" means
+        logically separate paths; the actual concurrency model
+        (sync sequential vs threaded vs async) is facade-side
+        implementation detail, not specified here.
 ```
 
 Apex returns its slice; the facade composes the final pre-prompt context. The composition / ranking / dedup between Apex and Perihelion claims is **facade business**, not Apex business. M7 spec does not specify it (and explicitly refuses to specify it, to avoid encroaching on Perihelion's territory).
@@ -220,21 +227,45 @@ The 100ms p99 is **load-tested goal**, not a hard fence — if M7 implementation
 | Package unsigned | `AphelionUnreachableError(reason="unsigned_package")` | Same as above (facade does NOT route to Perihelion as a fallback — §3.2 boundary) |
 | Signer untrusted | `AphelionUnreachableError(reason="signer_untrusted")` | Same |
 | Package corrupt | `AphelionUnreachableError(reason="package_corrupt")` | Same |
-| Aphelion lib raises unexpectedly | Apex wraps as `AphelionUnreachableError(reason="lib_error")` + audit-log the wrapped exception class | Same |
-| Empty corpus (no packages in `PARALLAX_APHELION_PACKAGE_DIR`) | Return empty claim list, NOT an error (this is a normal state on a fresh deploy) | Facade sees `[]` and proceeds without Apex context |
+| `PARALLAX_APHELION_PACKAGE_DIR` inaccessible (relative path, non-existent dir, no read perms, broken symlink) | `AphelionUnreachableError(reason="package_dir_inaccessible")` + observable counter `parallax_apex_package_dir_errors_total{reason}` — MUST NOT silently degrade to empty result | Facade logs as misconfiguration; ops alert |
+| Empty corpus — dir IS accessible but contains zero `.aphelion.tar` files | Return empty claim list (this is a legitimate fresh-deploy state); also emit `parallax_apex_empty_corpus_total` counter at first-read-per-process boundary so a stuck-empty deployment is visible in dashboards | Facade sees `[]` and proceeds without Apex context |
+| Aphelion lib version mismatch (detected at startup per §3.3) | Hard startup error (process refuses to come up); not a per-request failure | n/a — process never enters serving state |
+| Aphelion lib raises unexpectedly mid-request | Apex wraps as `AphelionUnreachableError(reason="lib_error", exc_class=<class name>)` + increment `parallax_apex_lib_errors_total{reason}` counter (Prom-observable, mirrors M5 `parallax_audit_write_failures_total` precedent) | Same as the "Package missing" row |
+| Audit ledger write failure during a divergence-telemetry read (R-10 path) | Hard raise `AphelionAuditWriteError(reason=<cause>)`; the claim list is NOT returned with a missing audit row. Also increment `parallax_audit_write_failures_total` (same counter M5 §3.1a defined) so the read-path audit failure surfaces in the same dashboard panel as the write-path failure | Facade logs + surfaces the error; **must not silently substitute Perihelion content for the failed read** |
 
-**Critical rule**: the §3.2 boundary forbids Apex falling back to Perihelion. The facade also must not fall back across the boundary (it composes both sides but does not substitute one for the other). This is the explicit decision in §8 Q3 below.
+**Critical rule**: the §3.2 boundary forbids Apex falling back to Perihelion. The facade also must not fall back across the boundary (it composes both sides but does not substitute one for the other). This is the explicit decision in §8 Q3 below. The audit-write-during-read row above is load-bearing because the natural implementer default ("read succeeded, audit failed, return claims anyway") silently drops the divergence audit row and breaks the M5 R-10 provenance guarantee — the spec forbids that path explicitly.
+
+**Library version assertion** (carries forward from §3.3): the version check is startup-only, not per-request. If the assertion ever fails at runtime (e.g., hot-reload swapped lib mid-process — not expected but not forbidden by Python), the spec treats this as a programmer-error path that does not need a per-request failure mode.
 
 ### 4.4 Read invariants carried forward from M5
 
-Several M5 invariants apply unchanged to M7 because they cover the same `aphelion.read_package + validate_signatures` path:
+Several M5 invariants apply unchanged to M7 because they cover the same package-read + signature-validation path:
 
 - R-7 session-scoped arbitration monotonicity (M5 §3.1c) — applies on read
 - R-8 Aphelion-wins arbitration (M5 §3.1c) — applies when M7 router serves a query that already saw a dual-read result from M5
 - R-10 divergence telemetry (M5 §3.1c) — applies on every Apex-overrides-cache event
 - Untar safety + signer mandatory + audit `package_id`-only (M5 §3.1a) — apply on every read
+- **M5 §3.1c P-A2' startup validation for `PARALLAX_APHELION_PACKAGE_DIR`** (existence, absolute path, read permission, no `..` segments) carries forward unchanged into M7. M7 does not re-derive this; the M5 entry condition is normative for M7 startup as well.
 
 M7 does not re-derive these; the M5 spec entries are normative for M7 as well.
+
+### 4.5 Observability requirements (M7-introduced metrics)
+
+M7 router MUST emit (at minimum) the following Prometheus-shaped metrics. Exact metric names below are normative; histograms and counters per Prom conventions. Dashboards and alerts are out-of-scope for this spec (per §8 Q5, observability is the second PR of the recommended 2-PR split), but the metric *contract* below is normative so the dashboards PR has stable names to bind to:
+
+| Metric | Type | Labels | Emit when |
+|---|---|---|---|
+| `parallax_apex_read_latency_ms` | Histogram (p50/p90/p99 buckets — bucket set TBD by impl PR) | `result={success, error}` | Every read regardless of outcome; measures wall-clock from request entry to result return |
+| `parallax_apex_read_total` | Counter | `result={success, error}` | Every read |
+| `parallax_apex_read_errors_total` | Counter | `reason={package_missing, unsigned_package, signer_untrusted, package_corrupt, package_dir_inaccessible, lib_error, audit_write_failure, other}` | Every `AphelionUnreachableError` or `AphelionAuditWriteError` raise |
+| `parallax_apex_package_dir_errors_total` | Counter | `reason={relative_path, dir_missing, perm_denied, broken_symlink, traversal_segment}` | Every misconfiguration detection at startup or first-read |
+| `parallax_apex_empty_result_total` | Counter | `cause={empty_corpus, no_matching_claim}` | Every read that returns `[]` for non-error reasons; distinguishes "no public knowledge on this topic" from "Apex unreachable" — load-bearing for §8 Q3 enforcement |
+| `parallax_apex_empty_corpus_total` | Counter | `dir={<dir-hash>}` | First-read-per-process when the package directory is accessible but empty; lets ops dashboards detect stuck-empty deploys |
+| `parallax_apex_lib_errors_total` | Counter | `reason={lib_error}`, `exc_class={<class name>}` | Every unexpected Aphelion lib exception wrap |
+| `parallax_apex_lib_version_info` | Gauge (info-style, value=1) | `version={<aphelion __version__>}`, `min_version={<REQUIRED_APHELION_MIN_VERSION>}` | Emit once at startup after version assertion succeeds; lets dashboards detect version drift across the fleet |
+| `parallax_audit_write_failures_total` | Counter (already defined by M5 §3.1a) | `path={read, write}` | M7 adds `path="read"` label value for the audit-write-during-read failure row in §4.3 |
+
+**No-substitution enforcement**: the `parallax_apex_empty_result_total` counter is the load-bearing signal the §3.2 boundary needs. If a facade silently substitutes Perihelion results for an empty Apex result, the counter would still increment (Apex returned `[]`) and dashboards would show "Apex empty" alongside "Perihelion served" — making the substitution visible. This is why the counter is required even when the facade does the right thing: it makes the right behavior auditable and the wrong behavior visible.
 
 ---
 
@@ -274,9 +305,14 @@ Per M5 envelope spec §8 Q1 (FROZEN 2026-05-09 PM, sha256-only REQUIRED no fallb
 
 The 2026-05-08 M7 DoD line "data_loss_events = 0 累積 10,000 write ops" was written assuming Apex owned a router-side write surface. After this reframe, the only write surface is `parallax ingest` (which is M6's responsibility) and the per-package audit.db write (which has its own atomicity guarantee shipped in PR #66). M7 does not introduce a new write operation, so this DoD line has nowhere to attach.
 
-The data-loss guarantee for the public layer is still important — it just lives in M6 + M5 audit.db invariants, not in M7. The 10k-ops metric becomes part of the M5/M6 long-running observation track (already tracked via `parallax_audit_write_failures_total`).
+The data-loss guarantee for the public layer is still important — it just lives in M6 + M5 audit.db invariants, not in M7. The relocated home for the metric is:
+
+- **Write-failure observability**: `parallax_audit_write_failures_total` (M5 §3.1a) — counts audit-row write failures on both write path (M6 ingest) and read path (M7 R-10 divergence telemetry, per §4.3 and §4.5).
+- **Data-loss-events-zero assertion**: M5/M6 long-running observation track. The 10k-write-ops counting metric is a *derived* metric (cumulative writes since last `audit_write_failures_total` increment); if M5/M6 specs do not currently name this derived metric, that is a gap **upstream** of this M7 spec and SHOULD be raised before opening the M7 implementation PR. M7 inherits whatever name M5/M6 settle on; M7 does not introduce it.
 
 The 2026-05-08 M7 DoD line "跨過一次完整 backup/restore 週期" reframes to: M4.5 S3 backup track owns backup; M7 inherits whatever posture M4.5 settles on (S3 bucket + `parallax-backup.timer/.service` per M4.5 entry on the roadmap). No new backup work in M7.
+
+> **Caveat**: As of 2026-05-28, the M4.5 S3 backup track exists as a roadmap entry (carved out via 5/9 council vote) but has not yet been spec'd as a standalone document or shipped as code. The M7 entry condition that inherits M4.5 backup posture is therefore load-bearing on M4.5 actually shipping. If M4.5 is still vapor at M7 entry time, the M7 implementation PR may need a stop-gap backup runbook or escalate to Chris for a re-prioritization decision.
 
 ---
 
@@ -324,7 +360,7 @@ This rollback simplicity is one of the reasons the reframe is *better* than the 
 |---|---|---|
 | E.1 | **M5 GA active** — M4 canary @100% DoD signed off; M5 dual-write activates naturally per M5 roadmap entry | Roadmap M4/M5 row green; Chris ACK in `#m4-canary` (or successor channel) |
 | E.2 | **M6 ingest pipeline deployed to ZenBook** | M6 code is already MERGED to main-next `a978cff` per M6 roadmap entry; deploy is the gating step — `parallax ingest --version` returns expected on ZenBook + at least one `.aphelion.tar` ingested into the live audit.db |
-| E.3 | **Perihelion v0.7.6+ stable** — M6.5 P2 soak window ≥ 2 weeks complete with zero data-loss | M6.5 D2 + D3 DoD met (per M6.5 roadmap row); Perihelion deployed + retrieve quality eval set passing |
+| E.3 | **Perihelion version where M6.5 D2 + D3 DoD met** — soak window ≥ 2 weeks with zero data-loss + injection-quality not regressing. As of 2026-05-28, Perihelion main is `5cbd9ca` (PR #13 P2 substrate merged); v0.7.0 is the latest tag; v0.7.5 is in PR; v0.7.6 (P2 application wiring + soak host) is queued behind v0.7.5. The exact tag that satisfies E.3 will be whichever version is in deploy when the soak clock reaches 14 days clean — likely v0.7.6 or later, but the spec gates on D2/D3 DoD evidence, not on a specific semver. | M6.5 D2 + D3 DoD met (per M6.5 roadmap row); Perihelion deployed + retrieve quality eval set passing; soak clock evidence in audit log |
 | E.4 | **No M5 production rollback active or pending hysteresis** | Carry forward from M5 §2 E.5 — `RollbackController.state == RUNNING`, not `TRIPPED` / `AWAITING_ACK` |
 | E.5 | **Public-read SLA preview met on M6 ingested corpus** — at least one synthetic load test demonstrates p99 < 100ms on Apex read path against a non-empty `PARALLAX_APHELION_PACKAGE_DIR` | Stress test artifact under `docs/m7-prep/` similar to M6 stress test (28650rps p99=0.057ms) |
 | E.6 | **§3 boundary lint passes** — grep checks on M7 implementation branch return empty for Perihelion imports in router modules | Pre-merge CI hook OR manual reviewer checklist |
@@ -400,13 +436,21 @@ Rationale:
 
 **Question**: When Apex public-read returns an empty result for a query, should the caller (retrieve facade) substitute / fall back to a Perihelion query on the same key? OR should public-read empty be surfaced as empty with no cross-layer substitution?
 
-**Recommendation**: **Raise (i.e., surface empty as empty, no fallback to Perihelion). The facade composes both sides; it does not substitute.**
+**Recommendation**: **Surface the empty / error state without substituting Perihelion content. The facade composes both sides; it does not substitute.**
+
+Concretely this means:
+
+- **Empty Apex result** (non-error, public corpus simply has no match): facade still returns whatever Perihelion produced in its own slot of the composed result, but the Apex slot stays empty and is observable. The facade MUST emit `parallax_apex_empty_result_total{cause}` (per §4.5) so the empty-state is visible in dashboards; substituting Perihelion content into the Apex slot is forbidden.
+- **Apex error** (`AphelionUnreachableError` / `AphelionAuditWriteError`): facade logs + surfaces the error to the upstream caller (Claude Code hook); does not silently swap Perihelion content into the Apex slot to hide the failure.
+
+The word "raise" in earlier drafts of this question used a colloquial sense ("surface, do not hide"). The normative behavior is the §4.5 metric requirement plus the no-substitution rule above — not a Python `raise` per se.
 
 Rationale:
 1. §3.2 boundary 2 forbids Apex reading Perihelion. The facade is a separate component, so technically the facade could fall back across the boundary. But that would defeat the whole reconcile: it would re-merge the two layers from the consumer's perspective.
 2. Public knowledge and private self-model claims have different semantic types. A query "what did I think about retrieval in May?" is private; a query "what does Aphelion v0.3 R1 say about polarity?" is public. Cross-layer substitution would produce semantically wrong results — the system would answer a public query with private content or vice versa.
 3. The 2026-05-28 reconcile explicitly framed "雙軌獨立" (two independent tracks). Substitution violates "獨立".
 4. Empty Apex result means the public corpus does not have a match. That is useful information for the caller; substituting hides it.
+5. The `parallax_apex_empty_result_total` counter (§4.5) makes the no-substitution rule auditable: a facade that silently substitutes would still increment the counter (Apex genuinely returned `[]`), so dashboards would show "Apex empty" alongside "Perihelion served" — the substitution is visible to ops even if it sneaks past code review.
 
 **Chris-gated note**: if Chris later wants a unified retrieve experience where the facade does opportunistic substitution, that is a *facade-side* decision (M6.5 P3 or a future M9 OSS surface), not Apex's. The recommendation above just refuses to bake substitution into M7 default behavior. Chris can override per-call via an explicit facade flag.
 
@@ -422,7 +466,11 @@ Rationale:
 3. If profiling at M7 implementation time shows per-read rebuild eats > 30ms, M7 PR can add a clock-tick refresh (e.g., every 10s background thread re-scans the dir) as a small follow-up.
 4. inotify (Linux) / ReadDirectoryChangesW (Windows) introduces daemon-lifecycle complexity that the M5/M6 burn-in stack already struggles with (per `project_messier_v4_v5_progress` 2026-05-16 sandbox bugs). Deferring this complexity to M8 is reasonable.
 
-**Chris-gated note**: this is the lowest-stakes of the four questions. The recommendation is a sensible v0 default; the M7 PR author should pick based on package count and profiling data at impl time. Chris can override but unlikely to need to.
+**Scaling assumption (load-bearing)**: the per-read recommendation assumes package count stays in the "10s of packages" range. If `PARALLAX_APHELION_PACKAGE_DIR` grows past ~100 packages (e.g., a wiki ingest produces one `.aphelion.tar` per top-level topic), the per-read directory scan + manifest read could exceed the 100ms p99 budget. M7 implementation PR MUST profile against the actual expected package count and document the chosen package-count ceiling for per-read mode. Past the ceiling, M7 (or M8 follow-up) moves to a refresh strategy.
+
+**Stale-index window** (when M7 or M8 eventually moves off per-read): any clock-tick or inotify implementation MUST define behavior for the window between a new package landing on disk and the index seeing it. Queries during that window MUST NOT silently return stale-empty for keys present in the new package — the index either (a) rebuilds synchronously on cache miss before returning empty, or (b) emits an explicit `parallax_apex_index_staleness_seconds` gauge that ops can alert on. The spec does not prescribe which; the spec forbids the silent-stale-window path.
+
+**Chris-gated note**: this is the lowest-stakes of the four questions for the v0 default but the highest-stakes for the scaling story. The M7 PR author should pick based on profiling data + the package-count ceiling. Chris can override but unlikely to need to.
 
 ### 8.5 Q5 — M7 PR split strategy
 
@@ -451,6 +499,7 @@ These are listed so future readers (including LLM agents reading this in some se
 - **Does not specify the router module path** (e.g., `parallax/apex/router.py` vs `parallax/router/apex.py`). That's an M7 implementation PR concern.
 - **Does not modify MEMORY.md or any prefix file.** §6 explicitly defers shrink to M6.5 P3.
 - **Does not bind M9 SDK / OSS Surface Lock decisions.** M7 ships well before M9.
+- **Does not reconcile the M11 roadmap entry.** M11's current body ("Parallax 成為 Claude Code session continuity SSoT 永久取代 MEMORY.md" + "刪 MEMORY.md.bak 跑 7 天") inherits the same 2026-05-08 era Parallax-centric framing that this spec reframes for M7. After the 2026-05-28 reconcile, M11 also needs a wording pass — Parallax alone does not replace the private layer, and there is no `.bak` to delete because the per-purpose shrink schedule (§6) doesn't produce one. The M11 reconcile is **out-of-scope for this PR** but is flagged here so a future session can pick it up. M10 DoD that says "所有 M7 條件維持 30 天" will inherit whatever M7 conditions are defined by this spec, which is the desired ripple — M10 needs no separate reconcile.
 
 ---
 
@@ -463,7 +512,7 @@ For future readers tracing the lineage of this reframe:
 - **Stack model** — `reference_memory_stack_architecture` (4-layer)
 - **Roadmap ripple** — `messier-roadmap-v0-to-v11.md` M7 段 2026-05-22 ripple note
 - **Singularity framing** — `project_singularity_cosmological_umbrella` (LOCKED 2026-05-07) + `active.md` Singularity section
-- **Sibling spec — M6.5** — `messier-roadmap-v0-to-v11.md` M6.5 段 + `project_apex_m65_redesign` + xcouncil reset (Opus 4.7 + GPT 5.5 dual judge HIGH consensus)
+- **Sibling spec — M6.5** — `messier-roadmap-v0-to-v11.md` M6.5 段 + `project_apex_m65_redesign` + xcouncil reset 2026-05-22 (Opus 4.7 + GPT 5.5 dual judge HIGH consensus)
 - **M6 ingest route A** — `docs/m6-prep/m6-ingest-contract-spec.md` v0.1-frozen-2026-05-17 + roadmap M6 段
 - **M5 spec** — `docs/m5-prep/apex-m5-entry-spec.md` v0.3.0-reframe (local-file adapter, signature verification, untar safety)
 - **M5 audit row** — `docs/m5-prep/audit-db-path-config.md` §6
@@ -478,3 +527,4 @@ For future readers tracing the lineage of this reframe:
 | Date | Version | Change |
 |---|---|---|
 | 2026-05-28 | v0.1-reframe-2026-05-28 | Initial reframe. Reframes 2026-05-08 M7 entry per 2026-05-28 MIDDAY framing reconcile + 2026-05-20 Perihelion directive + 2026-05-22 roadmap ripple note. 8 sections + open questions + cross-refs. |
+| 2026-05-28 | v0.1.1-reframe-2026-05-28 | Folded internal team review feedback (architect + critic + silent-failure-hunter, all 3 doc-review mode). Changes: §3.3 fix Aphelion API names to public surface (`unpacker.unpack` + `verifier.verify_package` + `validator.validate_signatures` + `read_adapter.AphelionReadAdapter`) + require startup version assertion. §4.1 diagram match. §4.3 split empty-corpus row into accessible-vs-inaccessible; add lib-version-mismatch row; add audit-write-during-read row mandating hard raise. §4.4 carry-forward P-A2' startup validation explicit. §4.5 NEW — 9 normative Prom-shaped metrics for M7 observability. §7.1 E.3 soften Perihelion version pin (gate on M6.5 D2+D3 DoD evidence, not on a specific semver). §8.3 Q3 clarify "raise" colloquial usage + require empty-result counter for no-substitution enforcement. §8.4 Q4 add package-count ceiling caveat + stale-index window prohibition. §9 add M11 staleness ripple note. §10 add date to xcouncil reset cross-ref. §5.4 expand data-loss metric relocation + M4.5 backup track caveat. Wording: §4.1 "in parallel" → "independently" (avoid implying concurrent execution model). §3.2 grep enforcement OS-neutral. |

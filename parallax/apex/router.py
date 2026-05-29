@@ -244,6 +244,10 @@ def validate_package_dir(package_dir: Path | str) -> Path:
         raise _fail("relative_path")
     if any(part == ".." for part in path.parts):
         raise _fail("traversal_segment")
+    # A dangling symlink reports exists()==False; classify it as the spec-named
+    # ``broken_symlink`` reason (§4.5) rather than folding it into dir_missing.
+    if path.is_symlink() and not path.exists():
+        raise _fail("broken_symlink")
     if not path.exists():
         raise _fail("dir_missing")
     if not path.is_dir():
@@ -335,6 +339,12 @@ class ApexPublicReadRouter:
         Raises :class:`AphelionUnreachableError` (typed reason) on any package
         verification failure. An accessible-but-empty corpus is a legitimate
         fresh-deploy state: it returns ``()`` and emits ``empty_corpus``.
+
+        Concurrency: a router instance is single-context per call — it relies on
+        the M5 adapter's per-call ``audit_conn_provider`` (thread-local) pattern,
+        and ``_last_corpus_empty`` is per-instance scratch state set here and read
+        by :meth:`query` immediately after. Do not share one instance across
+        concurrent queries without external synchronization.
         """
         tars = sorted(self._package_dir.glob("*.aphelion.tar"))
         self._last_corpus_empty = not tars
@@ -344,6 +354,11 @@ class ApexPublicReadRouter:
 
         claims: list[Mapping[str, Any]] = []
         for tar in tars:
+            # Abort-on-first-bad-package is load-bearing (§4.3): any exception
+            # from _read_package_claims MUST propagate and fail the whole read.
+            # Silently skipping a corrupt package and returning partial results
+            # from the others is forbidden — a future "graceful degradation"
+            # mode would be an explicit spec deviation, not a quiet loop change.
             claims.extend(self._read_package_claims(tar))
         return tuple(claims)
 
@@ -391,11 +406,21 @@ class ApexPublicReadRouter:
         would normally reject a divergent fileset, the read path does not rely on
         that to keep its own filesystem access in-bounds.
         """
-        manifest = json.loads((extracted / "manifest.json").read_text(encoding="utf-8"))
-        package_id = manifest["package_id"]
+        # A package that passed verify_package but whose manifest is unreadable /
+        # not JSON / missing required keys is a corrupt package, not a lib bug —
+        # surface package_corrupt for a precise metric label (rather than letting
+        # it fall through the caller's total fence into the vaguer lib_error).
+        try:
+            manifest = json.loads((extracted / "manifest.json").read_text(encoding="utf-8"))
+            package_id = manifest["package_id"]
+            entries = manifest["claims"]
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            _log.error("apex public-read manifest unreadable in %s: %s", tar.name, exc)
+            raise AphelionUnreachableError("package_corrupt") from exc
+
         extracted_root = extracted.resolve()
         out: list[Mapping[str, Any]] = []
-        for entry in manifest["claims"]:
+        for entry in entries:
             claim_path = (extracted / entry["path"]).resolve()
             try:
                 claim_path.relative_to(extracted_root)
@@ -406,7 +431,18 @@ class ApexPublicReadRouter:
                     tar.name,
                 )
                 raise AphelionUnreachableError("package_corrupt") from exc
-            frontmatter = _read_claim_frontmatter(claim_path)
+            try:
+                frontmatter = _read_claim_frontmatter(claim_path)
+            except (OSError, UnicodeDecodeError) as exc:
+                # Claim file present-but-unreadable (e.g. perms changed after
+                # unpack) is distinct from a genuine lib bug; tag it corrupt.
+                _log.error(
+                    "apex public-read claim unreadable %s in %s: %s",
+                    entry.get("path"),
+                    tar.name,
+                    exc,
+                )
+                raise AphelionUnreachableError("package_corrupt") from exc
             out.append({**frontmatter, "package_id": package_id})
         return tuple(out)
 

@@ -327,6 +327,20 @@ class TestValidatePackageDir:
             validate_package_dir(sneaky)
         assert exc.value.reason == "package_dir_inaccessible"
 
+    def test_broken_symlink_counts_as_broken_symlink(self, tmp_path: Path) -> None:
+        """A dangling symlink is classified under the spec-named broken_symlink."""
+        link = tmp_path / "pkgs_link"
+        try:
+            link.symlink_to(tmp_path / "nonexistent_target", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlink creation unprivileged on this platform")
+        before = _counter_value(router_mod.PACKAGE_DIR_ERRORS, reason="broken_symlink")
+        with pytest.raises(AphelionUnreachableError) as exc:
+            validate_package_dir(link)
+        assert exc.value.reason == "package_dir_inaccessible"
+        after = _counter_value(router_mod.PACKAGE_DIR_ERRORS, reason="broken_symlink")
+        assert after == before + 1
+
 
 # ===========================================================================
 # Unit — claim-path traversal guard (W6 cross-review Tier-A hardening)
@@ -363,6 +377,23 @@ class TestProjectClaimsPathTraversal:
         outside = tmp_path / "outside.md"
         outside.write_text("---\nclaim_id: c1\n---\n", encoding="utf-8")
         self._write_manifest(extracted, str(outside))
+        with pytest.raises(AphelionUnreachableError) as exc:
+            ApexPublicReadRouter._project_claims(tmp_path / "x.aphelion.tar", extracted)
+        assert exc.value.reason == "package_corrupt"
+
+    def test_unreadable_manifest_is_package_corrupt(self, tmp_path: Path) -> None:
+        """Manifest that survived verify but is not valid JSON → package_corrupt."""
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        (extracted / "manifest.json").write_text("{not json", encoding="utf-8")
+        with pytest.raises(AphelionUnreachableError) as exc:
+            ApexPublicReadRouter._project_claims(tmp_path / "x.aphelion.tar", extracted)
+        assert exc.value.reason == "package_corrupt"
+
+    def test_manifest_missing_required_key_is_package_corrupt(self, tmp_path: Path) -> None:
+        extracted = tmp_path / "extracted"
+        extracted.mkdir()
+        (extracted / "manifest.json").write_text('{"claims": []}', encoding="utf-8")
         with pytest.raises(AphelionUnreachableError) as exc:
             ApexPublicReadRouter._project_claims(tmp_path / "x.aphelion.tar", extracted)
         assert exc.value.reason == "package_corrupt"
@@ -422,9 +453,17 @@ class TestModuleHygiene:
         assert "from perihelion" not in source
 
     def test_no_ghost_audit_write_error_class(self) -> None:
-        """Hard gate (#68 reconcile): AphelionAuditWriteError must stay clean."""
-        source = Path(router_mod.__file__).read_text(encoding="utf-8")
-        assert "AphelionAuditWriteError" not in source
+        """Hard gate (#68 reconcile): AphelionAuditWriteError must stay clean.
+
+        Covers both the M7 router and the reused M5 adapter (the #68 reconcile
+        touched the adapter), since the ghost class must not exist as a code
+        symbol in either.
+        """
+        from parallax.router import aphelion_adapter
+
+        for mod in (router_mod, aphelion_adapter):
+            source = Path(mod.__file__).read_text(encoding="utf-8")
+            assert "AphelionAuditWriteError" not in source, mod.__name__
 
     def test_read_path_does_not_use_extract_signer_manifests(self) -> None:
         """§3.3: extract_signer_manifests is OUT-OF-SCOPE for the read path."""

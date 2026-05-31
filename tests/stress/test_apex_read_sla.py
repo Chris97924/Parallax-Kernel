@@ -55,6 +55,30 @@ class TestStressHarnessMechanics:
         assert "| packages |" in md
         assert "§8.4 Q4" in md
 
+    def test_markdown_handles_no_passing_ceiling(self) -> None:
+        """When no swept size passes (ceiling=None), the prose must not print the
+        literal 'None package(s)' — it renders '0 packages' instead."""
+        report = {
+            "sla_p99_ms": 100.0,
+            "iters": 10,
+            "results": [
+                {
+                    "package_count": 1,
+                    "p50_ms": 120.0,
+                    "p95_ms": 130.0,
+                    "p99_ms": 140.0,
+                    "max_ms": 150.0,
+                    "error_count": 0,
+                }
+            ],
+            "p99_under_sla_ceiling_packages": None,
+            "slo_pass": False,
+        }
+        md = harness.render_markdown(report, generated_at="t", host="h")
+        assert "None package" not in md
+        assert "0 packages" in md
+        assert "FAIL" in md
+
 
 @pytest.mark.unit
 class TestPercentile:

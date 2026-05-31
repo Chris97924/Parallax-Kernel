@@ -1,9 +1,9 @@
 # Apex M7 Public-Read — SLA Preview (spec §7.1 E.5)
 
-- Generated: 2026-05-31T05:55:57Z
+- Generated: 2026-05-31T06:52:32Z
 - Host: DESKTOP-0BKLFNS
 - SLA preview budget (§4.2): **p99 < 100ms**, zero errors
-- Iterations per package count: 100
+- Iterations per package count: 200
 - Harness: `scripts/m7_apex_read_stress.py` (real signed `.aphelion.tar`, no mocks)
 
 ## Package-count sweep
@@ -14,11 +14,11 @@ validate_signatures → projection) across **every** package in the corpus
 
 | packages | p50 (ms) | p95 (ms) | p99 (ms) | max (ms) | errors | SLO |
 |---|---|---|---|---|---|---|
-| 1 | 14.862 | 16.492 | 18.168 | 22.341 | 0 | ✅ |
-| 2 | 29.092 | 32.955 | 39.498 | 48.953 | 0 | ✅ |
-| 4 | 57.978 | 65.743 | 78.368 | 96.252 | 0 | ✅ |
-| 8 | 115.159 | 124.336 | 132.123 | 171.122 | 0 | ❌ |
-| 16 | 228.649 | 244.179 | 248.778 | 310.378 | 0 | ❌ |
+| 1 | 15.037 | 19.405 | 23.38 | 39.602 | 0 | ✅ |
+| 2 | 29.161 | 34.752 | 44.46 | 62.633 | 0 | ✅ |
+| 4 | 57.656 | 63.131 | 75.513 | 107.28 | 0 | ✅ |
+| 8 | 116.923 | 134.253 | 182.508 | 267.466 | 0 | ❌ |
+| 16 | 230.853 | 257.581 | 289.171 | 394.057 | 0 | ❌ |
 
 ## Findings
 

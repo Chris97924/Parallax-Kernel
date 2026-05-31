@@ -474,6 +474,16 @@ class ApexPublicReadRouter:
             self._record(start, "error")
             self._record_error(err)
             raise
+        except Exception as exc:
+            # §4.3/§4.5: an unexpected (non-typed) adapter failure must still be
+            # metric-visible — making read failures observable is this layer's
+            # whole job, and a metric-dark error would let ApexReadErrorRateHigh
+            # silently never fire. Record the call as an error + tag it lib_error
+            # with the real class, then re-raise the ORIGINAL exception unchanged
+            # (the caller's contract is preserved; the type is not masked).
+            self._record(start, "error")
+            READ_ERRORS.labels(reason="lib_error", exc_class=type(exc).__name__).inc()
+            raise
 
         self._record(start, "success")
         if not evidence.hits:

@@ -291,15 +291,20 @@ def run_sweep(package_counts: list[int], iters: int) -> dict[str, Any]:
         if not _passes(r):
             break
         ceiling = r["package_count"]
-    # Overall SLO: the smallest non-empty corpus (single package) must meet the
-    # p99<100ms budget with zero errors. The ceiling documents §8.4 Q4 scaling.
-    smallest = min(results, key=lambda r: r["package_count"])
+    # Overall SLO: the single-package corpus must meet the p99<100ms budget with
+    # zero errors. Anchor on package_count==1 specifically (the E.5 "non-empty
+    # corpus" baseline), not just the smallest swept count — a custom
+    # --package-counts that omits 1 would otherwise silently re-anchor slo_pass
+    # on a larger corpus. Falls back to the smallest swept count if 1 was omitted.
+    baseline = next((r for r in results if r["package_count"] == 1), None)
+    if baseline is None:
+        baseline = min(results, key=lambda r: r["package_count"])
     return {
         "sla_p99_ms": SLA_P99_MS,
         "iters": iters,
         "results": results,
         "p99_under_sla_ceiling_packages": ceiling,
-        "slo_pass": smallest["p99_ms"] < SLA_P99_MS and smallest["error_count"] == 0,
+        "slo_pass": _passes(baseline),
     }
 
 
@@ -334,6 +339,9 @@ def render_markdown(report: dict[str, Any], *, generated_at: str, host: str) -> 
             f"{r['p99_ms']} | {r['max_ms']} | {r['error_count']} | {verdict} |"
         )
     ceiling = report["p99_under_sla_ceiling_packages"]
+    ceiling_str = (
+        f"{ceiling} package(s)" if ceiling is not None else "0 packages (no swept size passed)"
+    )
     lines += [
         "",
         "## Findings",
@@ -342,7 +350,7 @@ def render_markdown(report: dict[str, Any], *, generated_at: str, host: str) -> 
         f"{'PASS' if report['slo_pass'] else 'FAIL'} — E.5 demonstrates p99 < "
         f"{report['sla_p99_ms']:.0f}ms on a non-empty corpus.",
         f"- **Per-read scan ceiling (§8.4 Q4):** p99 stays under the "
-        f"{report['sla_p99_ms']:.0f}ms SLA up to **{ceiling} package(s)** at this "
+        f"{report['sla_p99_ms']:.0f}ms SLA up to **{ceiling_str}** at this "
         "iteration count on this host. Beyond the ceiling, the per-read full-scan "
         "design exceeds the budget — the §8.4 Q4 package-count ceiling is real and "
         "an index/refresh strategy (clock-tick or cache-miss rebuild) is required "

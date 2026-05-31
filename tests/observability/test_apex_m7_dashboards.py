@@ -23,6 +23,7 @@ import json
 import math
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -99,16 +100,18 @@ def _walk_exprs(node: object) -> list[str]:
     return found
 
 
-def _dashboard() -> dict:
-    return json.loads(_DASHBOARD.read_text(encoding="utf-8"))
+def _dashboard() -> dict[str, Any]:
+    data: dict[str, Any] = json.loads(_DASHBOARD.read_text(encoding="utf-8"))
+    return data
 
 
-def _rules() -> dict:
-    return yaml.safe_load(_RULES.read_text(encoding="utf-8"))
+def _rules() -> dict[str, Any]:
+    data: dict[str, Any] = yaml.safe_load(_RULES.read_text(encoding="utf-8"))
+    return data
 
 
-def _rule_entries() -> list[dict]:
-    out: list[dict] = []
+def _rule_entries() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
     for group in _rules().get("groups", []):
         out.extend(group.get("rules", []))
     return out

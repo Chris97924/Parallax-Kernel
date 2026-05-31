@@ -279,7 +279,7 @@ def run_sweep(package_counts: list[int], iters: int) -> dict[str, Any]:
     results = [measure(count, iters) for count in sorted(set(package_counts))]
 
     def _passes(r: dict[str, Any]) -> bool:
-        return r["p99_ms"] < SLA_P99_MS and r["error_count"] == 0
+        return bool(r["p99_ms"] < SLA_P99_MS and r["error_count"] == 0)
 
     # Ceiling = largest corpus size that passes AND for which every smaller size
     # also passed. Walking from the smallest and stopping at the first failure

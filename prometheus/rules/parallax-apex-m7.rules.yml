@@ -1,0 +1,136 @@
+groups:
+  - name: parallax_apex_m7_public_read
+    interval: 30s
+    rules:
+      # SLA preview (spec §4.2): p99 read latency < 100ms. Sized as a WARNING,
+      # not critical — §4.2 calls the 100ms budget a "load-tested goal, not a
+      # hard fence" (the hard fence is M8's 5k QPS test). The latency histogram
+      # buckets straddle 100ms (parallax.apex.router.READ_LATENCY_BUCKETS) so
+      # histogram_quantile resolves the true p99 instead of saturating at the
+      # default le=10.0 ceiling.
+      #
+      # Traffic guard: histogram_quantile over an empty range yields NaN, and
+      # NaN-comparison semantics drift across Prometheus versions. The
+      # `and (... read_total ... > 0)` clause makes the alert silently no-op
+      # during zero-traffic windows (pre-deploy / idle) rather than relying on
+      # NaN behavior. Both sides reduce to a single label-less series so `and`
+      # matches on the empty label set.
+      - alert: ApexReadLatencyP99High
+        expr: |
+          (histogram_quantile(0.99, sum(rate(parallax_apex_read_latency_ms_bucket[5m])) by (le)) > 100)
+          and
+          (sum(rate(parallax_apex_read_total[5m])) > 0)
+        for: 10m
+        labels:
+          severity: warning
+          component: parallax_apex_m7
+        annotations:
+          summary: Apex public-read p99 latency above the 100ms SLA preview for 10min
+          description: |
+            histogram_quantile(0.99) of parallax_apex_read_latency_ms has exceeded
+            the §4.2 p99<100ms SLA preview for 10 minutes. Investigate package count
+            growth (§8.4 Q4 per-read scan ceiling), signature-verification cost, or
+            disk latency. Not a hard fence — escalate to a follow-up tightening track
+            per spec §4.2 rather than rolling back.
+            Spec: docs/m7-prep/apex-router-public-read-spec.md §4.2.
+
+      # Read error fraction > 1% for 5min. Denominator guarded with `> 0` so the
+      # ratio is dropped (no alert) during zero-traffic windows instead of NaN.
+      - alert: ApexReadErrorRateHigh
+        expr: |
+          (sum(rate(parallax_apex_read_errors_total[5m]))
+           /
+           (sum(rate(parallax_apex_read_total[5m])) > 0)) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: parallax_apex_m7
+        annotations:
+          summary: Apex public-read error rate above 1% for 5min
+          description: |
+            parallax_apex_read_errors_total / parallax_apex_read_total exceeded 1%
+            for 5 minutes. Break down by `reason` (package_missing / unsigned_package
+            / signer_untrusted / package_corrupt / package_dir_inaccessible /
+            lib_error / audit_db_write_failed) on the M7 dashboard. Per §3.2 the
+            facade MUST NOT substitute Perihelion content for these failures.
+            Spec: docs/m7-prep/apex-router-public-read-spec.md §4.3.
+
+      # Package-dir misconfiguration is a deploy/config fault, never a per-request
+      # failure (§4.4 P-A2'). Any detection in the last 10min pages immediately.
+      - alert: ApexPackageDirMisconfigured
+        expr: sum(increase(parallax_apex_package_dir_errors_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: parallax_apex_m7
+        annotations:
+          summary: Apex PARALLAX_APHELION_PACKAGE_DIR misconfigured
+          description: |
+            parallax_apex_package_dir_errors_total incremented (reason ∈
+            relative_path / traversal_segment / broken_symlink / dir_missing /
+            perm_denied). The router refuses to serve a misconfigured package dir
+            and raises AphelionUnreachableError(reason="package_dir_inaccessible")
+            rather than silently degrading to empty results. Fix the deploy config.
+            Spec: docs/m7-prep/apex-router-public-read-spec.md §4.4.
+
+      # Read-path audit-row write failure = R-10 provenance break (§4.3). The read
+      # was atomically aborted (no partial state). This counter is DISTINCT from
+      # M5's write-path parallax_audit_write_failures_total. NOTE: §4.5's label
+      # enum names this failure `audit_write_failure` while §4.3 + the impl + #68
+      # name the read-error reason `audit_db_write_failed`; alerting on the
+      # dedicated parallax_apex_audit_write_failures_total counter sidesteps that
+      # spec-internal label inconsistency entirely (resolves the PR #69 flag).
+      - alert: ApexAuditWriteFailure
+        expr: sum(increase(parallax_apex_audit_write_failures_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: parallax_apex_m7
+        annotations:
+          summary: Apex read-path audit-row write failure (R-10 provenance break)
+          description: |
+            parallax_apex_audit_write_failures_total incremented — a divergence
+            telemetry audit row failed to write during a read, and the read was
+            fully aborted (no claims returned, no partial state). Investigate the
+            audit.db (disk full / locked / corrupt). Provenance for the affected
+            reads is missing until resolved.
+            Spec: docs/m7-prep/apex-router-public-read-spec.md §4.3 + §4.5.
+
+      # Stuck-empty corpus: empty_result{cause="empty_corpus"} increments on EVERY
+      # read against an accessible-but-empty package dir (unlike empty_corpus_total
+      # which only counts first-read-per-process). A sustained rate for >1h means
+      # this host keeps serving reads with no packages — i.e. M6 ingest is not
+      # reaching it. EXPECTED on a fresh deploy until the first package lands.
+      - alert: ApexStuckEmptyCorpus
+        expr: sum(rate(parallax_apex_empty_result_total{cause="empty_corpus"}[15m])) > 0
+        for: 1h
+        labels:
+          severity: warning
+          component: parallax_apex_m7
+        annotations:
+          summary: Apex serving reads against an empty corpus for over 1h
+          description: |
+            parallax_apex_empty_result_total{cause="empty_corpus"} has been
+            incrementing for over an hour — the package dir is accessible but
+            empty while reads keep arriving. Expected immediately after a fresh
+            deploy; otherwise M6 `parallax ingest` is not reaching this host.
+            Spec: docs/m7-prep/apex-router-public-read-spec.md §4.3 (empty-corpus row).
+
+      # Aphelion lib version drift across the fleet. The §3.3 startup assertion
+      # pins a floor; this alerts when more than one distinct version label is
+      # exposed (e.g. a partial rollout left mixed versions serving reads).
+      - alert: ApexLibVersionDrift
+        expr: count(count by (version) (parallax_apex_lib_version_info)) > 1
+        for: 5m
+        labels:
+          severity: warning
+          component: parallax_apex_m7
+        annotations:
+          summary: More than one Aphelion lib version serving Apex reads
+          description: |
+            parallax_apex_lib_version_info exposes >1 distinct `version` label —
+            the fleet is running mixed Aphelion versions. The §3.3 startup version
+            assertion guarantees each is at/above the floor, but mixed versions can
+            still mean behavioral divergence in verify_package/validate_signatures.
+            Reconcile the deploy to a single version.
+            Spec: docs/m7-prep/apex-router-public-read-spec.md §3.3.

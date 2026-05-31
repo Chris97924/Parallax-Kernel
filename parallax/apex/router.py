@@ -109,11 +109,21 @@ def _get_or_create(factory: Any, base_name: str) -> Any:
         raise
 
 
+# Histogram buckets are in MILLISECONDS (the metric observes ``elapsed_ms``).
+# prometheus_client's DEFAULT_BUCKETS top out at a finite ``le=10.0`` — fine for
+# second-scale latencies, but here a 50ms read lands only in ``+Inf`` and
+# ``histogram_quantile`` saturates at 10, making the §4.2 p99<100ms SLA alert
+# structurally unmeasurable. §4.5 left "bucket set TBD by impl PR"; this
+# observability slice pins it. Boundaries straddle the 100ms SLA so p50/p90/p99
+# resolve below it and breaches above it stay visible.
+READ_LATENCY_BUCKETS = (1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 150.0, 250.0, 500.0, 1000.0)
+
 READ_LATENCY = _get_or_create(
     lambda: prometheus_client.Histogram(
         "parallax_apex_read_latency_ms",
         "Apex public-read wall-clock latency in milliseconds.",
         ["result"],
+        buckets=READ_LATENCY_BUCKETS,
     ),
     "parallax_apex_read_latency_ms",
 )

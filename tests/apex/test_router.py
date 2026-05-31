@@ -621,3 +621,35 @@ class TestAuditWriteAtomicAbort:
         assert router.last_envelope is None
         after = _counter_value(router_mod.AUDIT_WRITE_FAILURES, cause="ProgrammingError")
         assert after == before + 1
+
+
+@pytest.mark.unit
+class TestQueryMetricVisibility:
+    """No read may be metric-dark (§4.3/§4.5): an unexpected (non-typed) adapter
+    failure must still increment the error counters before propagating, or
+    ApexReadErrorRateHigh could silently never fire for adapter contract breaks."""
+
+    def test_unexpected_adapter_error_is_recorded_then_reraised(
+        self, package_dir: Path, audit_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        router = _make_router(package_dir, audit_conn)
+
+        before_err = _counter_value(router_mod.READ_TOTAL, result="error")
+        before_lib = _counter_value(
+            router_mod.READ_ERRORS, reason="lib_error", exc_class="RuntimeError"
+        )
+
+        def _boom(_request: QueryRequest) -> object:
+            raise RuntimeError("adapter contract break")
+
+        monkeypatch.setattr(router._adapter, "query", _boom)
+
+        # The ORIGINAL exception type is preserved (not masked as AphelionUnreachableError).
+        with pytest.raises(RuntimeError, match="adapter contract break"):
+            router.query(_query())
+
+        assert _counter_value(router_mod.READ_TOTAL, result="error") == before_err + 1
+        assert (
+            _counter_value(router_mod.READ_ERRORS, reason="lib_error", exc_class="RuntimeError")
+            == before_lib + 1
+        )

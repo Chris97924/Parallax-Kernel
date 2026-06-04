@@ -54,6 +54,7 @@ from aphelion.yaml_canonical import parse_frontmatter, split_frontmatter
 
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.aphelion_adapter import (
+    CLAIM_CONTENT_KEY,
     AphelionReadAdapter,
     AphelionUnreachableError,
     AuditConnProvider,
@@ -442,7 +443,7 @@ class ApexPublicReadRouter:
                 )
                 raise AphelionUnreachableError("package_corrupt") from exc
             try:
-                frontmatter = _read_claim_frontmatter(claim_path)
+                frontmatter, body = _read_claim_frontmatter(claim_path)
             except (OSError, UnicodeDecodeError) as exc:
                 # Claim file present-but-unreadable (e.g. perms changed after
                 # unpack) is distinct from a genuine lib bug; tag it corrupt.
@@ -453,7 +454,10 @@ class ApexPublicReadRouter:
                     exc,
                 )
                 raise AphelionUnreachableError("package_corrupt") from exc
-            out.append({**frontmatter, "package_id": package_id})
+            # Project package_id (for the audit row) + the markdown body (for
+            # content-bearing hits, #71). The merge is immutable (new dict per
+            # claim) per the project's immutability rule.
+            out.append({**frontmatter, "package_id": package_id, CLAIM_CONTENT_KEY: body})
         return tuple(out)
 
     # -- public read --------------------------------------------------------
@@ -507,9 +511,14 @@ class ApexPublicReadRouter:
             AUDIT_WRITE_FAILURES.labels(cause=cause_cls or "unknown").inc()
 
 
-def _read_claim_frontmatter(claim_path: Path) -> Mapping[str, Any]:
-    """Parse a v0.3 markdown claim's YAML frontmatter (mirrors ingest)."""
+def _read_claim_frontmatter(claim_path: Path) -> tuple[Mapping[str, Any], str]:
+    """Parse a v0.3 markdown claim into ``(frontmatter, body)`` (mirrors ingest).
+
+    The markdown body carries the claim's content. #71 surfaces it as the
+    content-bearing hit text downstream, so it is returned alongside the
+    frontmatter rather than discarded.
+    """
     text = claim_path.read_text(encoding="utf-8")
-    yaml_part, _body = split_frontmatter(text)
+    yaml_part, body = split_frontmatter(text)
     data, _key_order = parse_frontmatter(yaml_part)
-    return data
+    return data, body

@@ -222,6 +222,47 @@ def test_r4_supersession_surfaces_active_claim_and_emits_envelope(
     assert evidence.hits[0]["id"] == newer["claim_id"]
 
 
+# ---------------------------------------------------------------------------
+# #71 Gap 2 — content-bearing hits (body → title → subject fallback)
+# ---------------------------------------------------------------------------
+
+
+def test_hit_is_content_bearing_when_claim_has_body(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
+    """A claim carrying a markdown body surfaces it as the hit's content text."""
+    claim = {
+        **_claim(claim_id="01963f7d-7000-7000-8000-00000000c0de"),
+        "title": "short title",
+        "body": "Public knowledge body content.",
+    }
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider, claim_loader=lambda _r: [claim]
+    )
+    hit = adapter.query(_request()).hits[0]
+
+    assert hit["text"] == "Public knowledge body content."
+    assert hit["content_source"] == "body"
+    assert hit["subject"] == claim["subject"]
+    assert hit["kind"] == "aphelion_claim"
+    assert isinstance(hit["evidence"], str)
+    assert isinstance(hit["full"], dict)
+
+
+def test_hit_text_falls_back_to_subject_without_body_or_title(
+    audit_conn_provider: Callable[[], sqlite3.Connection],
+) -> None:
+    """Pre-#71 behaviour preserved: no body and no title → text == subject."""
+    claim = _claim(claim_id="01963f7d-7000-7000-8000-00000000c0df")
+    adapter = AphelionReadAdapter(
+        audit_conn_provider=audit_conn_provider, claim_loader=lambda _r: [claim]
+    )
+    hit = adapter.query(_request()).hits[0]
+
+    assert hit["text"] == claim["subject"]
+    assert hit["content_source"] == "subject"
+
+
 def test_audit_db_ref_matches_canonical_sha256(
     audit_conn_provider: Callable[[], sqlite3.Connection],
 ) -> None:

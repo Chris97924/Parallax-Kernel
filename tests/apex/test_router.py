@@ -70,8 +70,18 @@ _SUBJECT = "retrieval-quality"
 # ---------------------------------------------------------------------------
 
 
-def _claim_md(*, claim_id: str, extra_fields: Mapping[str, Any] | None = None) -> bytes:
-    """v0.3 claim markdown with ASCII-ascending bare-identifier YAML keys."""
+def _claim_md(
+    *,
+    claim_id: str,
+    extra_fields: Mapping[str, Any] | None = None,
+    body: str = "",
+) -> bytes:
+    """v0.3 claim markdown with ASCII-ascending bare-identifier YAML keys.
+
+    ``body`` is the markdown content after the frontmatter fence — the claim's
+    actual statement. It defaults to empty (the pre-#71 fixture shape); pass a
+    non-empty string to exercise content-bearing hits.
+    """
     base: dict[str, Any] = {
         "body_format": "markdown",
         "claim_id": claim_id,
@@ -98,7 +108,7 @@ def _claim_md(*, claim_id: str, extra_fields: Mapping[str, Any] | None = None) -
         else:
             lines.append(f"{key}: {value}")
     lines.append("---")
-    lines.append("")
+    lines.append(body)
     return ("\n".join(lines)).encode("utf-8")
 
 
@@ -109,11 +119,12 @@ def _build_source_dir(
     instance_id: str,
     package_id: str,
     extra_fields: Mapping[str, Any] | None = None,
+    body: str = "",
 ) -> bytes:
     """Materialize a 1-claim source dir; return the canonical claim bytes."""
     (src / "claims").mkdir(parents=True, exist_ok=True)
     claim_rel = f"claims/{claim_id}.md"
-    claim_bytes = _claim_md(claim_id=claim_id, extra_fields=extra_fields)
+    claim_bytes = _claim_md(claim_id=claim_id, extra_fields=extra_fields, body=body)
     (src / claim_rel).write_bytes(claim_bytes)
 
     manifest = {
@@ -155,6 +166,7 @@ def _build_aphelion_package(
     out_name: str,
     sign: bool = True,
     extra_fields: Mapping[str, Any] | None = None,
+    body: str = "",
 ) -> Path:
     """Build a v0.4 (optionally HMAC-signed) ``.aphelion.tar`` at tmp_path/out_name."""
     src = tmp_path / f"pkg_source_{package_id[-12:]}"
@@ -166,6 +178,7 @@ def _build_aphelion_package(
         instance_id=instance_id,
         package_id=package_id,
         extra_fields=extra_fields,
+        body=body,
     )
 
     tar_path = tmp_path / out_name
@@ -512,6 +525,82 @@ class TestPublicReadHappyPath:
 
         count = audit_conn.execute("SELECT COUNT(*) FROM audit_row").fetchone()[0]
         assert count == 1
+
+
+@pytest.mark.integration
+class TestContentBearingHits:
+    """#71 Gap 2: a surfaced hit carries the claim *content*, not just its subject.
+
+    These exercise the unchanged exact-subject R4 path but assert the enriched
+    hit shape: ``text`` is the claim markdown body, with ``subject`` / ``evidence``
+    / ``full`` carried as discrete fields aligned with the ``RetrievalHit``
+    contract (``parallax.retrieve.RetrievalHit``: evidence is ``str | None``,
+    full is ``dict | None``). The free-text → subject *resolution* (Gap 1) is a
+    deferred architecture fork; here the query still pins an exact subject.
+    """
+
+    _BODY = "Claude Code reads public knowledge from verified Apex claims."
+
+    def test_hit_text_is_claim_body_not_subject(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-c0de00000001",
+            out_name="content.aphelion.tar",
+            extra_fields=_ACTIVE_CLAIM_FIELDS,
+            body=self._BODY,
+        )
+        router = _make_router(package_dir, audit_conn)
+        evidence = router.query(_query())
+
+        assert len(evidence.hits) >= 1
+        hit = evidence.hits[0]
+        # text is now the claim CONTENT (body), not the subject label.
+        assert hit["text"] == self._BODY
+        assert hit["text"] != _SUBJECT
+        assert hit["content_source"] == "body"
+        # subject is still available as its own discrete field (no info loss).
+        assert hit["subject"] == _SUBJECT
+        assert hit["kind"] == "aphelion_claim"
+
+    def test_hit_evidence_is_str_and_full_is_dict(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        """evidence is a str provenance reason (NOT a Mapping); full is a dict snapshot."""
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-c0de00000002",
+            out_name="content2.aphelion.tar",
+            extra_fields=_ACTIVE_CLAIM_FIELDS,
+            body=self._BODY,
+        )
+        router = _make_router(package_dir, audit_conn)
+        hit = router.query(_query()).hits[0]
+
+        assert isinstance(hit["evidence"], str)
+        assert hit["id"] in hit["evidence"]  # provenance references the claim id
+        assert isinstance(hit["full"], dict)
+        assert hit["full"]["body"] == self._BODY
+        assert hit["full"]["subject"] == _SUBJECT
+
+    def test_body_absent_falls_back_to_title_not_subject(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        """No body → text falls back to the title frontmatter field, not the subject."""
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-c0de00000003",
+            out_name="nobody.aphelion.tar",
+            extra_fields=_ACTIVE_CLAIM_FIELDS,
+            # body defaults to "" → no content; the builder sets title "M7 test claim".
+        )
+        router = _make_router(package_dir, audit_conn)
+        hit = router.query(_query()).hits[0]
+
+        assert hit["text"] == "M7 test claim"  # title fallback
+        assert hit["text"] != _SUBJECT
+        assert hit["content_source"] == "title"
 
 
 @pytest.mark.integration

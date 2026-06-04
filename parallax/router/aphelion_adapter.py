@@ -54,12 +54,24 @@ from parallax.apex.envelope import (
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.contracts import QueryRequest
 
-__all__ = ["AphelionReadAdapter", "AphelionUnreachableError"]
+__all__ = ["CLAIM_CONTENT_KEY", "AphelionReadAdapter", "AphelionUnreachableError"]
 
 _log = logging.getLogger(__name__)
 
 ENVELOPE_VERSION_LITERAL = "0.1"
 ENVELOPE_SCHEMA_VERSION = 1
+
+# Key under which the M7 package loader
+# (:meth:`parallax.apex.router.ApexPublicReadRouter._project_claims`) projects a
+# claim's markdown *body* onto the otherwise-frontmatter-only claim mapping, so
+# the hit builder below can surface claim content (not just the subject label).
+# It is intentionally a single shared constant: the loader writes it, the hit
+# builder reads it, and nothing else depends on the name. The v0.3 validator
+# tolerates the extra key (only ``conflict_class`` is reserved) and the R4
+# reader ignores unknown keys, so injecting it does not perturb detection. The
+# M5 dual-read path uses ``_empty_loader`` (no body), so content-bearing hits
+# are a pure additive no-op there.
+CLAIM_CONTENT_KEY = "body"
 
 ClaimLoader = Callable[[QueryRequest], Iterable[Mapping[str, Any]]]
 
@@ -142,6 +154,71 @@ def _string_field(claim: Mapping[str, Any], name: str) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _claim_content(claim: Mapping[str, Any]) -> tuple[str, str]:
+    """Best human-readable content for a claim hit, plus which field it came from.
+
+    Returns ``(content, source)`` where ``source`` is one of ``"body"`` /
+    ``"title"`` / ``"subject"``. Preference order: the markdown ``body`` (the
+    claim statement, projected by the M7 loader under :data:`CLAIM_CONTENT_KEY`)
+    → the ``title`` frontmatter field → the ``subject`` label. The subject
+    fallback preserves the pre-#71 behaviour for callers (e.g. M5 dual-read)
+    whose claims carry no body/title.
+
+    The ``source`` is surfaced on the hit so a degraded label-only fall-through
+    (e.g. an M7 claim whose body was lost at ingest) is distinguishable from a
+    genuine content hit — the fall-through itself is intentional (graceful) but
+    must not be silent.
+    """
+    body = claim.get(CLAIM_CONTENT_KEY)
+    if isinstance(body, str) and body.strip():
+        return body.strip(), CLAIM_CONTENT_KEY
+    title = _string_field(claim, "title")
+    if title is not None:
+        return title, "title"
+    return (_string_field(claim, "subject") or ""), "subject"
+
+
+def _build_hit(claim: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a content-bearing RetrievalEvidence hit from a surfaced claim (#71).
+
+    The hit aligns with the 3-layer ``RetrievalHit`` contract
+    (``parallax.retrieve.RetrievalHit``):
+      * ``text`` — claim content (L1 title surface), via :func:`_claim_content`.
+      * ``evidence`` — a one-sentence provenance reason (L2), ``str | None``
+        per the contract (never a Mapping).
+      * ``full`` — a shallow dict snapshot of the claim frontmatter + body (L3),
+        ``dict | None`` (JSON-safe while frontmatter values stay scalars/lists).
+    ``id`` / ``kind`` / ``polarity`` / ``subject`` are preserved as discrete
+    fields so no information is lost relative to the pre-#71 subject-only hit;
+    ``content_source`` records which field ``text`` was drawn from.
+    """
+    claim_id = _string_field(claim, "claim_id") or ""
+    subject = _string_field(claim, "subject") or ""
+    polarity = _string_field(claim, "polarity") or "affirm"
+    package_id = _string_field(claim, "package_id")
+    content, content_source = _claim_content(claim)
+
+    package_part = f", package={package_id}" if package_id else ""
+    provenance = (
+        f"aphelion claim {claim_id} (subject={subject!r}, polarity={polarity}{package_part})"
+    )
+
+    hit: dict[str, Any] = {
+        "id": claim_id,
+        "text": content,
+        "kind": "aphelion_claim",
+        "polarity": polarity,
+        "subject": subject,
+        "content_source": content_source,
+        "evidence": provenance,
+        "full": dict(claim),
+    }
+    created_at = _string_field(claim, "created_at")
+    if created_at is not None:
+        hit["created_at"] = created_at
+    return hit
 
 
 class AphelionReadAdapter:
@@ -241,15 +318,7 @@ class AphelionReadAdapter:
             else None
         )
 
-        hits = tuple(
-            {
-                "id": str(claim.get("claim_id", "")),
-                "text": str(claim.get("subject", "")),
-                "kind": "aphelion_claim",
-                "polarity": str(claim.get("polarity", "affirm")),
-            }
-            for claim in result.surfaced
-        )
+        hits = tuple(_build_hit(claim) for claim in result.surfaced)
 
         evidence = RetrievalEvidence(
             hits=hits,

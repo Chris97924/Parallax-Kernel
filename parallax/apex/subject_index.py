@@ -15,16 +15,22 @@ Ownership / freshness (spec §8.4 stale-index window rule — silent-stale is
     lookup, no full-corpus unpack).
   * **The read path guarantees correctness**, not M6. ``load_or_rebuild``
     treats the index as a *derived cache*: if the recorded package set does
-    not match what is actually on disk (a package landed/where the M6 write
-    was skipped or failed), it **rebuilds synchronously before returning** —
-    spec §8.4 option (a). It also publishes ``parallax_apex_index_staleness_
-    seconds`` (option (b)) so ops can alert. Either way a key present in a new
-    on-disk package is never served as stale-empty.
+    not match what is actually on disk it **rebuilds synchronously before
+    returning** (spec §8.4 option (a)) and publishes
+    ``parallax_apex_index_staleness_seconds`` (option (b)).
+
+Freshness is keyed on package **identity** — ``(name, size, mtime_ns)`` — not
+on the filename alone. A package replaced or re-ingested under the *same*
+``.aphelion.tar`` basename (e.g. when the best-effort M6 index write was
+skipped or failed) therefore still trips a rebuild: its size/mtime differ, so
+a read never resolves against the stale subjects of the old content. The
+identity is read from ``os.stat`` only (no content read), so the fast-path
+latency budget (§4.2) is preserved.
 
 Package-count ceiling (spec §8.4, load-bearing): the *fast path* cost is
 O(matching packages) — it scales well past the ~100-package per-read ceiling
 the spec warns about. The *rebuild fallback* is O(all packages) but only fires
-on a cache miss (new/removed package not yet reflected), so it is the rare
+on a cache miss (content changed / package added / removed), so it is the rare
 self-healing path, not the steady state.
 
 This module performs **no** package unpacking itself (that keeps it free of an
@@ -50,8 +56,10 @@ __all__ = [
     "INDEX_FILENAME",
     "SCHEMA_VERSION",
     "IndexEntry",
+    "PackageStat",
     "SubjectIndex",
     "current_package_files",
+    "current_packages",
     "index_path",
     "load_index",
     "load_or_rebuild",
@@ -66,8 +74,9 @@ _log = logging.getLogger(__name__)
 INDEX_FILENAME = ".apex-subject-index.json"
 
 # Bumped when the on-disk JSON shape changes; an index written by an older
-# schema is treated as absent (→ rebuild) rather than mis-parsed.
-SCHEMA_VERSION = 1
+# schema is treated as absent (→ rebuild) rather than mis-parsed. v2 added
+# per-package identity (size/mtime) to the freshness signal.
+SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -134,16 +143,32 @@ class IndexEntry:
 
 
 @dataclass(frozen=True)
+class PackageStat:
+    """Identity signature of a package file used for staleness detection.
+
+    ``(name, size, mtime_ns)`` together change whenever a package's content is
+    replaced — even under the same basename — so the read path can detect a
+    same-name content swap that a filename-only check would miss. Read from
+    ``os.stat`` (metadata only, no content read).
+    """
+
+    name: str
+    size: int
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
 class SubjectIndex:
     """An immutable snapshot of the subject → package mapping.
 
-    ``package_files`` is the sorted set of ``.aphelion.tar`` basenames the
-    index was built from; the read path compares it to the live glob to detect
-    staleness. ``built_at`` is an epoch-seconds stamp used to report staleness.
+    ``packages`` is the identity set of the ``.aphelion.tar`` files the index
+    was built from; the read path compares it to the live filesystem to detect
+    staleness (name, size, *and* mtime). ``built_at`` is an epoch-seconds stamp
+    used to report staleness.
     """
 
     entries: tuple[IndexEntry, ...]
-    package_files: tuple[str, ...]
+    packages: tuple[PackageStat, ...]
     built_at: float
 
     def subjects(self) -> frozenset[str]:
@@ -160,9 +185,13 @@ class SubjectIndex:
         files = {entry.package_file for entry in self.entries if entry.subject == subject}
         return tuple(sorted(files))
 
+    def package_files(self) -> tuple[str, ...]:
+        """Sorted basenames of the packages this index was built from."""
+        return tuple(pkg.name for pkg in self.packages)
+
     def is_empty(self) -> bool:
         """True when no packages back this index (a fresh-deploy empty corpus)."""
-        return len(self.package_files) == 0
+        return len(self.packages) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -174,9 +203,26 @@ def index_path(package_dir: Path | str) -> Path:
     return Path(package_dir) / INDEX_FILENAME
 
 
+def current_packages(package_dir: Path | str) -> tuple[PackageStat, ...]:
+    """Identity (name, size, mtime_ns) of every ``.aphelion.tar`` on disk.
+
+    Sorted by name for a stable, comparable signature. A file that vanishes
+    between glob and ``stat`` (concurrent removal) is skipped — the next read
+    self-heals.
+    """
+    stats: list[PackageStat] = []
+    for path in sorted(Path(package_dir).glob("*.aphelion.tar")):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        stats.append(PackageStat(name=path.name, size=st.st_size, mtime_ns=st.st_mtime_ns))
+    return tuple(stats)
+
+
 def current_package_files(package_dir: Path | str) -> tuple[str, ...]:
     """Sorted basenames of the ``.aphelion.tar`` files currently on disk."""
-    return tuple(sorted(p.name for p in Path(package_dir).glob("*.aphelion.tar")))
+    return tuple(pkg.name for pkg in current_packages(package_dir))
 
 
 def load_index(package_dir: Path | str) -> SubjectIndex | None:
@@ -207,12 +253,19 @@ def load_index(package_dir: Path | str) -> SubjectIndex | None:
             )
             for item in data["entries"]
         )
-        package_files = tuple(str(name) for name in data["package_files"])
+        packages = tuple(
+            PackageStat(
+                name=str(item["name"]),
+                size=int(item["size"]),
+                mtime_ns=int(item["mtime_ns"]),
+            )
+            for item in data["packages"]
+        )
         built_at = float(data["built_at"])
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         _log.warning("subject index corrupt (%s); will rebuild: %s", path, exc)
         return None
-    return SubjectIndex(entries=entries, package_files=package_files, built_at=built_at)
+    return SubjectIndex(entries=entries, packages=packages, built_at=built_at)
 
 
 def save_index(package_dir: Path | str, index: SubjectIndex) -> None:
@@ -227,7 +280,10 @@ def save_index(package_dir: Path | str, index: SubjectIndex) -> None:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "built_at": index.built_at,
-        "package_files": list(index.package_files),
+        "packages": [
+            {"name": pkg.name, "size": pkg.size, "mtime_ns": pkg.mtime_ns}
+            for pkg in index.packages
+        ],
         "entries": [
             {
                 "subject": entry.subject,
@@ -267,11 +323,12 @@ def update_index_for_package(
 
     The merge keeps existing entries for *other* packages that still exist on
     disk, drops any whose package vanished, and replaces this package's prior
-    entries (idempotent re-ingest). ``package_files`` is recomputed from the
-    live glob so it always reflects reality.
+    entries (idempotent re-ingest). The package identity set is recomputed from
+    the live filesystem so freshness reflects reality (size/mtime included).
     """
     existing = load_index(package_dir)
-    on_disk = set(current_package_files(package_dir))
+    current = current_packages(package_dir)
+    on_disk = {pkg.name for pkg in current}
     base = [
         entry
         for entry in (existing.entries if existing else ())
@@ -289,7 +346,7 @@ def update_index_for_package(
     ]
     index = SubjectIndex(
         entries=tuple(base) + tuple(added),
-        package_files=current_package_files(package_dir),
+        packages=current,
         built_at=time.time(),
     )
     save_index(package_dir, index)
@@ -306,12 +363,12 @@ def load_or_rebuild(
 ) -> SubjectIndex:
     """Return a fresh index, rebuilding synchronously on a cache miss.
 
-    Freshness rule (spec §8.4): the index is fresh iff its recorded
-    ``package_files`` equals the live ``*.aphelion.tar`` glob. On any mismatch
-    — missing file, corrupt file, or a package added/removed since the index
-    was written — the index is rebuilt from ``scan_fn`` **before returning**,
-    so a subject present in a new on-disk package is never served as
-    stale-empty.
+    Freshness rule (spec §8.4): the index is fresh iff its recorded package
+    identities equal the live filesystem's — same names, sizes, **and** mtimes.
+    On any mismatch — missing file, corrupt file, a package added/removed, or a
+    same-name content swap — the index is rebuilt from ``scan_fn`` **before
+    returning**, so a subject present in new/changed on-disk content is never
+    served stale-empty.
 
     Args:
         package_dir: ``PARALLAX_APHELION_PACKAGE_DIR``.
@@ -323,10 +380,10 @@ def load_or_rebuild(
     Returns:
         A :class:`SubjectIndex` guaranteed consistent with the current corpus.
     """
-    current = current_package_files(package_dir)
+    current = current_packages(package_dir)
     existing = load_index(package_dir)
 
-    if existing is not None and tuple(existing.package_files) == current:
+    if existing is not None and existing.packages == current:
         INDEX_STALENESS.set(0.0)
         return existing
 
@@ -338,7 +395,7 @@ def load_or_rebuild(
         INDEX_STALENESS.set(max(0.0, time.time() - existing.built_at))
 
     entries = tuple(scan_fn())
-    rebuilt = SubjectIndex(entries=entries, package_files=current, built_at=time.time())
+    rebuilt = SubjectIndex(entries=entries, packages=current, built_at=time.time())
     # Persisting is an optimisation; the in-memory index already serves this
     # query correctly, so a write failure must not break the read.
     try:

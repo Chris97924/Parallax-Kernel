@@ -3,15 +3,17 @@
 Covers ``parallax.apex.subject_index`` in isolation: the data model, atomic
 persistence, the M6 incremental writer, and — most importantly — the
 ``load_or_rebuild`` freshness contract (spec §8.4: rebuild-on-stale, never
-silent-stale).
+silent-stale), including the same-name content-swap case.
 
-Freshness is tested without real packages: ``current_package_files`` only globs
-by name, so empty ``*.aphelion.tar`` placeholder files drive the staleness logic
-while a fake ``scan_fn`` stands in for the router's unpack scan.
+Freshness is tested without real packages: ``current_packages`` reads only
+``os.stat`` metadata, so placeholder ``*.aphelion.tar`` files (whose bytes /
+mtime drive the identity signal) plus a fake ``scan_fn`` standing in for the
+router's unpack scan are enough.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +23,10 @@ from parallax.apex import subject_index
 from parallax.apex.subject_index import (
     INDEX_FILENAME,
     IndexEntry,
+    PackageStat,
     SubjectIndex,
     current_package_files,
+    current_packages,
     index_path,
     load_index,
     load_or_rebuild,
@@ -36,8 +40,12 @@ def _counter(metric: Any, **labels: str) -> float:
     return child._value.get()  # type: ignore[attr-defined]
 
 
-def _touch_tar(package_dir: Path, name: str) -> None:
-    (package_dir / name).write_bytes(b"")
+def _write_tar(package_dir: Path, name: str, content: bytes = b"") -> None:
+    (package_dir / name).write_bytes(content)
+
+
+def _ps(name: str, size: int = 0, mtime_ns: int = 0) -> PackageStat:
+    return PackageStat(name=name, size=size, mtime_ns=mtime_ns)
 
 
 def _entry(
@@ -62,7 +70,7 @@ class TestSubjectIndexModel:
                 _entry("a", "y.aphelion.tar"),
                 _entry("b", "x.aphelion.tar"),
             ),
-            package_files=("x.aphelion.tar", "y.aphelion.tar"),
+            packages=(_ps("x.aphelion.tar"), _ps("y.aphelion.tar")),
             built_at=1.0,
         )
         assert idx.subjects() == frozenset({"a", "b"})
@@ -70,7 +78,7 @@ class TestSubjectIndexModel:
     def test_packages_for_subject_returns_all_carrying_packages(self) -> None:
         idx = SubjectIndex(
             entries=(_entry("a", "y.aphelion.tar"), _entry("a", "x.aphelion.tar")),
-            package_files=("x.aphelion.tar", "y.aphelion.tar"),
+            packages=(_ps("x.aphelion.tar"), _ps("y.aphelion.tar")),
             built_at=1.0,
         )
         # Sorted, and every package carrying the subject is returned (R4 needs
@@ -78,14 +86,22 @@ class TestSubjectIndexModel:
         assert idx.packages_for_subject("a") == ("x.aphelion.tar", "y.aphelion.tar")
 
     def test_packages_for_unknown_subject_is_empty(self) -> None:
-        idx = SubjectIndex(entries=(), package_files=(), built_at=1.0)
+        idx = SubjectIndex(entries=(), packages=(), built_at=1.0)
         assert idx.packages_for_subject("nope") == ()
 
+    def test_package_files_lists_names(self) -> None:
+        idx = SubjectIndex(
+            entries=(),
+            packages=(_ps("b.aphelion.tar", 1, 2), _ps("a.aphelion.tar", 3, 4)),
+            built_at=1.0,
+        )
+        assert idx.package_files() == ("b.aphelion.tar", "a.aphelion.tar")
+
     def test_is_empty(self) -> None:
-        assert SubjectIndex(entries=(), package_files=(), built_at=1.0).is_empty()
+        assert SubjectIndex(entries=(), packages=(), built_at=1.0).is_empty()
         assert not SubjectIndex(
             entries=(_entry("a", "x.aphelion.tar"),),
-            package_files=("x.aphelion.tar",),
+            packages=(_ps("x.aphelion.tar"),),
             built_at=1.0,
         ).is_empty()
 
@@ -102,14 +118,14 @@ class TestPersistence:
             entries=(
                 _entry("retrieval-quality", "a.aphelion.tar", claim_id="cid", package_id="pid"),
             ),
-            package_files=("a.aphelion.tar",),
+            packages=(_ps("a.aphelion.tar", size=42, mtime_ns=123456789),),
             built_at=123.5,
         )
         save_index(tmp_path, idx)
         loaded = load_index(tmp_path)
         assert loaded is not None
         assert loaded.entries == idx.entries
-        assert loaded.package_files == idx.package_files
+        assert loaded.packages == idx.packages
         assert loaded.built_at == idx.built_at
 
     def test_load_missing_returns_none(self, tmp_path: Path) -> None:
@@ -121,13 +137,13 @@ class TestPersistence:
 
     def test_load_schema_mismatch_returns_none(self, tmp_path: Path) -> None:
         index_path(tmp_path).write_text(
-            '{"schema_version": 999, "built_at": 1.0, "package_files": [], "entries": []}',
+            '{"schema_version": 1, "built_at": 1.0, "package_files": [], "entries": []}',
             encoding="utf-8",
         )
         assert load_index(tmp_path) is None
 
     def test_save_leaves_no_temp_file(self, tmp_path: Path) -> None:
-        save_index(tmp_path, SubjectIndex(entries=(), package_files=(), built_at=1.0))
+        save_index(tmp_path, SubjectIndex(entries=(), packages=(), built_at=1.0))
         leftovers = [p.name for p in tmp_path.iterdir() if p.name != INDEX_FILENAME]
         assert leftovers == []
 
@@ -140,7 +156,7 @@ class TestPersistence:
 @pytest.mark.unit
 class TestUpdateIndexForPackage:
     def test_writes_subject_to_package_mapping(self, tmp_path: Path) -> None:
-        _touch_tar(tmp_path, "pkg1.aphelion.tar")
+        _write_tar(tmp_path, "pkg1.aphelion.tar", b"content")
         update_index_for_package(
             tmp_path,
             package_file="pkg1.aphelion.tar",
@@ -150,12 +166,14 @@ class TestUpdateIndexForPackage:
         idx = load_index(tmp_path)
         assert idx is not None
         assert idx.packages_for_subject("retrieval-quality") == ("pkg1.aphelion.tar",)
-        assert idx.package_files == ("pkg1.aphelion.tar",)
+        assert idx.package_files() == ("pkg1.aphelion.tar",)
+        # Identity captured for staleness detection (non-zero size recorded).
+        assert idx.packages[0].size == len(b"content")
         entry = idx.entries[0]
         assert (entry.package_id, entry.claim_id) == ("pid-1", "claim-a")
 
     def test_skips_subjectless_claims(self, tmp_path: Path) -> None:
-        _touch_tar(tmp_path, "pkg1.aphelion.tar")
+        _write_tar(tmp_path, "pkg1.aphelion.tar")
         update_index_for_package(
             tmp_path,
             package_file="pkg1.aphelion.tar",
@@ -167,7 +185,7 @@ class TestUpdateIndexForPackage:
         assert idx.subjects() == frozenset({"real-subject"})
 
     def test_reingest_replaces_package_entries(self, tmp_path: Path) -> None:
-        _touch_tar(tmp_path, "pkg1.aphelion.tar")
+        _write_tar(tmp_path, "pkg1.aphelion.tar")
         update_index_for_package(
             tmp_path,
             package_file="pkg1.aphelion.tar",
@@ -185,7 +203,7 @@ class TestUpdateIndexForPackage:
         assert idx.subjects() == frozenset({"new-subject"})  # old entry replaced
 
     def test_keeps_other_packages_prunes_vanished(self, tmp_path: Path) -> None:
-        _touch_tar(tmp_path, "pkg1.aphelion.tar")
+        _write_tar(tmp_path, "pkg1.aphelion.tar")
         update_index_for_package(
             tmp_path,
             package_file="pkg1.aphelion.tar",
@@ -193,7 +211,7 @@ class TestUpdateIndexForPackage:
             claim_subjects=[("c1", "subject-1")],
         )
         # pkg2 added on disk; pkg1 removed from disk before pkg2 is indexed.
-        _touch_tar(tmp_path, "pkg2.aphelion.tar")
+        _write_tar(tmp_path, "pkg2.aphelion.tar")
         (tmp_path / "pkg1.aphelion.tar").unlink()
         update_index_for_package(
             tmp_path,
@@ -205,7 +223,7 @@ class TestUpdateIndexForPackage:
         assert idx is not None
         # subject-1's package vanished → pruned; only on-disk pkg2 remains.
         assert idx.subjects() == frozenset({"subject-2"})
-        assert idx.package_files == ("pkg2.aphelion.tar",)
+        assert idx.package_files() == ("pkg2.aphelion.tar",)
 
 
 # ===========================================================================
@@ -216,25 +234,25 @@ class TestUpdateIndexForPackage:
 @pytest.mark.unit
 class TestLoadOrRebuild:
     def test_missing_index_triggers_rebuild(self, tmp_path: Path) -> None:
-        _touch_tar(tmp_path, "a.aphelion.tar")
+        _write_tar(tmp_path, "a.aphelion.tar")
         scanned = [_entry("subj", "a.aphelion.tar")]
         before = _counter(subject_index.INDEX_REBUILD, trigger="missing")
 
         idx = load_or_rebuild(tmp_path, lambda: scanned)
 
         assert idx.subjects() == frozenset({"subj"})
-        assert idx.package_files == ("a.aphelion.tar",)
+        assert idx.package_files() == ("a.aphelion.tar",)
         assert _counter(subject_index.INDEX_REBUILD, trigger="missing") == before + 1
         # Rebuilt index was persisted for the next read.
         assert load_index(tmp_path) is not None
 
     def test_fresh_index_does_not_rescan(self, tmp_path: Path) -> None:
-        _touch_tar(tmp_path, "a.aphelion.tar")
+        _write_tar(tmp_path, "a.aphelion.tar")
         save_index(
             tmp_path,
             SubjectIndex(
                 entries=(_entry("subj", "a.aphelion.tar"),),
-                package_files=("a.aphelion.tar",),
+                packages=current_packages(tmp_path),
                 built_at=10.0,
             ),
         )
@@ -253,28 +271,78 @@ class TestLoadOrRebuild:
         index was built, so the index is stale; the read rebuilds synchronously
         and surfaces ``b`` rather than returning empty for it.
         """
-        _touch_tar(tmp_path, "a.aphelion.tar")
+        _write_tar(tmp_path, "a.aphelion.tar")
         save_index(
             tmp_path,
             SubjectIndex(
                 entries=(_entry("a-subj", "a.aphelion.tar"),),
-                package_files=("a.aphelion.tar",),
+                packages=current_packages(tmp_path),
                 built_at=1000.0,
             ),
         )
-        _touch_tar(tmp_path, "b.aphelion.tar")  # new package, index doesn't know it
+        _write_tar(tmp_path, "b.aphelion.tar")  # new package, index doesn't know it
         rebuilt_entries = [_entry("a-subj", "a.aphelion.tar"), _entry("b-subj", "b.aphelion.tar")]
         before = _counter(subject_index.INDEX_REBUILD, trigger="stale")
 
         idx = load_or_rebuild(tmp_path, lambda: rebuilt_entries)
 
         assert idx.packages_for_subject("b-subj") == ("b.aphelion.tar",)  # not stale-empty
-        assert idx.package_files == ("a.aphelion.tar", "b.aphelion.tar")
+        assert idx.package_files() == ("a.aphelion.tar", "b.aphelion.tar")
         assert _counter(subject_index.INDEX_REBUILD, trigger="stale") == before + 1
         assert subject_index.INDEX_STALENESS._value.get() > 0.0  # type: ignore[attr-defined]
 
+    def test_same_name_content_swap_rebuilds(self, tmp_path: Path) -> None:
+        """Codex #74 P1: a same-basename content change must trip a rebuild.
+
+        If a package is replaced/re-ingested under the same ``.aphelion.tar``
+        name and the best-effort M6 index write was skipped, a filename-only
+        freshness check would keep serving the OLD subjects (silent-stale). The
+        identity signal (size/mtime) catches it: here the file's bytes change
+        (and mtime is bumped), so the read rebuilds and surfaces the new subject.
+        """
+        _write_tar(tmp_path, "a.aphelion.tar", b"v1")
+        save_index(
+            tmp_path,
+            SubjectIndex(
+                entries=(_entry("old-subj", "a.aphelion.tar"),),
+                packages=current_packages(tmp_path),
+                built_at=1000.0,
+            ),
+        )
+        # Replace content under the SAME name (size changes) + force a new mtime
+        # so the identity differs even on coarse-resolution filesystems.
+        _write_tar(tmp_path, "a.aphelion.tar", b"v2-different-content")
+        st = (tmp_path / "a.aphelion.tar").stat()
+        os.utime(tmp_path / "a.aphelion.tar", ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+        before = _counter(subject_index.INDEX_REBUILD, trigger="stale")
+
+        idx = load_or_rebuild(tmp_path, lambda: [_entry("new-subj", "a.aphelion.tar")])
+
+        assert idx.subjects() == frozenset({"new-subj"})  # not the stale "old-subj"
+        assert _counter(subject_index.INDEX_REBUILD, trigger="stale") == before + 1
+
+    def test_mtime_only_change_rebuilds(self, tmp_path: Path) -> None:
+        """Even a same-size content swap is caught via mtime (identity ≠ name)."""
+        _write_tar(tmp_path, "a.aphelion.tar", b"same-size!!")
+        save_index(
+            tmp_path,
+            SubjectIndex(
+                entries=(_entry("old-subj", "a.aphelion.tar"),),
+                packages=current_packages(tmp_path),
+                built_at=1000.0,
+            ),
+        )
+        st = (tmp_path / "a.aphelion.tar").stat()
+        os.utime(tmp_path / "a.aphelion.tar", ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        before = _counter(subject_index.INDEX_REBUILD, trigger="stale")
+
+        idx = load_or_rebuild(tmp_path, lambda: [_entry("new-subj", "a.aphelion.tar")])
+
+        assert idx.subjects() == frozenset({"new-subj"})
+        assert _counter(subject_index.INDEX_REBUILD, trigger="stale") == before + 1
+
     def test_corrupt_index_rebuilds(self, tmp_path: Path) -> None:
-        _touch_tar(tmp_path, "a.aphelion.tar")
+        _write_tar(tmp_path, "a.aphelion.tar")
         index_path(tmp_path).write_text("{garbage", encoding="utf-8")
         before = _counter(subject_index.INDEX_REBUILD, trigger="corrupt")
 
@@ -287,7 +355,7 @@ class TestLoadOrRebuild:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A failed persist after rebuild still serves the in-memory index."""
-        _touch_tar(tmp_path, "a.aphelion.tar")
+        _write_tar(tmp_path, "a.aphelion.tar")
 
         def _raise(*_a: Any, **_k: Any) -> None:
             raise OSError("disk full")

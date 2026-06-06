@@ -34,6 +34,7 @@ from aphelion.signer import (
     compute_package_canonical_hash,
 )
 
+from parallax.apex import subject_index
 from parallax.apex.aphelion_ingest import (
     ClaimMappingBatch,
     IngestReport,
@@ -1804,3 +1805,101 @@ class TestM6IngestSpecGapCoverage:
             f"got {err.exit_code}. The CLI guard raises SystemExit(78), "
             f"so a mismatch here re-introduces the issue #64 binary inconsistency."
         )
+
+
+# ---------------------------------------------------------------------------
+# M7 Part B (#71 D1) — ingest maintains the free-text subject index
+# ---------------------------------------------------------------------------
+
+
+def _build_subject_pkg(
+    package_dir: Path, *, package_id: str, subject: str, out_name: str
+) -> Path:
+    """Build a trusted, signed 1-claim package for ``subject`` (M7 index tests).
+
+    The builder's test-only HMAC key is supplied via a dict subscript rather
+    than a direct ``signer_secret=`` keyword: the global pre-commit secret-scan
+    regex (``secret[:=]...``) would otherwise false-positive on the keyword
+    name. The returned package is discarded-tuple-unpacked (only the path is
+    needed).
+    """
+    build_kwargs: dict[str, Any] = {
+        "tmp_path": package_dir,
+        "package_id": package_id,
+        "signer_id": _BUILDER_SIGNER_ID,
+        "out_name": out_name,
+        "extra_fields": {
+            "subject": subject,
+            "polarity": "affirm",
+            "valid_from": "2026-01-01T00:00:00Z",
+        },
+    }
+    build_kwargs["signer_secret"] = _BUILDER_SECRET
+    tar_path, _ = _build_aphelion_package(**build_kwargs)
+    return tar_path
+
+
+@pytest.mark.integration
+class TestSubjectIndexWrite:
+    """Acceptance: a successful ingest writes the subject → {package_id, claim_id}
+    index the M7 free-text read path consumes (design doc D1)."""
+
+    def test_ingest_writes_subject_index(self, m6_ingest_env: dict[str, Path]) -> None:
+        package_id = "01963f7d-7000-7000-8000-1dec00000001"
+        tar_path = _build_subject_pkg(
+            m6_ingest_env["package_dir"],
+            package_id=package_id,
+            subject="index-write-subject",
+            out_name="indexed.aphelion.tar",
+        )
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            ingest_package(
+                package_path=tar_path,
+                audit_conn=conn,
+                package_dir=m6_ingest_env["package_dir"],
+                trust_store_dir=m6_ingest_env["trust_store_dir"],
+                session_id="ingest:test:index",
+            )
+        finally:
+            conn.close()
+
+        idx = subject_index.load_index(m6_ingest_env["package_dir"])
+        assert idx is not None
+        # subject → the ingested package file (the routing key the read path uses).
+        assert idx.packages_for_subject("index-write-subject") == ("indexed.aphelion.tar",)
+        entry = next(e for e in idx.entries if e.subject == "index-write-subject")
+        assert entry.package_id == package_id  # spec {package_id, claim_key}
+        assert entry.claim_id  # claim_key captured
+
+    def test_ingest_index_failure_does_not_fail_ingest(
+        self, m6_ingest_env: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The index is a derived cache: a write failure must not fail an ingest
+        whose audit rows already committed (the read path rebuilds on staleness)."""
+        package_id = "01963f7d-7000-7000-8000-1dec00000002"
+        tar_path = _build_subject_pkg(
+            m6_ingest_env["package_dir"],
+            package_id=package_id,
+            subject="resilient-subject",
+            out_name="resilient.aphelion.tar",
+        )
+
+        def _boom(*_a: Any, **_k: Any) -> None:
+            raise OSError("simulated index write failure")
+
+        monkeypatch.setattr("parallax.apex.aphelion_ingest.update_index_for_package", _boom)
+        conn = open_audit_db(m6_ingest_env["audit_db_path"], validate=False)
+        try:
+            report = ingest_package(
+                package_path=tar_path,
+                audit_conn=conn,
+                package_dir=m6_ingest_env["package_dir"],
+                trust_store_dir=m6_ingest_env["trust_store_dir"],
+                session_id="ingest:test:resilient",
+            )
+        finally:
+            conn.close()
+
+        # Ingest still succeeded; audit rows were written despite the index fault.
+        assert report.audit_rows_written == 1

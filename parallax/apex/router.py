@@ -41,6 +41,7 @@ import re
 import tempfile
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,8 @@ from aphelion.validator import validate_signatures
 from aphelion.verifier import verify_package
 from aphelion.yaml_canonical import parse_frontmatter, split_frontmatter
 
+from parallax.apex import subject_index
+from parallax.apex.resolver import DEFAULT_TOP_K, resolve_subjects
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.aphelion_adapter import (
     CLAIM_CONTENT_KEY,
@@ -294,6 +297,49 @@ def classify_package_exception(exc: BaseException) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Free-text read helpers (#71 Part B)
+# ---------------------------------------------------------------------------
+
+
+def _explicit_subject(request: QueryRequest) -> str | None:
+    """The caller-supplied exact subject (``params['subject']``), or ``None``.
+
+    Mirrors the precedence in ``aphelion_adapter._resolve_subject``: an explicit
+    ``params['subject']`` selects the exact-subject path; its absence means the
+    read is free-text and must go through the resolver against ``request.q``.
+    """
+    if request.params:
+        explicit = request.params.get("subject")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+    return None
+
+
+def _with_subject(request: QueryRequest, subject: str) -> QueryRequest:
+    """Return a copy of ``request`` with ``params['subject']`` set (immutable).
+
+    Used to drive the per-candidate exact-subject R4 read from a resolved
+    free-text query without mutating the caller's request.
+    """
+    params = dict(request.params or {})
+    params["subject"] = subject
+    return replace(request, params=params)
+
+
+def _empty_evidence(extra_notes: tuple[str, ...] = ()) -> RetrievalEvidence:
+    """A content-free :class:`RetrievalEvidence` for the free-text empty paths.
+
+    Mirrors the adapter's miss note (``conflict_class=NOT_FOUND``) so a free-text
+    empty result is shaped like an exact-subject miss for downstream consumers.
+    """
+    return RetrievalEvidence(
+        hits=(),
+        stages=("aphelion_v03_r4",),
+        notes=("conflict_class=NOT_FOUND", *extra_notes),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Apex public-read router
 # ---------------------------------------------------------------------------
 
@@ -314,10 +360,22 @@ class ApexPublicReadRouter:
             audit-db connection; forwarded unchanged to the M5 adapter so the
             audit write-order invariant + atomic-abort path apply unchanged.
         timeout_ms: reserved dual-read timeout, forwarded to the M5 adapter.
+        resolver_top_k: max candidate subjects the free-text resolver admits
+            per query (#71 Part B, design doc D4). Ignored on the exact-subject
+            path (``params["subject"]`` set).
 
     Raises:
         ApexRouterStartupError: installed Aphelion below the version floor.
         AphelionUnreachableError: ``package_dir`` failed validation.
+
+    Read modes:
+        * **Exact subject** — ``request.params["subject"]`` is set: the caller
+          already resolved the subject, so the read scans the full corpus and
+          runs exact-subject R4 (the pre-#71 behaviour, unchanged).
+        * **Free-text** — no explicit subject: ``request.q`` is resolved to
+          candidate subjects via the M6-maintained subject index +
+          token-overlap (#71 Part B), and R4 runs per candidate subject over
+          only that subject's package(s); hits are merged.
     """
 
     def __init__(
@@ -326,10 +384,19 @@ class ApexPublicReadRouter:
         package_dir: Path | str,
         audit_conn_provider: AuditConnProvider,
         timeout_ms: float = 100.0,
+        resolver_top_k: int = DEFAULT_TOP_K,
     ) -> None:
         assert_aphelion_version()
         self._package_dir = validate_package_dir(package_dir)
         self._last_corpus_empty = False
+        self._resolver_top_k = resolver_top_k
+        # Per-query scratch (#71 Part B): the set of package basenames the next
+        # claim-loader call should unpack. ``None`` means "scan the full corpus"
+        # — the exact-subject / pre-#71 behaviour. The free-text path sets it to
+        # one candidate subject's packages before each per-subject R4 read. Like
+        # ``_last_corpus_empty`` this is single-context-per-call state; do not
+        # share one instance across concurrent queries without synchronization.
+        self._scoped_packages: tuple[str, ...] | None = None
         self._adapter = AphelionReadAdapter(
             audit_conn_provider=audit_conn_provider,
             package_dir=self._package_dir,
@@ -351,17 +418,39 @@ class ApexPublicReadRouter:
         verification failure. An accessible-but-empty corpus is a legitimate
         fresh-deploy state: it returns ``()`` and emits ``empty_corpus``.
 
+        Scope (#71 Part B): when :attr:`_scoped_packages` is ``None`` the full
+        corpus is scanned (exact-subject / pre-#71 behaviour). When it is set
+        (free-text per-subject read), only those package basenames are unpacked
+        — the §8.4 win: a directory listing is cheap, but the expensive
+        unpack+verify (:meth:`_read_package_claims`) runs only on the resolved
+        package(s), not every ``.aphelion.tar``. The scoped names are
+        intersected with the live glob so a stale index entry can never make the
+        loader unpack a vanished file.
+
         Concurrency: a router instance is single-context per call — it relies on
         the M5 adapter's per-call ``audit_conn_provider`` (thread-local) pattern,
-        and ``_last_corpus_empty`` is per-instance scratch state set here and read
-        by :meth:`query` immediately after. Do not share one instance across
-        concurrent queries without external synchronization.
+        and ``_last_corpus_empty`` / ``_scoped_packages`` are per-instance scratch
+        state set by :meth:`query` and read here. Do not share one instance
+        across concurrent queries without external synchronization.
         """
-        tars = sorted(self._package_dir.glob("*.aphelion.tar"))
-        self._last_corpus_empty = not tars
-        if not tars:
+        all_tars = sorted(self._package_dir.glob("*.aphelion.tar"))
+        # Emptiness is a property of the whole corpus, not of a scoped subset, so
+        # the empty_corpus signal stays accurate on the per-subject free-text path.
+        self._last_corpus_empty = not all_tars
+        if not all_tars:
             EMPTY_CORPUS.inc()
             return ()
+
+        if self._scoped_packages is None:
+            tars = all_tars
+        else:
+            scoped = set(self._scoped_packages)
+            tars = [tar for tar in all_tars if tar.name in scoped]
+            if not tars:
+                # Subject resolved to no on-disk package (corpus non-empty): a
+                # genuine no-match, surfaced as empty_result by query(), not
+                # empty_corpus.
+                return ()
 
         claims: list[Mapping[str, Any]] = []
         for tar in tars:
@@ -465,6 +554,11 @@ class ApexPublicReadRouter:
     def query(self, request: QueryRequest) -> RetrievalEvidence:
         """Run the Apex public read and emit §4.5 metrics.
 
+        Dispatches on the read mode (see the class docstring): an explicit
+        ``params["subject"]`` takes the exact-subject path; otherwise the
+        free-text resolver path runs. Both share this method's metric +
+        error-classification envelope so no read is ever metric-dark.
+
         Returns :class:`RetrievalEvidence` (possibly with empty ``hits`` — a
         legitimate "no public knowledge" result). Raises
         :class:`AphelionUnreachableError` on any failure (§4.3); the caller
@@ -472,8 +566,14 @@ class ApexPublicReadRouter:
         or empty Apex slot (§3.2 / §8.3 Q3 no-substitution rule).
         """
         start = time.perf_counter()
+        # Reset per-query scratch so a free-text early-return cannot leave a
+        # stale scope for the next query on a reused instance.
+        self._scoped_packages = None
         try:
-            evidence = self._adapter.query(request)
+            if _explicit_subject(request) is not None:
+                evidence = self._query_exact(request)
+            else:
+                evidence = self._query_freetext(request)
         except AphelionUnreachableError as err:
             self._record(start, "error")
             self._record_error(err)
@@ -494,6 +594,100 @@ class ApexPublicReadRouter:
             cause = "empty_corpus" if self._last_corpus_empty else "no_matching_claim"
             EMPTY_RESULT.labels(cause=cause).inc()
         return evidence
+
+    def _query_exact(self, request: QueryRequest) -> RetrievalEvidence:
+        """Exact-subject read (pre-#71 path, unchanged behaviour).
+
+        The caller named the subject via ``params["subject"]``, so no resolver
+        or index is involved: the loader scans the full corpus
+        (``_scoped_packages is None``) and the M5 adapter runs exact-subject R4
+        exactly as before. Used by existing callers and M5 dual-read.
+        """
+        self._scoped_packages = None
+        return self._adapter.query(request)
+
+    def _query_freetext(self, request: QueryRequest) -> RetrievalEvidence:
+        """Free-text read: resolve prompt → candidate subjects → per-subject R4 → merge.
+
+        Steps (#71 Part B, design doc §3.1):
+          1. ``subject_index.load_or_rebuild`` returns a freshness-guaranteed
+             index (rebuild-on-stale; never silent-stale per §8.4).
+          2. ``resolve_subjects`` (token-overlap, D2/D3) maps ``request.q`` to
+             ranked candidate subjects against the index's subject labels.
+          3. For each candidate, the loader is scoped to that subject's
+             package(s) and the M5 adapter runs unchanged exact-subject R4 — so
+             R4 detection, the audit write-order invariant, and the atomic-abort
+             path are reused verbatim (not re-implemented).
+          4. Hits are merged across subjects, deduped by claim id, ordered by
+             candidate rank (D4).
+
+        Negative-result contract (§4.5): an empty corpus, no resolved candidate,
+        or candidates whose R4 yields nothing all return empty ``hits`` — never a
+        fabricated hit — and ``query`` fires
+        ``parallax_apex_empty_result{cause=...}`` accordingly.
+        """
+        index = subject_index.load_or_rebuild(self._package_dir, self._scan_index_entries)
+        self._last_corpus_empty = index.is_empty()
+        if self._last_corpus_empty:
+            EMPTY_CORPUS.inc()
+            return _empty_evidence(("corpus=empty",))
+
+        candidates = resolve_subjects(
+            request.q or "", index.subjects(), top_k=self._resolver_top_k
+        )
+        if not candidates:
+            # Genuine miss: the prompt shares no meaningful token with any known
+            # subject. Surface empty (query() → empty_result{no_matching_claim}).
+            return _empty_evidence(("resolver=token_overlap", "candidates=0"))
+
+        merged: list[dict] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            self._scoped_packages = index.packages_for_subject(candidate.subject)
+            if not self._scoped_packages:
+                continue
+            evidence = self._adapter.query(_with_subject(request, candidate.subject))
+            for hit in evidence.hits:
+                hid = str(hit.get("id") or "")
+                if hid and hid in seen:
+                    continue
+                if hid:
+                    seen.add(hid)
+                merged.append(hit)
+
+        notes = (
+            "resolver=token_overlap",
+            f"candidates={len(candidates)}",
+            f"subjects={','.join(c.subject for c in candidates)}",
+        )
+        return RetrievalEvidence(hits=tuple(merged), stages=("aphelion_v03_r4",), notes=notes)
+
+    def _scan_index_entries(self) -> list[subject_index.IndexEntry]:
+        """Full-corpus scan that rebuilds the subject index (read-path fallback).
+
+        Reuses the same safe unpack + verify + projection as the read path
+        (:meth:`_read_package_claims`), so the index only ever points at
+        packages a read would accept, and a corrupt package aborts the scan with
+        the same typed :class:`AphelionUnreachableError` a read would raise
+        (§4.3 abort-on-bad-package). This is the O(all packages) fallback that
+        only fires on a cache miss — steady-state reads use the M6-maintained
+        index and never reach it (§8.4 ceiling note).
+        """
+        entries: list[subject_index.IndexEntry] = []
+        for tar in sorted(self._package_dir.glob("*.aphelion.tar")):
+            for claim in self._read_package_claims(tar):
+                subject = claim.get("subject")
+                claim_id = claim.get("claim_id")
+                if isinstance(subject, str) and subject and isinstance(claim_id, str):
+                    entries.append(
+                        subject_index.IndexEntry(
+                            subject=subject,
+                            package_id=str(claim.get("package_id") or ""),
+                            claim_id=claim_id,
+                            package_file=tar.name,
+                        )
+                    )
+        return entries
 
     @staticmethod
     def _record(start: float, result: str) -> None:

@@ -40,6 +40,7 @@ from aphelion.signer import (
 )
 
 from parallax.apex import router as router_mod
+from parallax.apex import subject_index
 from parallax.apex.audit_db import open_audit_db
 from parallax.apex.router import (
     REQUIRED_APHELION_MIN_VERSION,
@@ -742,3 +743,196 @@ class TestQueryMetricVisibility:
             _counter_value(router_mod.READ_ERRORS, reason="lib_error", exc_class="RuntimeError")
             == before_lib + 1
         )
+
+
+# ===========================================================================
+# Integration — free-text resolution read path (#71 Part B)
+# ===========================================================================
+
+
+def _subject_fields(subject: str) -> dict[str, Any]:
+    """Active R4 claim fields for an arbitrary subject (mirrors _ACTIVE_CLAIM_FIELDS)."""
+    return {"polarity": "affirm", "subject": subject, "valid_from": "2026-01-01T00:00:00Z"}
+
+
+def _freetext_query(prompt: str) -> QueryRequest:
+    """A free-text query: ``q`` set, NO ``params['subject']`` → resolver path."""
+    return QueryRequest(
+        query_type=QueryType.RECENT_CONTEXT,
+        user_id="m7-test-user",
+        q=prompt,
+        params=None,
+    )
+
+
+@pytest.mark.integration
+class TestFreeTextResolution:
+    """Gap 1: a natural-language prompt (no pre-rigged subject) finds the claim.
+
+    These exercise the full Part B path — subject index → token-overlap resolver
+    → per-subject R4 → merged content-bearing hits — on real signed packages.
+    """
+
+    _BODY = "Claude Code reads public knowledge from verified Apex claims."
+
+    def test_freetext_prompt_resolves_to_content_hit(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-f7e700000001",
+            out_name="retrieval.aphelion.tar",
+            extra_fields=_subject_fields("retrieval-quality"),
+            body=self._BODY,
+        )
+        router = _make_router(package_dir, audit_conn)
+
+        # The subject is NOT supplied — it is resolved from the free text.
+        evidence = router.query(_freetext_query("how good is the retrieval quality"))
+
+        assert len(evidence.hits) >= 1
+        hit = evidence.hits[0]
+        assert hit["subject"] == "retrieval-quality"
+        assert hit["text"] == self._BODY  # content-bearing (Part A) via free-text (Part B)
+        assert any(note.startswith("resolver=token_overlap") for note in evidence.notes)
+
+    def test_freetext_avoids_full_corpus_unpack(
+        self, package_dir: Path, audit_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """§8.4: with a fresh index, only the resolved package is unpacked.
+
+        Three packages, distinct subjects. After the index is warm, a free-text
+        query matching one subject must unpack ONLY that package — proving the
+        index lookup avoids the per-read full-corpus unpack ceiling.
+        """
+        for name, subject, pid in (
+            ("retrieval", "retrieval-quality", "01963f7d-7000-7000-8000-f7e7000a0001"),
+            ("vector", "vector-search", "01963f7d-7000-7000-8000-f7e7000a0002"),
+            ("signer", "signer-trust", "01963f7d-7000-7000-8000-f7e7000a0003"),
+        ):
+            _build_aphelion_package(
+                tmp_path=package_dir,
+                package_id=pid,
+                out_name=f"{name}.aphelion.tar",
+                extra_fields=_subject_fields(subject),
+                body=f"body for {subject}",
+            )
+        router = _make_router(package_dir, audit_conn)
+
+        # First query warms the index (rebuild-on-miss scans all packages).
+        router.query(_freetext_query("retrieval quality"))
+
+        # Now spy on the unpack step and run a second query against the warm index.
+        unpacked: list[str] = []
+        original = router._read_package_claims
+
+        def _spy(tar: Path) -> Any:
+            unpacked.append(tar.name)
+            return original(tar)
+
+        monkeypatch.setattr(router, "_read_package_claims", _spy)
+        evidence = router.query(_freetext_query("retrieval quality"))
+
+        assert len(evidence.hits) >= 1
+        # ONLY the resolved package was unpacked — not vector/signer.
+        assert unpacked == ["retrieval.aphelion.tar"]
+
+    def test_freetext_no_overlap_is_empty_not_spurious(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        """Negative-result contract: a real miss stays empty + fires the counter.
+
+        A prompt sharing no meaningful token with any subject must NOT be
+        broadened into a fabricated hit; it returns [] and increments
+        ``parallax_apex_empty_result{cause="no_matching_claim"}``.
+        """
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-f7e700000002",
+            out_name="retrieval.aphelion.tar",
+            extra_fields=_subject_fields("retrieval-quality"),
+            body=self._BODY,
+        )
+        router = _make_router(package_dir, audit_conn)
+
+        before = _counter_value(router_mod.EMPTY_RESULT, cause="no_matching_claim")
+        evidence = router.query(_freetext_query("weather forecast tomorrow afternoon"))
+        after = _counter_value(router_mod.EMPTY_RESULT, cause="no_matching_claim")
+
+        assert evidence.hits == ()  # NOT a spurious hit
+        assert after == before + 1
+
+        # Positive twin: an overlapping prompt against the same corpus DOES hit,
+        # proving the empty above is a real miss, not an always-empty resolver.
+        hit_evidence = router.query(_freetext_query("retrieval quality report"))
+        assert len(hit_evidence.hits) >= 1
+
+    def test_freetext_merges_hits_across_subjects(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        """D4: a prompt spanning two subjects returns merged, deduped hits."""
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-f7e700000a01",
+            out_name="retrieval.aphelion.tar",
+            extra_fields=_subject_fields("retrieval-quality"),
+            body="Body about retrieval quality.",
+        )
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-f7e700000a02",
+            out_name="vector.aphelion.tar",
+            extra_fields=_subject_fields("vector-search"),
+            body="Body about vector search.",
+        )
+        router = _make_router(package_dir, audit_conn)
+
+        evidence = router.query(_freetext_query("retrieval quality and vector search"))
+
+        subjects = {hit["subject"] for hit in evidence.hits}
+        assert subjects == {"retrieval-quality", "vector-search"}
+        # Distinct claims → no over-dedup, no duplication.
+        ids = [hit["id"] for hit in evidence.hits]
+        assert len(ids) == len(set(ids)) == 2
+
+    def test_freetext_stale_index_rebuilds_finds_new_package(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        """§8.4 silent-stale prohibition end-to-end: a package added after the
+        index was warmed is still found (synchronous rebuild-on-stale)."""
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-f7e700000b01",
+            out_name="alpha.aphelion.tar",
+            extra_fields=_subject_fields("alpha-concept"),
+            body="Body about alpha concept.",
+        )
+        router = _make_router(package_dir, audit_conn)
+        router.query(_freetext_query("alpha concept"))  # warms index (alpha only)
+
+        # A new package lands AFTER the index was built → index is now stale.
+        _build_aphelion_package(
+            tmp_path=package_dir,
+            package_id="01963f7d-7000-7000-8000-f7e700000b02",
+            out_name="beta.aphelion.tar",
+            extra_fields=_subject_fields("beta-notion"),
+            body="Body about beta notion.",
+        )
+        before = _counter_value(subject_index.INDEX_REBUILD, trigger="stale")
+        evidence = router.query(_freetext_query("beta notion"))
+        after = _counter_value(subject_index.INDEX_REBUILD, trigger="stale")
+
+        assert {hit["subject"] for hit in evidence.hits} == {"beta-notion"}  # not stale-empty
+        assert after == before + 1
+
+    def test_freetext_empty_corpus_returns_empty(
+        self, package_dir: Path, audit_conn: sqlite3.Connection
+    ) -> None:
+        """Free-text against an empty corpus → [] + empty_corpus counter."""
+        router = _make_router(package_dir, audit_conn)
+        before = _counter_value(router_mod.EMPTY_CORPUS)
+        evidence = router.query(_freetext_query("anything at all"))
+        after = _counter_value(router_mod.EMPTY_CORPUS)
+
+        assert evidence.hits == ()
+        assert after == before + 1

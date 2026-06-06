@@ -52,6 +52,7 @@ from parallax.apex.audit_writer import (
     AuditRow,
     canonicalize_row,
 )
+from parallax.apex.subject_index import update_index_for_package
 from parallax.obs.log import get_logger
 
 __all__ = [
@@ -517,8 +518,15 @@ def _build_audit_rows(
     signer_id: str,
     signer_manifest_digest: str,
     timestamp: str,
-) -> tuple[AuditRow, ...]:
-    """Spec §4.4 — one canonical audit_row per claim in ``manifest["claims"]``."""
+) -> tuple[tuple[AuditRow, ...], tuple[tuple[str, str], ...]]:
+    """Spec §4.4 — one canonical audit_row per claim in ``manifest["claims"]``.
+
+    Returns ``(audit_rows, claim_subjects)`` where ``claim_subjects`` is the
+    ``(claim_id, subject)`` pairs for claims that carry a subject — consumed by
+    the M7 free-text subject index (#71 D1). Subjectless claims are omitted
+    from the second tuple (they are not R4-routable); their audit rows are still
+    written.
+    """
     raw_claims = manifest.get("claims")
     if not isinstance(raw_claims, list) or not raw_claims:
         raise ParallaxIngestError(
@@ -549,7 +557,8 @@ def _build_audit_rows(
     _validate_and_check_duplicates(parsed)
 
     rows: list[AuditRow] = []
-    for claim_id, _fm in parsed:
+    claim_subjects: list[tuple[str, str]] = []
+    for claim_id, fm in parsed:
         envelope_message_id = str(uuid.uuid4())
         row_data: dict[str, Any] = {
             "claim_id": claim_id,
@@ -563,7 +572,10 @@ def _build_audit_rows(
             "ts": timestamp,
         }
         rows.append(canonicalize_row(row_data))
-    return tuple(rows)
+        subject = fm.get("subject")
+        if isinstance(subject, str) and subject:
+            claim_subjects.append((claim_id, subject))
+    return tuple(rows), tuple(claim_subjects)
 
 
 def _write_batch(
@@ -748,7 +760,7 @@ def ingest_package(
             )
 
         timestamp = _utc_now_iso_z()
-        audit_rows = _build_audit_rows(
+        audit_rows, claim_subjects = _build_audit_rows(
             manifest=manifest,
             unpacked_dir=unpacked,
             package_id=package_id,
@@ -767,6 +779,30 @@ def ingest_package(
         )
 
         rows_written = _write_batch(audit_conn, batch)
+
+    # Best-effort: maintain the M7 free-text subject index (#71 D1). The index
+    # is a *derived cache* the read path rebuilds on staleness
+    # (``subject_index.load_or_rebuild``), so a write failure here MUST NOT fail
+    # an ingest whose audit rows already committed — log and continue. The
+    # except is broad on purpose (any index-write fault is non-fatal here) but
+    # never silent.
+    try:
+        update_index_for_package(
+            resolved_pkg_dir,
+            package_file=resolved_pkg.name,
+            package_id=package_id,
+            claim_subjects=claim_subjects,
+        )
+    except Exception as exc:  # noqa: BLE001 — derived cache; must not fail a committed ingest
+        _log.warning(
+            "subject_index_update_failed",
+            extra={
+                "event": "subject_index_update_failed",
+                "package_id": package_id,
+                "package_path": str(resolved_pkg),
+                "error": str(exc),
+            },
+        )
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     report = IngestReport(

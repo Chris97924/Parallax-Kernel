@@ -70,13 +70,21 @@ __all__ = [
 
 
 class DodMetric(enum.StrEnum):
-    """The five DoD metric identifiers (AC-3.1)."""
+    """DoD metric identifiers.
+
+    The first five are the original SQLite-path metrics (AC-3.1).
+    ``APHELION_UNREACHABLE_RATE`` was added for the per-stage Prometheus
+    shadow summary (Option A1, 2026-06-07) — see
+    :mod:`parallax.canary.dod_prometheus`. It has no SQLite-path producer.
+    """
 
     ERROR_RATE = "error_rate"
     DISCREPANCY_RATE = "discrepancy_rate"
     P99_LATENCY_MS = "p99_latency_ms"
     DATA_LOSS_COUNT = "data_loss_count"
     MIN_HITS = "min_hits"
+    # Shadow-summary only (dod_prometheus): aphelion_unreachable / attempts.
+    APHELION_UNREACHABLE_RATE = "aphelion_unreachable_rate"
 
 
 class DodVerdict(enum.StrEnum):
@@ -100,6 +108,9 @@ DOD_THRESHOLD: Final[dict[DodMetric, float]] = {
     DodMetric.P99_LATENCY_MS: 100.0,  # < 100 ms
     DodMetric.DATA_LOSS_COUNT: 0,  # == 0
     DodMetric.MIN_HITS: 50,  # >= 50
+    # Shadow-summary only (dod_prometheus): mirrors the
+    # CanaryShadowAphelionUnreachableHigh alert ceiling (0.5%).
+    DodMetric.APHELION_UNREACHABLE_RATE: 0.005,  # < 0.5%
 }
 
 # AC 3.1 — 7-day rolling DoD window.
@@ -244,12 +255,8 @@ def _metric_family_has_traffic_source_label(
     try:
         for metric in registry.collect():
             metric_name = getattr(metric, "name", "")
-            sample_names = {
-                getattr(s, "name", "") for s in getattr(metric, "samples", ())
-            }
-            if metric_name not in target_names and not (
-                target_names & sample_names
-            ):
+            sample_names = {getattr(s, "name", "") for s in getattr(metric, "samples", ())}
+            if metric_name not in target_names and not (target_names & sample_names):
                 continue
             # Modern API: walk samples; each sample has a labels dict.
             for sample in getattr(metric, "samples", ()):
@@ -272,7 +279,9 @@ def _metric_family_has_traffic_source_label(
         _LOG.error(
             "prometheus introspection failed (%s: %s); gate_disabled=True "
             "split signal=False — set %s=1 to force-open if appropriate",
-            exc.__class__.__name__, exc, SPLIT_OVERRIDE_ENV,
+            exc.__class__.__name__,
+            exc,
+            SPLIT_OVERRIDE_ENV,
             extra={"gate_disabled": True, "exc_class": exc.__class__.__name__},
         )
         return False
@@ -315,9 +324,7 @@ def _verdict_for(metric: DodMetric, observed: float, sample_size: int) -> DodVer
     """
     if metric == DodMetric.MIN_HITS:
         return (
-            DodVerdict.PASS
-            if observed >= DOD_THRESHOLD[metric]
-            else DodVerdict.INSUFFICIENT_DATA
+            DodVerdict.PASS if observed >= DOD_THRESHOLD[metric] else DodVerdict.INSUFFICIENT_DATA
         )
 
     # All other metrics depend on sample size — fewer than 50 hits means
@@ -379,6 +386,18 @@ def compute_dod(
     OutcomeStore design); the function does not enforce this — the
     consequence of mismatched paths is silently empty results, which the
     INSUFFICIENT_DATA verdict surfaces.
+
+    .. deprecated:: 2026-06-07
+        Superseded for the ``parallax canary --dod`` CLI by
+        :func:`parallax.canary.dod_prometheus.compute_shadow_dod`
+        (Chris's Option A1). The SQLite path is retained (and still tested)
+        but is **no longer wired to the CLI** because nothing populates
+        ``canary_outcomes`` in production: the live observer
+        (``parallax.canary_shadow.observe``) emits Prometheus counters and
+        never calls ``OutcomeStore.record()``, so this path returns
+        INSUFFICIENT_DATA forever in a real deployment. The authoritative
+        promotion gate is the T1-T5 Prometheus alerts; the per-stage
+        ``--dod`` summary now reads Prometheus shadow metrics instead.
     """
     if stage not in KNOWN_STAGES:
         raise ValueError(
@@ -420,15 +439,11 @@ def compute_dod(
     split_ready = _split_implemented(conn_audit)
 
     # Step 2 — per-metric computation.
-    error_count = sum(
-        1 for row in audit_rows if int(row["response_status"]) >= 500
-    )
+    error_count = sum(1 for row in audit_rows if int(row["response_status"]) >= 500)
     error_rate = error_count / sample_size if sample_size else 0.0
 
     latencies = sorted(
-        float(row["latency_ms"])
-        for row in audit_rows
-        if row["latency_ms"] is not None
+        float(row["latency_ms"]) for row in audit_rows if row["latency_ms"] is not None
     )
     p99_latency = _quantile(latencies, 0.99)
 
@@ -450,9 +465,7 @@ def compute_dod(
     total_outcomes = int(sum(outcome_counts.values()) or 0)
     discrepancy_count = int(outcome_counts.get("discrepancy", 0))
     data_loss_count = int(outcome_counts.get("data_loss", 0))
-    discrepancy_rate = (
-        discrepancy_count / total_outcomes if total_outcomes else 0.0
-    )
+    discrepancy_rate = discrepancy_count / total_outcomes if total_outcomes else 0.0
 
     # Each metric is gated on the sample size of the corpus IT reads from.
     # Mixing the two would let an outcome-heavy / audit-light corpus return
@@ -480,9 +493,7 @@ def compute_dod(
             threshold=DOD_THRESHOLD[DodMetric.DISCREPANCY_RATE],
             # B2 metric — depends on synthetic/natural split per spec §3.4.
             verdict=(
-                _verdict_for(
-                    DodMetric.DISCREPANCY_RATE, discrepancy_rate, total_outcomes
-                )
+                _verdict_for(DodMetric.DISCREPANCY_RATE, discrepancy_rate, total_outcomes)
                 if split_ready
                 else DodVerdict.PENDING_IMPLEMENTATION
             ),
@@ -497,18 +508,14 @@ def compute_dod(
             # half the rows have NULL latency would otherwise return
             # PASS/FAIL on too few latency observations instead of
             # INSUFFICIENT_DATA.
-            verdict=_verdict_for(
-                DodMetric.P99_LATENCY_MS, p99_latency, len(latencies)
-            ),
+            verdict=_verdict_for(DodMetric.P99_LATENCY_MS, p99_latency, len(latencies)),
             sample_size=len(latencies),
         ),
         MetricResult(
             metric=DodMetric.DATA_LOSS_COUNT,
             observed=float(data_loss_count),
             threshold=DOD_THRESHOLD[DodMetric.DATA_LOSS_COUNT],
-            verdict=_verdict_for(
-                DodMetric.DATA_LOSS_COUNT, data_loss_count, total_outcomes
-            ),
+            verdict=_verdict_for(DodMetric.DATA_LOSS_COUNT, data_loss_count, total_outcomes),
             sample_size=total_outcomes,
         ),
         MetricResult(

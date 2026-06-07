@@ -225,6 +225,51 @@ class TestUpdateIndexForPackage:
         assert idx.subjects() == frozenset({"subject-2"})
         assert idx.package_files() == ("pkg2.aphelion.tar",)
 
+    def test_does_not_certify_changed_other_package_as_fresh(self, tmp_path: Path) -> None:
+        """Codex #74 round 2: ingesting B must not stamp a changed A as fresh.
+
+        A is same-name swapped on disk but its best-effort index write was
+        skipped; ingesting B carries A's *recorded* (old) identity, not A's
+        current one — so a later read still detects A as stale and rebuilds
+        rather than serving A's stale subjects indefinitely (no silent-stale).
+        """
+        _write_tar(tmp_path, "a.aphelion.tar", b"a-v1")
+        update_index_for_package(
+            tmp_path,
+            package_file="a.aphelion.tar",
+            package_id="pa",
+            claim_subjects=[("ca", "a-subject")],
+        )
+        # A's content is swapped on disk; its index write is skipped (we do NOT
+        # call update_index_for_package for A).
+        _write_tar(tmp_path, "a.aphelion.tar", b"a-v2-much-bigger-content")
+        # Ingest B before any read rebuild.
+        _write_tar(tmp_path, "b.aphelion.tar", b"b-v1")
+        update_index_for_package(
+            tmp_path,
+            package_file="b.aphelion.tar",
+            package_id="pb",
+            claim_subjects=[("cb", "b-subject")],
+        )
+
+        idx = load_index(tmp_path)
+        assert idx is not None
+        a_stat = next(p for p in idx.packages if p.name == "a.aphelion.tar")
+        # A's OLD identity is preserved (size of a-v1), NOT re-stamped to a-v2.
+        assert a_stat.size == len(b"a-v1")
+
+        # So a read detects A as stale and rebuilds (the silent-stale is gone).
+        before = _counter(subject_index.INDEX_REBUILD, trigger="stale")
+        rebuilt = load_or_rebuild(
+            tmp_path,
+            lambda: [
+                _entry("a-subject-new", "a.aphelion.tar"),
+                _entry("b-subject", "b.aphelion.tar"),
+            ],
+        )
+        assert _counter(subject_index.INDEX_REBUILD, trigger="stale") == before + 1
+        assert rebuilt.subjects() == frozenset({"a-subject-new", "b-subject"})
+
 
 # ===========================================================================
 # load_or_rebuild — the §8.4 freshness contract

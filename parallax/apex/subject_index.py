@@ -323,16 +323,35 @@ def update_index_for_package(
 
     The merge keeps existing entries for *other* packages that still exist on
     disk, drops any whose package vanished, and replaces this package's prior
-    entries (idempotent re-ingest). The package identity set is recomputed from
-    the live filesystem so freshness reflects reality (size/mtime included).
+    entries (idempotent re-ingest).
+
+    Crucially, an *other* package's recorded identity is **carried forward from
+    the existing index, not re-stat'd to its current on-disk value** (only the
+    just-ingested package is stat'd fresh). Re-stamping every tar's current
+    identity here would certify a since-changed other package as fresh while its
+    carried entries are stale — so a later ``load_or_rebuild`` would see a
+    matching identity set and never rebuild, serving stale subjects indefinitely
+    (codex #74 round 2). By preserving the recorded identity, a changed other
+    package no longer matches disk and the next read rebuilds. A package on disk
+    but absent from the existing index is likewise left out of the identity set,
+    forcing a rebuild that picks it up.
     """
     existing = load_index(package_dir)
     current = current_packages(package_dir)
     on_disk = {pkg.name for pkg in current}
-    base = [
+    ingested_stat = next((pkg for pkg in current if pkg.name == package_file), None)
+
+    prev_entries = existing.entries if existing else ()
+    prev_packages = existing.packages if existing else ()
+
+    base_entries = [
         entry
-        for entry in (existing.entries if existing else ())
+        for entry in prev_entries
         if entry.package_file != package_file and entry.package_file in on_disk
+    ]
+    # Carry the OTHER packages' recorded identities verbatim (see docstring).
+    base_packages = [
+        pkg for pkg in prev_packages if pkg.name != package_file and pkg.name in on_disk
     ]
     added = [
         IndexEntry(
@@ -344,9 +363,12 @@ def update_index_for_package(
         for claim_id, subject in claim_subjects
         if subject
     ]
+    packages = tuple(base_packages)
+    if ingested_stat is not None:
+        packages += (ingested_stat,)
     index = SubjectIndex(
-        entries=tuple(base) + tuple(added),
-        packages=current,
+        entries=tuple(base_entries) + tuple(added),
+        packages=packages,
         built_at=time.time(),
     )
     save_index(package_dir, index)

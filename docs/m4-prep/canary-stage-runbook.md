@@ -91,6 +91,7 @@ sudo systemctl restart parallax-server.service
    PARALLAX_SPLIT_IMPLEMENTED=1 /home/chris/parallax/.venv/bin/parallax canary --dod --stage m4_10pct
    #   → PASS / INSUFFICIENT_DATA（樣本不足，續等，不算失敗）/ FAIL
    ```
+   > ⚠️ **DoD 資料來源前提（codex 2026-06-07 指出，待 Chris 在 M4 impl 確認）**：`--dod` 讀 SQLite `canary_outcomes`（`parallax/canary/outcomes.py::OutcomeStore`），但 `canary_shadow.observe()` 目前**只增 Prometheus `parallax_canary_shadow_*` counter、未見呼叫 `OutcomeStore.record()`** 寫該 SQLite 表。若 shadow 流程裡沒有其他 producer 填入對應 stage 的 `canary_outcomes` 列，`--dod` 會一直回 `INSUFFICIENT_DATA`。推進前先 `sqlite3 <audit_db> "SELECT stage,count(*) FROM canary_outcomes GROUP BY stage"` 確認該 stage 有列；若空，DoD 判讀要改讀 Prometheus 指標而非此 SQLite 路徑。
 5. **Gate 告警**（block 推進，非 auto-rollback）：`CanaryShadowDiscrepancyHigh` / `CanaryShadowAphelionUnreachableHigh`（rate > 0.5%，持續 10m，severity=warning，class=gate）。任一 firing → 不推進，查 divergence 來源。
 6. **取得 Chris Go/No-Go ACK** 才推下一階。
 

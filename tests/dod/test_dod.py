@@ -261,12 +261,8 @@ def test_stage_isolation_no_cross_stage_spillover(
         seed_offset=10_000,
     )
 
-    r1 = compute_dod(
-        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
-    )
-    r10 = compute_dod(
-        audit_log=audit, outcomes=outcomes, stage="m4_10pct", until=_FIXED_NOW
-    )
+    r1 = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW)
+    r10 = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_10pct", until=_FIXED_NOW)
 
     # r1: healthy data, but split not implemented → B1/B2 are PENDING.
     # Overall must not be PASS (PENDING trumps PASS) and must not be FAIL.
@@ -309,9 +305,7 @@ def test_window_excludes_events_older_than_7_days(
         when=_FIXED_NOW,
     )
 
-    report = compute_dod(
-        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
-    )
+    report = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW)
     # Overall: PENDING_IMPLEMENTATION (B1/B2 pending) rather than PASS —
     # the window test's invariant is that old data_loss rows are excluded,
     # not the overall verdict shape (which now depends on split readiness).
@@ -340,9 +334,7 @@ def test_insufficient_data_for_low_hits(
     audit, outcomes = stores
     _populate(audit=audit, outcomes=outcomes, stage="m4_1pct", count=10)
 
-    report = compute_dod(
-        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
-    )
+    report = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW)
     # ERROR_RATE and DISCREPANCY_RATE are gated on the split; they return
     # PENDING_IMPLEMENTATION in test fixtures (no traffic_source column).
     _SPLIT_GATED = {DodMetric.ERROR_RATE, DodMetric.DISCREPANCY_RATE}
@@ -371,9 +363,7 @@ def test_zero_data_returns_insufficient_data(
     stores: tuple[AuditLog, OutcomeStore],
 ) -> None:
     audit, outcomes = stores
-    report = compute_dod(
-        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
-    )
+    report = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW)
     # With zero data AND split not implemented, B1/B2 are PENDING_IMPLEMENTATION
     # which trumps INSUFFICIENT_DATA in _aggregate precedence.
     assert report.overall in (DodVerdict.INSUFFICIENT_DATA, DodVerdict.PENDING_IMPLEMENTATION)
@@ -401,9 +391,7 @@ def test_audit_thin_outcomes_full_does_not_pass_audit_metrics(
                 idempotency_hit=False,
             )
         )
-        outcomes.record(
-            event_id=eid, stage="m4_1pct", outcome="ok", recorded_at=when_iso
-        )
+        outcomes.record(event_id=eid, stage="m4_1pct", outcome="ok", recorded_at=when_iso)
     # 200 extra outcome rows with no audit row (outcome-side full)
     for i in range(200):
         outcomes.record(
@@ -413,9 +401,7 @@ def test_audit_thin_outcomes_full_does_not_pass_audit_metrics(
             recorded_at=when_iso,
         )
 
-    report = compute_dod(
-        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
-    )
+    report = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW)
     # ERROR_RATE is split-gated → PENDING_IMPLEMENTATION in test fixtures.
     # P99_LATENCY_MS is not split-gated → still INSUFFICIENT_DATA when thin.
     for m in report.metrics:
@@ -453,13 +439,9 @@ def test_p99_latency_gates_on_non_null_latency_count(
                 idempotency_hit=False,
             )
         )
-        outcomes.record(
-            event_id=eid, stage="m4_1pct", outcome="ok", recorded_at=when_iso
-        )
+        outcomes.record(event_id=eid, stage="m4_1pct", outcome="ok", recorded_at=when_iso)
 
-    report = compute_dod(
-        audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
-    )
+    report = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW)
     p99 = next(m for m in report.metrics if m.metric == DodMetric.P99_LATENCY_MS)
     assert p99.verdict == DodVerdict.INSUFFICIENT_DATA, (
         f"p99 should be INSUFFICIENT_DATA when only 10/100 rows have latency, "
@@ -501,9 +483,7 @@ def test_dod_json_output_shape(
         _populate(audit=audit, outcomes=outcomes, stage="m4_1pct", count=200)
         from parallax.canary.cli import _print_dod  # internal helper, OK in tests
 
-        report = compute_dod(
-            audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW
-        )
+        report = compute_dod(audit_log=audit, outcomes=outcomes, stage="m4_1pct", until=_FIXED_NOW)
         _print_dod(report, fmt="json")
     finally:
         audit.close()
@@ -515,8 +495,15 @@ def test_dod_json_output_shape(
     # overall is "pending_implementation" until traffic_source column lands
     # (split not implemented in test fixture); shape test only checks structure.
     assert payload["overall"] in ("pass", "pending_implementation")
+    # The SQLite compute_dod path emits exactly the five original metrics.
+    # APHELION_UNREACHABLE_RATE was added to DodMetric for the Prometheus
+    # shadow summary (dod_prometheus) and is NOT part of this SQLite report.
     assert {m["metric"] for m in payload["metrics"]} == {
-        m.value for m in DodMetric
+        DodMetric.ERROR_RATE.value,
+        DodMetric.DISCREPANCY_RATE.value,
+        DodMetric.P99_LATENCY_MS.value,
+        DodMetric.DATA_LOSS_COUNT.value,
+        DodMetric.MIN_HITS.value,
     }
     for m in payload["metrics"]:
         assert m["threshold"] == DOD_THRESHOLD[DodMetric(m["metric"])]
@@ -625,16 +612,15 @@ def test_non_split_metrics_still_pass_when_split_not_implemented(
     data_loss = next(m for m in report.metrics if m.metric == DodMetric.DATA_LOSS_COUNT)
     min_hits = next(m for m in report.metrics if m.metric == DodMetric.MIN_HITS)
 
-    assert p99.verdict == DodVerdict.PASS, (
-        f"p99_latency must still compute PASS when split not landed, got {p99.verdict.value}"
-    )
+    assert (
+        p99.verdict == DodVerdict.PASS
+    ), f"p99_latency must still compute PASS when split not landed, got {p99.verdict.value}"
     assert data_loss.verdict == DodVerdict.PASS, (
         f"data_loss_count must still compute PASS when split not landed, "
         f"got {data_loss.verdict.value}"
     )
     assert min_hits.verdict == DodVerdict.PASS, (
-        f"min_hits must still compute PASS when split not landed, "
-        f"got {min_hits.verdict.value}"
+        f"min_hits must still compute PASS when split not landed, " f"got {min_hits.verdict.value}"
     )
 
 
@@ -720,9 +706,7 @@ def test_split_implemented_env_override_falsy_values(monkeypatch):
     # (no live server), so the secondary check will also return False.
     for value in ("", "   ", "0", "false", "no", "off", "ture", "maybe"):
         monkeypatch.setenv("PARALLAX_SPLIT_IMPLEMENTED", value)
-        assert _split_implemented() is False, (
-            f"value={value!r} must NOT open gate"
-        )
+        assert _split_implemented() is False, f"value={value!r} must NOT open gate"
 
 
 def test_split_implemented_env_override_unset_falls_through(monkeypatch):

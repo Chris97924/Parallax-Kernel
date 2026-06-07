@@ -2,8 +2,14 @@
 
 Exposes three CLI flag-groups invoked from :mod:`parallax.cli`:
 
-* ``parallax canary --dod --stage <stage> [--days N] [--audit-db PATH]``
-  Run DoD verification for one stage over the trailing window.
+* ``parallax canary --dod --stage <stage> [--days N] [--prometheus-url URL]``
+  Run the per-stage DoD summary for one stage over the trailing window.
+  Reads the canary shadow observer's **Prometheus** metrics
+  (discrepancy_rate, aphelion_unreachable_rate, sample size) per Option A1
+  (2026-06-07); error_rate / p99_latency / data_loss are gated by the
+  T1-T5 Prometheus alerts (auto-rollback), not this summary. The SQLite
+  ``OutcomeStore`` path is retired for ``--dod`` (nothing populates
+  ``canary_outcomes`` in production).
 * ``parallax canary --rollback-drill [--dry-run]``
   Run the three-scenario drill (drain + re-emit + idempotency).
 * ``parallax canary --drain-test [--timeout SECONDS]``
@@ -27,13 +33,18 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from typing import Final
 
 from parallax.canary.audit_log import AuditLog
 from parallax.canary.dod import (
     DEFAULT_WINDOW_DAYS,
     DodReport,
     DodVerdict,
-    compute_dod,
+)
+from parallax.canary.dod_prometheus import (
+    DEFAULT_PROM_URL,
+    PROM_URL_ENV,
+    compute_shadow_dod,
 )
 from parallax.canary.drill import (
     DEFAULT_DRAIN_TIMEOUT_S,
@@ -43,7 +54,7 @@ from parallax.canary.drill import (
     run_full_drill,
     run_reemit_drill,
 )
-from parallax.canary.outcomes import KNOWN_STAGES, OutcomeStore
+from parallax.canary.outcomes import KNOWN_STAGES
 
 __all__ = ["register_canary_subparser", "cmd_canary"]
 
@@ -101,7 +112,16 @@ def register_canary_subparser(sub: argparse._SubParsersAction[argparse.ArgumentP
         "--audit-db",
         type=str,
         default=None,
-        help="Override audit-log SQLite path (defaults to PARALLAX_CANARY_AUDIT_DB).",
+        help=(
+            "Override audit-log SQLite path (defaults to PARALLAX_CANARY_AUDIT_DB). "
+            "Used by the rollback drills; --dod no longer reads SQLite."
+        ),
+    )
+    p_canary.add_argument(
+        "--prometheus-url",
+        type=str,
+        default=None,
+        help=f"Prometheus base URL for --dod (defaults to ${PROM_URL_ENV} or {DEFAULT_PROM_URL}).",
     )
     p_canary.add_argument(
         "--timeout",
@@ -167,21 +187,28 @@ def _cmd_dod(args: argparse.Namespace) -> int:
         print("error: --stage is required with --dod", file=sys.stderr)
         return 2
 
-    audit = AuditLog(db_path=args.audit_db)
-    outcomes = OutcomeStore(db_path=args.audit_db)
-    try:
-        report = compute_dod(
-            audit_log=audit,
-            outcomes=outcomes,
-            stage=args.stage,
-            window_days=args.days,
-        )
-    finally:
-        audit.close()
-        outcomes.close()
+    # Option A1 (2026-06-07): the per-stage --dod summary reads the canary
+    # shadow observer's Prometheus metrics, not the SQLite OutcomeStore
+    # (which has no production producer). prom_url resolution order:
+    # --prometheus-url flag > PARALLAX_PROMETHEUS_URL env > localhost default.
+    prom_url = args.prometheus_url or os.environ.get(PROM_URL_ENV) or DEFAULT_PROM_URL
+
+    report = compute_shadow_dod(
+        stage=args.stage,
+        window_days=args.days,
+        prom_url=prom_url,
+    )
 
     _print_dod(report, fmt=args.format)
     return 0 if report.overall == DodVerdict.PASS else 1
+
+
+# Footer shown under every --dod report: the three metrics this per-stage
+# summary does NOT compute are gated elsewhere (Option A1, 2026-06-07).
+_DOD_GATE_NOTE: Final[str] = (
+    "error_rate / p99_latency / data_loss are gated by the T1-T5 Prometheus "
+    "alerts (auto-rollback), not this per-stage summary."
+)
 
 
 def _print_dod(report: DodReport, *, fmt: str) -> None:
@@ -201,6 +228,7 @@ def _print_dod(report: DodReport, *, fmt: str) -> None:
                 }
                 for m in report.metrics
             ],
+            "note": _DOD_GATE_NOTE,
         }
         print(json.dumps(payload, indent=2))
         return
@@ -216,6 +244,8 @@ def _print_dod(report: DodReport, *, fmt: str) -> None:
             f"  {m.metric.value:<22} {m.observed:>14.6f} {m.threshold:>14.6f} "
             f"{m.verdict.value:<20} {m.sample_size}"
         )
+    print()
+    print(f"  note: {_DOD_GATE_NOTE}")
 
 
 # ----------------------------------------------------------------------
@@ -305,8 +335,10 @@ def _print_drill_reports(reports: Sequence[DrillReport], *, fmt: str) -> None:
     for r in reports:
         print(f"Drill: {r.drill}  (dry_run={r.dry_run})  →  {r.overall.upper()}")
         for s in r.steps:
-            mark = "✓" if s.status == DrillStatus.PASS else (
-                "✗" if s.status == DrillStatus.FAIL else "·"
+            mark = (
+                "✓"
+                if s.status == DrillStatus.PASS
+                else ("✗" if s.status == DrillStatus.FAIL else "·")
             )
             print(f"  {mark} {s.name}: {s.detail}")
             if s.observations:
@@ -366,4 +398,3 @@ def _cmd_check_alerting(args: argparse.Namespace) -> int:
             )
 
     return 0 if pd_url and slack_url else 1
-

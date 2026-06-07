@@ -85,13 +85,15 @@ sudo systemctl restart parallax-server.service
 1. 確認 Grafana 上對應 stage 的 series 開始有資料。
 2. Discord `#指揮室` relay（PR #60）發推進通知。
 3. **觀察期 dwell**：s1 入場 → s2 24h → s3 48h → s4 14-day。
-4. dwell 滿後跑 **DoD**（spec §5 metrics + 7-day 窗）。`--stage` **必須對應當前推進的階段**——`compute_dod` 用 `WHERE c.stage = ?` 精確過濾，填錯會驗到別的 cohort（s1→`m4_1pct`、s2→`m4_10pct`、s3→`m4_50pct`、s4→`m4_100pct`）：
+4. dwell 滿後跑 **DoD**（per-stage summary + 7-day 窗）。`--dod` **讀 Prometheus shadow 指標**（Option A1，2026-06-07 Chris 拍板），不再讀 SQLite。它報三個 metric：`discrepancy_rate`、`aphelion_unreachable_rate`、樣本數（`min_hits`）——全部由 `parallax_canary_shadow_*{stage="sN"}` counter 在 `[7d]` 窗上 `increase()` 聚合而得。`--stage` **必須對應當前推進的階段**（s1→`m4_1pct`、s2→`m4_10pct`、s3→`m4_50pct`、s4→`m4_100pct`，CLI 內部映射成 `sN` label）；填錯會驗到別的 cohort：
    ```bash
    # 範例：當前在 s2 (10%)。s1/s3/s4 改成 m4_1pct / m4_50pct / m4_100pct。
-   PARALLAX_SPLIT_IMPLEMENTED=1 /home/chris/parallax/.venv/bin/parallax canary --dod --stage m4_10pct
-   #   → PASS / INSUFFICIENT_DATA（樣本不足，續等，不算失敗）/ FAIL
+   # prom URL 預設讀 $PARALLAX_PROMETHEUS_URL，未設則 http://localhost:9090；
+   # 可用 --prometheus-url 覆寫。
+   /home/chris/parallax/.venv/bin/parallax canary --dod --stage m4_10pct
+   #   → PASS / INSUFFICIENT_DATA（樣本 < 50 或 Prometheus 不可達，續等，不算失敗）/ FAIL
    ```
-   > ⚠️ **DoD 資料來源前提（codex 2026-06-07 指出，待 Chris 在 M4 impl 確認）**：`--dod` 讀 SQLite `canary_outcomes`（`parallax/canary/outcomes.py::OutcomeStore`），但 `canary_shadow.observe()` 目前**只增 Prometheus `parallax_canary_shadow_*` counter、未見呼叫 `OutcomeStore.record()`** 寫該 SQLite 表。若 shadow 流程裡沒有其他 producer 填入對應 stage 的 `canary_outcomes` 列，`--dod` 會一直回 `INSUFFICIENT_DATA`。推進前先 `sqlite3 <audit_db> "SELECT stage,count(*) FROM canary_outcomes GROUP BY stage"` 確認該 stage 有列；若空，DoD 判讀要改讀 Prometheus 指標而非此 SQLite 路徑。
+   > ℹ️ **DoD 資料來源（A1 resolved，2026-06-07）**：舊版 `--dod` 讀 SQLite `canary_outcomes`，但 `canary_shadow.observe()` 只增 Prometheus counter、從不呼叫 `OutcomeStore.record()`，所以生產環境那張表永遠是空的 → 舊路徑恆回 `INSUFFICIENT_DATA`。Chris 拍板 Option A1：`--dod` 改成 per-stage Prometheus shadow summary（薄殼，advisory cross-check）。**`error_rate` / `p99_latency` / `data_loss` 這三個 shadow observer 不產的 per-stage 指標，交由 `prometheus/rules/parallax-m4-canary.rules.yml` 的 T1-T5 Prometheus 告警（auto-rollback）把關——那些告警才是權威的 promotion gate**，`--dod` summary 不重複計算它們。除 T1-T5 外，第 5 點的兩個 CanaryShadow gate 告警另就 per-stage discrepancy / aphelion 把關。SQLite `compute_dod` 程式碼保留（仍有測試）但不再接 CLI。
 5. **Gate 告警**（block 推進，非 auto-rollback）：`CanaryShadowDiscrepancyHigh` / `CanaryShadowAphelionUnreachableHigh`（rate > 0.5%，持續 10m，severity=warning，class=gate）。任一 firing → 不推進，查 divergence 來源。
 6. **取得 Chris Go/No-Go ACK** 才推下一階。
 

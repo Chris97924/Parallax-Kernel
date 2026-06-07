@@ -59,16 +59,18 @@ sudo systemctl daemon-reload
 sudo systemctl restart parallax-server.service
 systemctl status parallax-server.service --no-pager | head -3   # 確認 active
 
-# 4. 把 recording rules + dashboard 進 observability stack
-cp prometheus/rules/parallax-m4-canary.rules.yml \
-   /home/chris/parallax-kernel/deploy/observability/prometheus/rules/
+# 4. 載入 recording rules + dashboard
+# rule 檔已版控在 repo 的 prometheus/rules/，而 docker-compose 正是把
+# /home/chris/parallax-kernel/prometheus/rules 掛進容器的 /etc/prometheus/rules（:ro）。
+# 不需 cp 到別處（deploy/observability/prometheus/rules 並不存在）——確認 repo
+# working tree 最新（git pull）讓 rule 檔在掛載來源目錄後，直接 reload：
 docker compose -f /home/chris/parallax-kernel/deploy/observability/docker-compose.yml \
    exec prometheus promtool check rules /etc/prometheus/rules/parallax-m4-canary.rules.yml
 docker compose -f /home/chris/parallax-kernel/deploy/observability/docker-compose.yml kill -s HUP prometheus
 # Grafana：import grafana/dashboards/parallax-m4-canary-stage-1.json
 ```
 
-**Stage 0 驗收**：`parallax-server` active；`SHADOW_FRACTION=0.0`（observer off）；Grafana 出現 `parallax_m4_canary` series（idle stage 因 `>0` guard 不出 NaN）。
+**Stage 0 驗收**：`parallax-server` active；`SHADOW_FRACTION=0.0`（observer off）；Prometheus rule group `parallax_m4_canary` 已載入（`promtool check rules` 綠 + `/api/v1/rules` 看得到 group）。此時**不應有** `parallax_canary_shadow_*` series —— fraction=0 時 `observe()` 提早返回不增 counter，recording rule 的 `>0` denominator guard 也不出 gauge；若反而有 series，代表 fraction 沒真正歸零。
 
 ## 4. Stage 推進（s1 → s4，逐階）
 
@@ -83,8 +85,9 @@ sudo systemctl restart parallax-server.service
 1. 確認 Grafana 上對應 stage 的 series 開始有資料。
 2. Discord `#指揮室` relay（PR #60）發推進通知。
 3. **觀察期 dwell**：s1 入場 → s2 24h → s3 48h → s4 14-day。
-4. dwell 滿後跑 **DoD**（spec §5 metrics + 7-day 窗）：
+4. dwell 滿後跑 **DoD**（spec §5 metrics + 7-day 窗）。`--stage` **必須對應當前推進的階段**——`compute_dod` 用 `WHERE c.stage = ?` 精確過濾，填錯會驗到別的 cohort（s1→`m4_1pct`、s2→`m4_10pct`、s3→`m4_50pct`、s4→`m4_100pct`）：
    ```bash
+   # 範例：當前在 s2 (10%)。s1/s3/s4 改成 m4_1pct / m4_50pct / m4_100pct。
    PARALLAX_SPLIT_IMPLEMENTED=1 /home/chris/parallax/.venv/bin/parallax canary --dod --stage m4_10pct
    #   → PASS / INSUFFICIENT_DATA（樣本不足，續等，不算失敗）/ FAIL
    ```

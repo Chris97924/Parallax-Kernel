@@ -3,17 +3,17 @@
 > **文件版本**: v2.0 (rewrite — grounded in the real ZenBook mechanism)
 > **最後更新**: 2026-06-07
 > **擁有者**: Chris (single-operator homelab)
-> **狀態**: Draft → Review by Chris
+> **狀態**: Final（§0 兩點已於 2026-06-07 由 Chris reconcile）
 > **權威來源**: [canary-shadow-spec.md](./canary-shadow-spec.md) (frozen-2026-05-18) · `parallax/canary_shadow.py` · `parallax/canary/` CLI
 
 ---
 
-## 0. ⚠️ 讀這份前必看 — 兩個未 reconcile 的問題（別照舊操作）
+## 0. 設計決策（Chris 2026-06-07 reconcile 完成）
 
-v1.0 的舊 runbook 是**通用企業 canary 範本，與本系統不符**（`canary-ctl.parallax.internal` 主機、`canary-deploy.sh`、image registry、load-balancer 流量切分、PagerDuty/Slack、Kernel/Aphelion 團隊 —— 這些**都不存在**）。本 v2.0 改寫對齊真實機制，但有兩點**刻意留給 Chris 決，未自行填補**：
+v1.0 的舊 runbook 是**通用企業 canary 範本，與本系統不符**（`canary-ctl.parallax.internal` 主機、`canary-deploy.sh`、image registry、load-balancer 流量切分、PagerDuty/Slack、Kernel/Aphelion 團隊 —— 這些**都不存在**）。本 v2.0 改寫對齊真實機制；以下兩點原為待決，已由 Chris 2026-06-07 拍板定案：
 
-1. **observer-only（§9）vs rollback 演練的張力。** spec §9 明寫此 observer **永不改變 served result**（client 永遠拿 `result.primary`，無真流量切分）。但 `parallax canary` CLI 卻有 `--rollback-drill` / `--drain-test` / `--orbit-reemit-test`（drain in-flight + Orbit re-emit + idempotency）。若 observer 不碰 served path，這些 drill「rollback」的到底是什麼？**推測**：它們屬於未來 **M5 Aphelion 真 cutover**，不是這個觀察層。**在 Chris 確認前，第 6 節 rollback 只當「關掉 observer」（`SHADOW_FRACTION=0.0`），對 served path 零風險。**
-2. **告警通道。** CLI `--check-alerting` 寫「PagerDuty + Slack」，但本 homelab 真實告警是 **Discord relay (PR #60, LIVE) + Gmail (PR #62)**。PagerDuty/Slack 疑為 CLI 內的 placeholder。**本 runbook 一律寫 Discord/Gmail；CLI 的 PagerDuty/Slack 字樣待 Chris 確認是否為佔位。**
+1. **observer-only（§9）vs rollback 演練 → drill 屬 M5。** spec §9 明寫此 observer **永不改變 served result**（client 永遠拿 `result.primary`，無真流量切分）。`parallax canary` CLI 的 `--rollback-drill` / `--drain-test` / `--orbit-reemit-test`（drain in-flight + Orbit re-emit + idempotency）**屬於未來 M5 Aphelion 真 cutover，不在本 M4 observer 範圍**（Chris 2026-06-07 拍板）。本 observer 的「rollback」只有一種：`SHADOW_FRACTION=0.0`（見第 6 節），對 served path 零風險。
+2. **告警通道 = Discord/Gmail。** CLI `--check-alerting` 寫「PagerDuty + Slack」，但本 homelab 真實告警是 **Discord relay (PR #60, LIVE) + Gmail (PR #62)**。CLI 的 PagerDuty/Slack 確認為 placeholder（Chris 2026-06-07），不反映實況；**本 runbook 一律以 Discord/Gmail 為準。**
 
 ---
 
@@ -114,7 +114,7 @@ sudo systemctl restart parallax-server.service
 - ≤10s downtime；client 服務路徑全程不受影響（本來就只拿 `result.primary`）。
 - 確認 Grafana 上 canary series 歸零。
 
-> ⚠️ **不要**把 `parallax canary --rollback-drill` / `--drain-test` / `--orbit-reemit-test` 當成這個 observer 的 rollback 來跑 —— 見第 0 節問題①。那些 drill 疑屬未來 M5 Aphelion cutover，未經 Chris reconcile 前不在本 observer 的回滾流程內。
+> ⚠️ **不要**把 `parallax canary --rollback-drill` / `--drain-test` / `--orbit-reemit-test` 當成這個 observer 的 rollback 來跑 —— 見第 0 節決策①。那些 drill 屬 M5 Aphelion cutover（Chris 2026-06-07 confirmed），不在本 observer 的回滾流程內。
 
 ## 7. Escalation（single-operator）
 
@@ -130,4 +130,4 @@ s4 `1.0` 跑滿 14-day 觀察窗、DoD PASS、gate 告警全程未 firing、Chri
 
 ---
 
-*Parallax homelab 內部操作手冊。v2.0 把 v1.0 的通用企業範本改寫為真實 ZenBook / `SHADOW_FRACTION` / system-service 機制；第 0 節兩個 reconcile 問題待 Chris 決後再定稿。*
+*Parallax homelab 內部操作手冊。v2.0 把 v1.0 的通用企業範本改寫為真實 ZenBook / `SHADOW_FRACTION` / system-service 機制；第 0 節兩個 reconcile 問題已於 2026-06-07 由 Chris 拍板，本版定稿。*

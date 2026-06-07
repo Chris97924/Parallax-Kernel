@@ -93,11 +93,15 @@ def _prom_instant_query(
     crashing the caller.
     """
     url = f"{prom_url.rstrip('/')}/api/v1/query?" + urllib.parse.urlencode({"query": query})
+    # Fail-closed gate: any failure issuing/reading the query — URLError,
+    # OSError, or http.client.InvalidURL from a malformed --prometheus-url
+    # (which is NOT a URLError/OSError) — must degrade to INSUFFICIENT_DATA.
+    # --dod must never crash on a Prometheus outage or a bad config value.
     try:
         req = urllib.request.Request(url, method="GET")  # noqa: S310 — operator-supplied prom_url
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             raw = resp.read()
-    except (urllib.error.URLError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - fail-closed gate (see comment above)
         _LOG.warning(
             "prometheus query failed (%s: %s); query=%r → INSUFFICIENT_DATA",
             exc.__class__.__name__,
@@ -233,17 +237,24 @@ def compute_shadow_dod(
         f'parallax_canary_shadow_attempts_total{{stage="{shadow_stage}"}}'
         f"[{window_days}d]))",
     )
+    # `or on() vector(0)` on the NUMERATOR queries: a stage with real traffic
+    # but zero bad outcomes has no `outcome="diverge"` counter child, so a bare
+    # sum() returns an empty vector → None → INSUFFICIENT_DATA, which would
+    # wrongly block a HEALTHY stage. The fallback reads "no bad outcomes" as 0.
+    # A real Prometheus outage still fails the HTTP call → None, and the
+    # attempts query (deliberately WITHOUT the fallback) then drives the
+    # INSUFFICIENT_DATA verdict for genuine no-data.
     diverge = _prom_instant_query(
         prom_url,
         "sum(increase("
         f'parallax_canary_shadow_outcomes_total{{stage="{shadow_stage}",outcome="diverge"}}'
-        f"[{window_days}d]))",
+        f"[{window_days}d])) or on() vector(0)",
     )
     aphelion = _prom_instant_query(
         prom_url,
         "sum(increase("
         f'parallax_canary_shadow_outcomes_total{{stage="{shadow_stage}",'
-        f'outcome="aphelion_unreachable"}}[{window_days}d]))',
+        f'outcome="aphelion_unreachable"}}[{window_days}d])) or on() vector(0)',
     )
 
     sample_size = int(attempts) if attempts is not None else 0

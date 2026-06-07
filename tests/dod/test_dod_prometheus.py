@@ -401,3 +401,49 @@ def test_window_days_threads_into_query(monkeypatch: pytest.MonkeyPatch) -> None
 
     # urlencoded "[3d]" → %5B3d%5D
     assert all("3d" in url for url in captured), captured
+
+
+# ----------------------------------------------------------------------
+# codex PR#75 review fixes: zero-fallback numerators + InvalidURL fail-closed
+# ----------------------------------------------------------------------
+
+
+def test_numerator_queries_carry_zero_fallback_attempts_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """diverge/aphelion numerator queries must carry an ``or on() vector(0)``
+    fallback so an ABSENT bad-outcome series (a healthy stage with zero
+    divergence) reads as 0 and can PASS — not INSUFFICIENT_DATA. The attempts
+    query must NOT carry the fallback: absent attempts is genuine no-data.
+    """
+    captured: list[str] = []
+    _install_router(
+        monkeypatch,
+        _make_router(attempts=1000, diverge=0, aphelion=0),
+        captured=captured,
+    )
+
+    compute_shadow_dod(stage="m4_1pct", prom_url="http://prom:9090")
+
+    diverge_q = next(u for u in captured if "diverge" in u)
+    aphelion_q = next(u for u in captured if "aphelion_unreachable" in u)
+    attempts_q = next(u for u in captured if "attempts_total" in u)
+    assert "vector" in diverge_q, diverge_q
+    assert "vector" in aphelion_q, aphelion_q
+    assert "vector" not in attempts_q, attempts_q
+
+
+def test_prom_instant_query_invalid_url_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed --prometheus-url that urlopen rejects with
+    ``http.client.InvalidURL`` (NOT a URLError/OSError) must still degrade to
+    None, never crash the gate (fail-closed contract).
+    """
+    import http.client
+
+    def _boom(req: object, *, timeout: float = 0.0):
+        raise http.client.InvalidURL("nonnumeric port")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    assert _prom_instant_query("http://bad host:9090", "up") is None

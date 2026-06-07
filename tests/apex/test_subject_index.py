@@ -270,6 +270,41 @@ class TestUpdateIndexForPackage:
         assert _counter(subject_index.INDEX_REBUILD, trigger="stale") == before + 1
         assert rebuilt.subjects() == frozenset({"a-subject-new", "b-subject"})
 
+    def test_update_keeps_packages_sorted_so_next_read_is_fresh(self, tmp_path: Path) -> None:
+        """Codex #74 round 3: a clean M6 update must leave the index fresh.
+
+        Persisted package identities are name-sorted to match current_packages(),
+        so load_or_rebuild() sees an exact match and takes the fast path instead
+        of a spurious full rebuild. Names are chosen so a naive append would
+        mis-order them (ingest 'a' while 'b' is already indexed).
+        """
+        _write_tar(tmp_path, "b.aphelion.tar")
+        update_index_for_package(
+            tmp_path,
+            package_file="b.aphelion.tar",
+            package_id="pb",
+            claim_subjects=[("cb", "b-subj")],
+        )
+        _write_tar(tmp_path, "a.aphelion.tar")  # sorts BEFORE b
+        update_index_for_package(
+            tmp_path,
+            package_file="a.aphelion.tar",
+            package_id="pa",
+            claim_subjects=[("ca", "a-subj")],
+        )
+
+        idx = load_index(tmp_path)
+        assert idx is not None
+        assert idx.package_files() == ("a.aphelion.tar", "b.aphelion.tar")  # sorted
+
+        def _no_scan() -> list[IndexEntry]:
+            raise AssertionError("a clean M6 update must not trigger a rebuild")
+
+        before = _counter(subject_index.INDEX_REBUILD, trigger="stale")
+        result = load_or_rebuild(tmp_path, _no_scan)
+        assert _counter(subject_index.INDEX_REBUILD, trigger="stale") == before  # no rebuild
+        assert result.subjects() == frozenset({"a-subj", "b-subj"})
+
 
 # ===========================================================================
 # load_or_rebuild — the §8.4 freshness contract

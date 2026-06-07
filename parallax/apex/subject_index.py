@@ -363,9 +363,14 @@ def update_index_for_package(
         for claim_id, subject in claim_subjects
         if subject
     ]
-    packages = tuple(base_packages)
+    combined = list(base_packages)
     if ingested_stat is not None:
-        packages += (ingested_stat,)
+        combined.append(ingested_stat)
+    # Sort by name to match current_packages() ordering: load_or_rebuild compares
+    # the identity tuples for exact equality, so an unsorted append would look
+    # stale immediately after a clean update and force a needless full rebuild on
+    # the next read (codex #74 round 3), undercutting the §8.4 fast path.
+    packages = tuple(sorted(combined, key=lambda pkg: pkg.name))
     index = SubjectIndex(
         entries=tuple(base_entries) + tuple(added),
         packages=packages,

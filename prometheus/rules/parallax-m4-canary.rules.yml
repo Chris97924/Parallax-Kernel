@@ -120,16 +120,33 @@ groups:
       # env var (0.0 / 0.01 / 0.10 / 0.50 / 1.00 → disabled/s1/s2/s3/s4).
       # Spec: docs/m4-prep/canary-shadow-spec.md
       # ---------------------------------------------------------------
+
+      # user_id-stripped aggregates (issue #76). The shadow counters carry a
+      # high-cardinality `user_id` label. rate()/increase() is computed
+      # per-series and only THEN summed, so a one-time user whose child series
+      # has a single sample in the range extrapolates to ~0 and is dropped —
+      # under-counting one-time users. Recording `sum without (user_id) (...)`
+      # at the 30s group interval first collapses user_id into a stable,
+      # densely-sampled aggregate counter; rate()/increase() over THAT series
+      # reflects every user's increment (one-time users included). These rules
+      # MUST stay above the consumers below — rules in a group evaluate
+      # sequentially, in order, so the aggregate is fresh each cycle.
+      - record: parallax_canary_shadow_attempts:sum_without_user_id
+        expr: sum without (user_id) (parallax_canary_shadow_attempts_total)
+
+      - record: parallax_canary_shadow_outcomes:sum_without_user_id
+        expr: sum without (user_id) (parallax_canary_shadow_outcomes_total)
+
       - record: parallax_canary_shadow_discrepancy_rate
         expr: |
           (
             sum by (stage, traffic_source) (
-              rate(parallax_canary_shadow_outcomes_total{outcome="diverge"}[5m])
+              rate(parallax_canary_shadow_outcomes:sum_without_user_id{outcome="diverge"}[5m])
             )
             /
             (
               sum by (stage, traffic_source) (
-                rate(parallax_canary_shadow_attempts_total[5m])
+                rate(parallax_canary_shadow_attempts:sum_without_user_id[5m])
               ) > 0
             )
           )
@@ -138,12 +155,12 @@ groups:
         expr: |
           (
             sum by (stage, traffic_source) (
-              rate(parallax_canary_shadow_outcomes_total{outcome="aphelion_unreachable"}[5m])
+              rate(parallax_canary_shadow_outcomes:sum_without_user_id{outcome="aphelion_unreachable"}[5m])
             )
             /
             (
               sum by (stage, traffic_source) (
-                rate(parallax_canary_shadow_attempts_total[5m])
+                rate(parallax_canary_shadow_attempts:sum_without_user_id[5m])
               ) > 0
             )
           )

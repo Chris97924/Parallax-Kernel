@@ -1,0 +1,77 @@
+# promtool rules unit test for the issue #76 user_id-stripping recording rules.
+#
+# Run:  promtool test rules prometheus/tests/parallax-m4-canary.test.yml
+#
+# Lives OUTSIDE prometheus/rules/ so the `promtool check rules` CI step (which
+# globs prometheus/rules/**) does not try to parse this test file as a rule
+# file. The `promtool test rules` CI step targets this file directly.
+#
+# Scenario: five "one-time users" each emit a single attempt. prometheus_client
+# keeps a label child for the process lifetime, so each user_id series sits flat
+# at 1. Under the OLD idiom (per-series increase, then sum) every child is flat
+# within the window, so each contributes 0 and all five are dropped — the
+# one-time-user under-count described in #76. The `:sum_without_user_id`
+# recording rule collapses user_id into one densely-sampled aggregate, so the
+# count survives.
+
+rule_files:
+  - ../rules/parallax-m4-canary.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  - interval: 30s
+    input_series:
+      # Five one-time users on stage s1, births staggered across the window so
+      # the user_id-stripped aggregate climbs 1 -> 5 (each child persists at 1).
+      - series: 'parallax_canary_shadow_attempts_total{stage="s1",user_id="u1",traffic_source="live"}'
+        values: '1+0x20'
+      - series: 'parallax_canary_shadow_attempts_total{stage="s1",user_id="u2",traffic_source="live"}'
+        values: '_ _ 1+0x18'
+      - series: 'parallax_canary_shadow_attempts_total{stage="s1",user_id="u3",traffic_source="live"}'
+        values: '_ _ _ _ 1+0x16'
+      - series: 'parallax_canary_shadow_attempts_total{stage="s1",user_id="u4",traffic_source="live"}'
+        values: '_ _ _ _ _ _ 1+0x14'
+      - series: 'parallax_canary_shadow_attempts_total{stage="s1",user_id="u5",traffic_source="live"}'
+        values: '_ _ _ _ _ _ _ _ 1+0x12'
+      # One diverge outcome from a single one-time user, to prove the outcomes
+      # recording rule also strips user_id.
+      - series: 'parallax_canary_shadow_outcomes_total{stage="s1",outcome="diverge",user_id="u1",traffic_source="live"}'
+        values: '1+0x20'
+
+    promql_expr_test:
+      # (1) The attempts recording rule materialises ALL five one-time users
+      # into one aggregate series with user_id stripped: value == 5.
+      - expr: parallax_canary_shadow_attempts:sum_without_user_id{stage="s1"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'parallax_canary_shadow_attempts:sum_without_user_id{stage="s1", traffic_source="live"}'
+            value: 5
+
+      # (2) The OLD idiom under-counts: per-series increase over flat children
+      # is 0 for every user, so the sum is 0 — all five one-time users dropped.
+      - expr: sum(increase(parallax_canary_shadow_attempts_total{stage="s1"}[10m]))
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+
+      # (3) The NEW idiom counts them: increase over the user_id-stripped
+      # aggregate is strictly greater than the OLD per-series-then-sum idiom.
+      # `> bool` yields a deterministic 1, independent of increase()'s exact
+      # extrapolation, so this asserts "no longer under-counted".
+      - expr: |
+          sum(increase(parallax_canary_shadow_attempts:sum_without_user_id{stage="s1"}[10m]))
+          > bool
+          sum(increase(parallax_canary_shadow_attempts_total{stage="s1"}[10m]))
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+      # (4) The outcomes recording rule likewise strips user_id (diverge child).
+      - expr: parallax_canary_shadow_outcomes:sum_without_user_id{stage="s1",outcome="diverge"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'parallax_canary_shadow_outcomes:sum_without_user_id{stage="s1", outcome="diverge", traffic_source="live"}'
+            value: 1

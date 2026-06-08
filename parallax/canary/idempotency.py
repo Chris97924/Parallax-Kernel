@@ -45,6 +45,23 @@ __all__ = [
 _RequestT = TypeVar("_RequestT")
 
 
+@dataclasses.dataclass(slots=True)
+class _RefCountedLock:
+    """A per-event lock plus a count of threads that hold or wait on it.
+
+    ``refs`` is mutated in place rather than replaced — both fields are read
+    and written exclusively under the handler's ``_locks_lock`` meta-lock, so
+    the non-atomic increment/decrement is safe. The entry is removed only when
+    ``refs`` falls to zero, which is what closes the issue #42 race: a thread
+    that joins while another still holds or waits on the lock is handed the
+    *same* lock object, so it cannot create a parallel lock for the same
+    ``event_id`` and double-execute the worker.
+    """
+
+    lock: threading.Lock
+    refs: int = 0
+
+
 class InvalidEventIdError(ValueError):
     """Raised when ``event_id`` is missing or not a valid UUID v7.
 
@@ -105,9 +122,12 @@ class IdempotencyHandler(Generic[_RequestT]):
         self._audit = audit_log
         self._clock = clock or time.monotonic
         # Per-event_id locks so concurrent dups serialise instead of
-        # double-executing. Bounded by hits — cleared on cache write.
+        # double-executing. Reference-counted: an entry lives only while at
+        # least one thread holds or waits on it, so the dict is bounded by
+        # in-flight concurrency (not by total event_ids ever processed) and a
+        # worker exception cannot orphan or duplicate a lock (issue #42).
         self._locks_lock = threading.Lock()
-        self._event_locks: dict[str, threading.Lock] = {}
+        self._event_locks: dict[str, _RefCountedLock] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -136,29 +156,56 @@ class IdempotencyHandler(Generic[_RequestT]):
         if cached is not None:
             return self._on_cache_hit(event_id, cached)
 
+        # The release is owned here (symmetric with the acquire) rather than in
+        # _execute_worker, so EVERY exit path — cache hit inside the lock, worker
+        # success, and worker exception — balances the refcount, and the release
+        # runs only AFTER ``with lock:`` has exited (issue #42).
         lock = self._acquire_lock(event_id)
-        with lock:
-            # Re-check inside the lock — another thread may have populated
-            # the cache while we were waiting.
-            cached = self._lookup(event_id)
-            if cached is not None:
-                return self._on_cache_hit(event_id, cached)
-            return self._execute_worker(event_id, request, worker)
+        try:
+            with lock:
+                # Re-check inside the lock — another thread may have populated
+                # the cache while we were waiting.
+                cached = self._lookup(event_id)
+                if cached is not None:
+                    return self._on_cache_hit(event_id, cached)
+                return self._execute_worker(event_id, request, worker)
+        finally:
+            self._release_lock(event_id)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
     def _acquire_lock(self, event_id: str) -> threading.Lock:
+        """Return the per-event lock, registering this caller as a referent.
+
+        Each call increments the entry's refcount under the meta-lock; the
+        matching :meth:`_release_lock` decrements it. While the count is > 0
+        the SAME lock object is returned to every caller for this ``event_id``,
+        so concurrent requests always serialise on one lock.
+        """
         with self._locks_lock:
-            lock = self._event_locks.get(event_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._event_locks[event_id] = lock
-        return lock
+            entry = self._event_locks.get(event_id)
+            if entry is None:
+                entry = _RefCountedLock(lock=threading.Lock())
+                self._event_locks[event_id] = entry
+            entry.refs += 1
+            return entry.lock
 
     def _release_lock(self, event_id: str) -> None:
+        """Drop this caller's reference; remove the entry at zero references.
+
+        The entry is removed only once no thread holds or waits on it, so a
+        thread still queued on the lock keeps it alive — a later arrival reuses
+        the same lock instead of forking a parallel one (issue #42). This keeps
+        ``_event_locks`` bounded by in-flight concurrency.
+        """
         with self._locks_lock:
-            self._event_locks.pop(event_id, None)
+            entry = self._event_locks.get(event_id)
+            if entry is None:
+                return
+            entry.refs -= 1
+            if entry.refs <= 0:
+                del self._event_locks[event_id]
 
     def _lookup(self, event_id: str) -> CachedResponse | None:
         record = self._audit.lookup(event_id)
@@ -197,24 +244,23 @@ class IdempotencyHandler(Generic[_RequestT]):
     ) -> IdempotencyResult:
         started = self._clock()
         request_at = _dt.datetime.now(_dt.UTC).isoformat()
-        # Lock entry kept for worker duration so concurrent dups serialise;
-        # finally guarantees cleanup even if worker raises.
-        try:
-            response = worker(request)
-            latency_ms = (self._clock() - started) * 1000.0
-            record = make_record(
-                event_id=event_id,
-                response_status=response.status,
-                latency_ms=latency_ms,
-                idempotency_hit=False,
-                request_at_iso=request_at,
-            )
-            ok = self._audit.record(record, response_body=response.body)
-            return IdempotencyResult(
-                status=response.status,
-                body=response.body,
-                hit=False,
-                audit_persisted=ok,
-            )
-        finally:
-            self._release_lock(event_id)
+        # The lock is held by the caller (``handle``) for the worker's whole
+        # duration so concurrent dups serialise; ``handle`` owns the matching
+        # _release_lock in its finally, so a worker exception here simply
+        # propagates and the lock lifecycle stays balanced (issue #42).
+        response = worker(request)
+        latency_ms = (self._clock() - started) * 1000.0
+        record = make_record(
+            event_id=event_id,
+            response_status=response.status,
+            latency_ms=latency_ms,
+            idempotency_hit=False,
+            request_at_iso=request_at,
+        )
+        ok = self._audit.record(record, response_body=response.body)
+        return IdempotencyResult(
+            status=response.status,
+            body=response.body,
+            hit=False,
+            audit_persisted=ok,
+        )

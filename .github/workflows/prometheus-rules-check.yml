@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "prometheus/rules/**"
+      - "prometheus/tests/**"
 
 jobs:
   promtool:
@@ -29,3 +30,17 @@ jobs:
           echo "Checking ${#files[@]} rule file(s):"
           printf '  %s\n' "${files[@]}"
           promtool check rules "${files[@]}"
+
+      - name: Unit-test Prometheus rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          tests=(prometheus/tests/**/*.test.yml prometheus/tests/**/*.test.yaml)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "::error::No Prometheus rule unit-test files found under prometheus/tests/ — expected at least the issue #76 recording-rule test."
+            exit 1
+          fi
+          echo "Running ${#tests[@]} rule unit-test file(s):"
+          printf '  %s\n' "${tests[@]}"
+          promtool test rules "${tests[@]}"

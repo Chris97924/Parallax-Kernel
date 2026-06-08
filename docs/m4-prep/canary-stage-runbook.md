@@ -85,7 +85,7 @@ sudo systemctl restart parallax-server.service
 1. 確認 Grafana 上對應 stage 的 series 開始有資料。
 2. Discord `#指揮室` relay（PR #60）發推進通知。
 3. **觀察期 dwell**：s1 入場 → s2 24h → s3 48h → s4 14-day。
-4. dwell 滿後跑 **DoD**（per-stage summary + 7-day 窗）。`--dod` **讀 Prometheus shadow 指標**（Option A1，2026-06-07 Chris 拍板），不再讀 SQLite。它報三個 metric：`discrepancy_rate`、`aphelion_unreachable_rate`、樣本數（`min_hits`）——全部由 `parallax_canary_shadow_*{stage="sN"}` counter 在 `[7d]` 窗上 `increase()` 聚合而得。`--stage` **必須對應當前推進的階段**（s1→`m4_1pct`、s2→`m4_10pct`、s3→`m4_50pct`、s4→`m4_100pct`，CLI 內部映射成 `sN` label）；填錯會驗到別的 cohort：
+4. dwell 滿後跑 **DoD**（per-stage summary + 7-day 窗）。`--dod` **讀 Prometheus shadow 指標**（Option A1，2026-06-07 Chris 拍板），不再讀 SQLite。它報三個 metric：`discrepancy_rate`、`aphelion_unreachable_rate`、樣本數（`min_hits`）——全部由 `parallax_canary_shadow_*:sum_without_user_id{stage="sN"}` **recording-rule series** 在 `[7d]` 窗上 `increase()` 聚合而得（issue #76：先用 `sum without (user_id)(...)` 把高基數的 `user_id` label 聚掉再 `increase()`，否則只出現一次的 one-time user 會被 per-series `increase()` 當 ~0 丟掉、低估樣本數）。`--stage` **必須對應當前推進的階段**（s1→`m4_1pct`、s2→`m4_10pct`、s3→`m4_50pct`、s4→`m4_100pct`，CLI 內部映射成 `sN` label）；填錯會驗到別的 cohort：
    ```bash
    # 範例：當前在 s2 (10%)。s1/s3/s4 改成 m4_1pct / m4_50pct / m4_100pct。
    # prom URL 預設讀 $PARALLAX_PROMETHEUS_URL，未設則 http://localhost:9090；

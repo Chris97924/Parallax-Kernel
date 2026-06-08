@@ -50,8 +50,18 @@ __all__ = [
     "DOD_STAGE_TO_SHADOW",
     "PROM_URL_ENV",
     "DEFAULT_PROM_URL",
+    "SHADOW_ATTEMPTS_SERIES",
+    "SHADOW_OUTCOMES_SERIES",
     "compute_shadow_dod",
 ]
+
+# user_id-stripped recording-rule series (issue #76). Defined in
+# prometheus/rules/parallax-m4-canary.rules.yml as
+# `sum without (user_id) (parallax_canary_shadow_*_total)`. The dod summary and
+# the shadow recording/alert rules all read these (not the raw `*_total`
+# counters) so one-time users are not dropped by per-series increase()/rate().
+SHADOW_ATTEMPTS_SERIES: Final[str] = "parallax_canary_shadow_attempts:sum_without_user_id"
+SHADOW_OUTCOMES_SERIES: Final[str] = "parallax_canary_shadow_outcomes:sum_without_user_id"
 
 # Map the DoD CLI stage names (m4_Npct) onto the shadow observer's stage
 # labels (sN). The observer labels counters with s1..s4 (see
@@ -231,14 +241,21 @@ def compute_shadow_dod(
     end = until.astimezone(_dt.UTC) if until else _dt.datetime.now(_dt.UTC)
     start = end - _dt.timedelta(days=window_days)
 
+    # Query the user_id-stripped recording-rule series, NOT the raw
+    # `*_total` counters (issue #76). The raw counters carry a `user_id` label;
+    # `increase()` is computed per (stage, user_id, ...) series and only then
+    # summed, so a one-time user with a single sample in the window
+    # extrapolates to ~0 and is dropped, under-counting one-time users. The
+    # `:sum_without_user_id` recording rules (parallax-m4-canary.rules.yml)
+    # collapse user_id into a densely-sampled aggregate first, so `increase()`
+    # over them counts every user. The dod and the shadow recording/alert rules
+    # read the same series for consistency.
     attempts = _prom_instant_query(
         prom_url,
-        "sum(increase("
-        f'parallax_canary_shadow_attempts_total{{stage="{shadow_stage}"}}'
-        f"[{window_days}d]))",
+        "sum(increase(" f'{SHADOW_ATTEMPTS_SERIES}{{stage="{shadow_stage}"}}' f"[{window_days}d]))",
     )
     # `or on() vector(0)` on the NUMERATOR queries: a stage with real traffic
-    # but zero bad outcomes has no `outcome="diverge"` counter child, so a bare
+    # but zero bad outcomes has no `outcome="diverge"` series, so a bare
     # sum() returns an empty vector → None → INSUFFICIENT_DATA, which would
     # wrongly block a HEALTHY stage. The fallback reads "no bad outcomes" as 0.
     # A real Prometheus outage still fails the HTTP call → None, and the
@@ -247,13 +264,13 @@ def compute_shadow_dod(
     diverge = _prom_instant_query(
         prom_url,
         "sum(increase("
-        f'parallax_canary_shadow_outcomes_total{{stage="{shadow_stage}",outcome="diverge"}}'
+        f'{SHADOW_OUTCOMES_SERIES}{{stage="{shadow_stage}",outcome="diverge"}}'
         f"[{window_days}d])) or on() vector(0)",
     )
     aphelion = _prom_instant_query(
         prom_url,
         "sum(increase("
-        f'parallax_canary_shadow_outcomes_total{{stage="{shadow_stage}",'
+        f'{SHADOW_OUTCOMES_SERIES}{{stage="{shadow_stage}",'
         f'outcome="aphelion_unreachable"}}[{window_days}d])) or on() vector(0)',
     )
 

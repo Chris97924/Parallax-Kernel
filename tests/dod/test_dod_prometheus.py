@@ -427,10 +427,36 @@ def test_numerator_queries_carry_zero_fallback_attempts_does_not(
 
     diverge_q = next(u for u in captured if "diverge" in u)
     aphelion_q = next(u for u in captured if "aphelion_unreachable" in u)
-    attempts_q = next(u for u in captured if "attempts_total" in u)
+    # The attempts query reads the attempts recording-rule series and carries no
+    # outcome= filter; the numerator queries read the outcomes series.
+    attempts_q = next(u for u in captured if "attempts" in u and "outcomes" not in u)
     assert "vector" in diverge_q, diverge_q
     assert "vector" in aphelion_q, aphelion_q
     assert "vector" not in attempts_q, attempts_q
+
+
+def test_queries_use_user_id_stripped_recording_rule_series(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #76: every query must target the ``:sum_without_user_id``
+    recording-rule series, never the raw ``*_total`` counters (which carry the
+    ``user_id`` label that drops one-time users from per-series increase()).
+    """
+    captured: list[str] = []
+    _install_router(
+        monkeypatch,
+        _make_router(attempts=1000, diverge=0, aphelion=0),
+        captured=captured,
+    )
+
+    compute_shadow_dod(stage="m4_1pct", prom_url="http://prom:9090")
+
+    assert captured, "expected at least one Prometheus query"
+    for url in captured:
+        assert "sum_without_user_id" in url, url
+        # The raw user_id-bearing counters must NOT be queried directly.
+        assert "attempts_total" not in url, url
+        assert "outcomes_total" not in url, url
 
 
 def test_prom_instant_query_invalid_url_returns_none(

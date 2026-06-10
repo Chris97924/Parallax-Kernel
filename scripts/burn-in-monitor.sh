@@ -48,6 +48,24 @@ prom_query() {
     python3 -c "import json, sys; r=json.load(sys.stdin); v=r['data']['result']; print(v[0]['value'][1] if v else '0')"
 }
 
+# Record an SLO gauge's RAW CURRENT VALUE (read-only observability — NOT a
+# pass/fail verdict; authoritative DoD evaluation lives in `parallax canary
+# --dod`, item 4.7). Unlike prom_query, this distinguishes a genuine 0 from an
+# absent series: prints the value if the series is scraped, "no_series" if the
+# metric is not yet instrumented, "query_failed" if Prometheus is unreachable.
+# Always exits 0 so `set -e` never aborts on a transient query error.
+prom_slo() {
+  local metric="$1" out
+  out=$(curl -sSfG -m 5 "${PROM_URL}/api/v1/query" --data-urlencode "query=${metric}" 2>/dev/null) \
+    || { printf 'query_failed'; return 0; }
+  printf '%s' "${out}" | python3 -c "import json, sys
+try:
+    r = json.load(sys.stdin); v = r['data']['result']
+    sys.stdout.write(v[0]['value'][1] if v else 'no_series')
+except Exception:
+    sys.stdout.write('query_failed')"
+}
+
 # These queries assume server-side instrumentation has the traffic_source
 # label wired (item 4.2). Until then both will return "0" → both flags
 # false → DoD evaluator returns PENDING_IMPLEMENTATION per spec §3.4.
@@ -64,10 +82,29 @@ else
   natural_started_24h="None"
 fi
 
-# ---- Metric pass/fail (vacuous when both flags false) -----------------------
-# Real per-metric evaluation is item 4.7 (Phase-1/Phase-2 split logic).
-# This script just records whether traffic flowed at all today.
-metrics_json='{"unreachable_rate":"no_data","discrepancy_rate":"no_data","p99_latency":"no_data","write_error_rate":"no_data","crosswalk_miss":"no_data","circuit_open_count":"no_data"}'
+# ---- Per-metric RAW SLO values (observability, not verdicts) ----------------
+# Record each SLO gauge's current observed value so the daily row is non-vacuous
+# even before natural traffic exists. These are RAW NUMBERS, not pass/fail — the
+# authoritative DoD verdict (thresholds + Phase-1/Phase-2 split) is item 4.7 in
+# `parallax canary --dod`. Metrics whose series is not yet scraped record
+# "no_series" (honest) rather than the old blanket "no_data" placeholder.
+#   - discrepancy_rate / write_error_rate: live dual-read gauges (name-exact).
+#   - unreachable_rate / p99_latency / crosswalk_miss / circuit_open_count:
+#     not yet instrumented as standalone scraped series → "no_series".
+discrepancy_rate=$(prom_slo "parallax_dual_read_discrepancy_rate")
+write_error_rate=$(prom_slo "parallax_dual_read_write_error_rate")
+metrics_json=$(python3 <<PY
+import json
+print(json.dumps({
+    "discrepancy_rate": "${discrepancy_rate}",
+    "write_error_rate": "${write_error_rate}",
+    "unreachable_rate": "no_series",
+    "p99_latency": "no_series",
+    "crosswalk_miss": "no_series",
+    "circuit_open_count": "no_series",
+}, sort_keys=True))
+PY
+)
 breaches='[]'
 
 # ---- Compose JSONL row -------------------------------------------------------

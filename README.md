@@ -1,5 +1,12 @@
 # Parallax-Kernel
 
+> **⚠️ This branch (`main`) is archived.** Active development happens on
+> [`main-next`](https://github.com/Chris97924/Parallax-Kernel/tree/main-next).
+> `main` is frozen at the `v0.2.1` release (tag
+> [`v0.2.x-archive-main`](https://github.com/Chris97924/Parallax-Kernel/releases/tag/v0.2.x-archive-main))
+> and is kept for historical reference only — open PRs and issues against
+> `main-next`, not here.
+
 Content-addressed canonical knowledge-base store. P0 core: 6-object schema
 (`sources`, `memories`, `claims`, `decisions`, `events`, `index_state`) with
 `content_hash` dedup on memories and claims, race-safe UPSERT ingest, an

@@ -20,6 +20,7 @@ build/
 .env
 *.db
 db/*.db
+db/*.bak
 
 # Coverage
 .coverage
@@ -47,3 +48,17 @@ migration/
 
 # Pre-migration backups
 *.pre-migration.backup*/
+
+# Local editor / tooling state (kept on disk, never distributed)
+.obsidian/
+.omx/
+
+# Generated docs site (mkdocs build output)
+site/
+
+# Local run logs (dual-read decision logs, etc.)
+parallax/logs/
+
+# LongMemEval run outputs — large, regenerable from eval/run_phase2_*.sh
+# (the eval source + reproduce.py are version-controlled; these are byproducts)
+eval/results/

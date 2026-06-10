@@ -1,0 +1,1232 @@
+## 2026-04-19 — v0.5.0-pre5 retrieval --explain trace view
+
+### Why
+Before running LongMemEval baseline, the CLI `--explain` was thin: it only
+printed per-hit `reason` + `score_components`. When a query MISSED (the
+most common LongMemEval failure mode), stdout was just `(no hits)` — the
+operator had no way to see whether the filter was wrong, the window was
+wrong, the subject was mis-spelled, or the DB was empty. That made
+retrieval regressions impossible to triage without opening sqlite3 by
+hand.
+
+### What shipped
+1. **`RetrievalTrace` + `RetrievalTraceStage`** (frozen dataclasses) —
+   per-query snapshot carrying `params`, `normalized_params`, the actual
+   SQL fragments run, a funnel of stages (`user_scope → filter → final`)
+   with `candidates_in`/`candidates_out` counts, free-form `notes`, and
+   the `hits` tuple. Stored as tuples so traces are safe to pass around.
+2. **`_TraceBuilder`** (private) — mutable recorder threaded through each
+   of the six v0.3.0 retrieve functions as a new keyword-only
+   `_trace=None` argument. Zero-cost when None (no extra queries, no
+   branch overhead); when provided, the function records its stages,
+   SQL, normalized params, and any fallback notes (e.g. recent_context
+   records "no session.start event found — fell back" when it degrades
+   to the user-wide scan).
+3. **`explain_retrieve(conn, *, kind, user_id, query, limit, since,
+   until)`** — public dispatcher returning the frozen trace. `kind` ∈
+   {recent, file, decision, bug, entity, timeline}. Raises ValueError
+   for unknown kinds and for `timeline` missing since/until.
+4. **Zero-hit near-miss sampler** — when `kind` ∈ {entity, file, bug}
+   and the call returned no hits, `explain_retrieve` attaches up to 3
+   sample-row notes (`near_miss(entity): sample=<id>: <spo>`) so the
+   operator can tell "empty corpus" apart from "non-matching corpus".
+5. **CLI `inspect retrieve --explain`** — now prints the trace header
+   block BEFORE hits: `== trace(kind=...) ==`, params, normalized,
+   sql, stages, notes. Zero-hit paths still get the full header
+   followed by `(no hits)`. No-`--explain` output is byte-identical to
+   pre-v0.5.0-pre5.
+
+### Files touched
+- `parallax/retrieve.py` — +~220 lines: trace dataclasses, _TraceBuilder,
+  six retrieve functions instrumented, `_near_miss_notes`,
+  `explain_retrieve`.
+- `parallax/cli.py` — `_cmd_inspect_retrieve` re-routed through
+  `explain_retrieve` when `--explain` is set; `_print_trace_header`
+  helper and `_format_kv` added.
+- `tests/test_retrieve_explain.py` — new file, 4 test classes covering
+  dataclass shape, instrumented functions, dispatcher, near-miss.
+- `tests/test_cli_inspect.py` — +1 test class
+  `TestInspectRetrieveExplainTrace` for the CLI surface.
+
+### Verification
+`python -m pytest tests/ --cov=parallax` → **439 passed, coverage 90.11%**
+(floor 88.97%). `ruff check` on the 4 scoped files — clean.
+Pre-existing `TestInspectRetrieve::test_explain_prints_score_components`
+still passes — per-hit reason + score_components still render in the
+hit block, the trace header is a strict addition above them.
+
+### LongMemEval implication
+When the eval misses, the operator can now read one `--explain` line and
+see exactly which stage dropped the rows, what normalized timestamps
+were used, and whether the DB even had candidates. This unblocks
+triaging eval regressions without sqlite3 by hand.
+
+### Post-review hardening (same day)
+Opus critic surfaced three HIGH findings on the first pass; fixed in
+the second pass: (1) renamed `explain_retrieve(query=...)` to
+`query_text=...` to stop shadowing `parallax.sqlite_store.query`;
+(2) split single `*_filter` stages in `by_file`/`by_entity`/`by_bug_fix`
+into two sub-stages (`event_type_filter`/`payload_filter`,
+`subject_filter`/`payload_filter`, `payload_token_filter`/
+`spo_token_filter`) so the row-count funnel shows real dropoff
+instead of collapsing N→N→N→0; (3) near-miss now runs a
+case-insensitive fuzzy LIKE on the query text first (labelled
+`near_miss(kind) fuzzy`) and only falls back to "3 most recent"
+(labelled `near_miss(kind) recent`) when the fuzzy pass yields
+nothing, so the label never silently misrepresents "recent" as
+"nearby". Opus critic re-verified: APPROVED. Deslop pass extracted
+two small formatters (`_fmt_claim_note`, `_fmt_file_note`) + one
+shared SQL constant (`_RECENT_CLAIMS_SQL`). Final: 439 passed /
+90.11% coverage / ruff clean.
+
+---
+
+## 2026-04-19 — P0-STABILITY review-of-review (audit on a21b08f)
+
+### Consensus HIGH finding — empirically DISPROVEN
+Critic (opus) and test-engineer (sonnet) both flagged
+`test_broken_pipe_silences_stderr_fd` (tests/test_cli_robustness.py:249)
+as not actually pinning the HIGH fix. Claim: since `cli_mod.sys.stderr`
+is monkeypatched to `_BrokenStderr` (whose `fileno()` returns -1), the
+production code calls `dup2(devnull, -1)`, but the assertion
+`any(dst == sys.stderr.fileno() for ...)` compares against the "real"
+stderr fd and so cannot distinguish fixed from buggy code.
+
+Empirical refutation: revert cli.py:446 from
+`_silence_broken_pipe(sys.stderr)` to the bare `_silence_broken_pipe()`
+(the 2f6723b bug form) and run the test — it reports
+`FAILED assert False`. The test DOES catch the regression.
+
+Why both reviewers got this wrong: `monkeypatch.setattr(cli_mod.sys,
+"stderr", broken)` targets the `sys` module object (which is also
+`cli_mod.sys`), so the mutation is global for the duration of the test.
+At assertion time, `sys.stderr` resolves to `broken`, and
+`sys.stderr.fileno()` returns `-1`. Recorded tuples contain
+`(devnull_fd, -1)` after the fix and `(devnull_fd, pytest_stdout_fd)`
+before the fix — the comparison is correct. The reviewers assumed
+`sys.stderr` inside the test body was the pre-monkeypatch value,
+which is only true AFTER the fixture reverts post-test.
+
+### Shipped tightenings (genuine low-sev from the audit)
+1. **`test_reconfigures_stderr_too`** now asserts BOTH
+   `stdout_rec.encoding == "utf-8"` AND `stderr_rec.encoding == "utf-8"`.
+   Pins both legs of the `_ensure_utf8_streams` loop, not just stderr.
+2. **`_fake_silence`** in
+   `test_broken_pipe_on_stderr_during_exception_arm_does_not_propagate`
+   now records the `stream` argument and asserts `silence_calls[0] is
+   broken`. Pins cli.py:446 call-site form — would fail if the call
+   regressed to no-arg `_silence_broken_pipe()`.
+3. **`test_tolerates_oserror_from_dup2`** — reviewer suggested
+   migrating to `monkeypatch.setattr`. Attempted, reverted, preserved
+   manual save/restore with an explanatory NOTE comment. Reason:
+   pytest's capture fixture calls `os.dup2` during teardown
+   (fd-capture mode), so a fake `dup2` that's still live during
+   capture teardown — even if `monkeypatch` eventually reverts it —
+   fires during teardown and reports as a spurious test failure.
+   Manual save/restore inside the test body restores BEFORE teardown.
+   The original design was correct; the review finding was wrong.
+
+### Verification
+`python -m pytest tests/ --no-cov` → 386 passed, 1 deselected,
+6 warnings. `ruff check` on the 3 scoped files → clean.
+
+---
+
+## 2026-04-19 — P0-STABILITY follow-up (2-agent review findings on 2f6723b)
+
+### Shipped
+A 2-agent parallel review (critic + test-engineer) of commit `2f6723b`
+surfaced 1 HIGH + 4 MEDIUM issues. All five land in one follow-up
+because the HIGH is a bug the Ralph fix itself introduced — splitting
+across PRs would leave `feat/phase3-extract-shadow` with a known
+traceback leak in between commits.
+
+1. **HIGH — `_silence_broken_pipe` stderr asymmetry.** The nested
+   Exception-arm guard added in `2f6723b` calls `_silence_broken_pipe()`
+   when `print(..., file=sys.stderr)` hits `BrokenPipeError`. But the
+   helper only `dup2`'d devnull onto `sys.stdout.fileno()`, so stderr's
+   atexit flush could still re-raise a traceback during interpreter
+   shutdown — exactly the class of bug `2f6723b` was supposed to close.
+   Fix: `_silence_broken_pipe(stream: object | None = None)`, resolves
+   `target = sys.stdout if stream is None else stream` at the top, then
+   `dup2`s devnull onto `target.fileno()`. Outer BrokenPipeError arm
+   still calls it with no arg (stdout default); the nested stderr arm
+   now calls `_silence_broken_pipe(sys.stderr)`. Same `(OSError,
+   ValueError, AttributeError)` tolerance covers both streams.
+
+2. **MEDIUM — `_ensure_utf8_streams()` runs outside the outer guard.**
+   If the codec-reconfigure path raises something outside its internal
+   `(AttributeError, LookupError, ValueError, OSError)` tuple (e.g. a
+   third-party stream wrapper raising `RuntimeError`), the traceback
+   bypasses `main()`'s outer guard entirely. Fix: restructure `main()`
+   so `_ensure_utf8_streams()` is the first statement INSIDE the outer
+   `try:` block. All four except arms now catch exceptions from it too.
+
+3. **MEDIUM — `_silence_broken_pipe` tolerance arms untested.** The
+   pre-existing `TestSilenceBrokenPipe.test_tolerates_no_fileno` only
+   exercised the `ValueError` branch (via `io.StringIO`). The `OSError`
+   branch (dup2 fails on a valid fd) and the `AttributeError` branch
+   (stream has no `.fileno` attribute at all) had zero coverage.
+   Added `test_tolerates_oserror_from_dup2` (monkeypatches `os.dup2`
+   to raise `OSError(9, "bad fd")` with manual save/restore — pytest's
+   `monkeypatch.setattr` interferes with capture teardown) and
+   `test_tolerates_missing_fileno_attribute` (swaps `sys.stdout` for a
+   `types.SimpleNamespace()`).
+
+4. **MEDIUM — `_ensure_utf8_streams()` stderr leg untested.** Existing
+   `TestEnsureUtf8Streams` only patched `sys.stdout`; a future refactor
+   could drop the stderr iteration of the `[sys.stdout, sys.stderr]`
+   loop silently. Added `test_reconfigures_stderr_too` in
+   `tests/test_cli_cp950.py` mirroring the `io.TextIOWrapper(BytesIO,
+   encoding="cp950")` pattern from the existing stdout test.
+
+5. **MEDIUM — `SystemExit` propagation only tested for code=2.**
+   Replaced `test_system_exit_propagates` with a parametrized variant
+   over codes `[0, 1, 2, None, "error msg"]`. Each case monkeypatches
+   `_dispatch` to raise `SystemExit(code)`, wraps `main([])` in
+   `pytest.raises(SystemExit)`, and asserts `ei.value.code == code`.
+   `test_help_still_exits_zero` and `test_subcommand_help_still_exits_zero`
+   kept separate — they exercise argparse's real SystemExit emission,
+   not mocked dispatch.
+
+### Bonus hardening folded into US-001 tests
+- `_BrokenStderr` test double gained `fileno(self) -> int: return -1`
+  and `isatty(self) -> bool: return False` so print's tty-check and
+  codec paths can't crash the test double before reaching `.write`.
+  This was LOW severity on the test-engineer report but trivial to
+  land with the US-001 fd-assertion test below.
+- Added `test_broken_pipe_silences_stderr_fd`: monkeypatches `os.dup2`
+  to record `(src, dst)` tuples, runs the real `_silence_broken_pipe`
+  through the Exception→BrokenPipe path, asserts at least one `dst ==
+  sys.stderr.fileno()`. Skips on environments where `sys.stderr.fileno()`
+  itself raises.
+
+### Verification
+- `python -m pytest tests/` → **386 passed**, 1 deselected (from the
+  `2f6723b` baseline of 377: +1 stderr-fd, +1 runtime-error,
+  +1 oserror, +1 missing-fileno, +1 stderr-reconfigure, +4 from
+  SystemExit parametrize replacing 1 test with 5 cases = net +8).
+- `ruff check parallax/cli.py tests/test_cli_robustness.py tests/test_cli_cp950.py` → clean.
+
+### Why one PR, not five
+The HIGH fix changes `_silence_broken_pipe`'s signature (backward
+compatible via default arg), and US-001 AC#5 requires a regression
+test that actually exercises the real helper with the stderr arg —
+which in turn depends on the `_BrokenStderr` hardening. Splitting
+US-001 from its test would ship production without regression; splitting
+the parametrize or coverage-gap stories would leave `progress.txt`
+fragmented across three near-identical follow-ups. One PR is the
+minimum coherent unit.
+
+---
+
+## 2026-04-19 — P0 stability: CLI pipe / SIGINT / unexpected-exception hardening
+
+### Shipped
+Three more crash classes in `parallax inspect …` no longer leak raw
+tracebacks to the terminal:
+
+1. **BrokenPipeError** — reproduced with
+   `parallax inspect events | head -n 1`. Both POSIX and Windows raise
+   BrokenPipeError inside `print()` once the reader closes the pipe,
+   and Python's atexit stdout-flush then re-raises a second traceback
+   during interpreter shutdown. Fix: `_silence_broken_pipe()` opens
+   `os.devnull` with `O_WRONLY` and `os.dup2`'s it onto
+   `sys.stdout.fileno()` so the atexit flush succeeds silently. Swallows
+   `(OSError, ValueError, AttributeError)` so the helper is a no-op when
+   `sys.stdout` has no real fileno (pytest capture, `io.StringIO`).
+2. **KeyboardInterrupt** — Ctrl+C surfaced a `KeyboardInterrupt`
+   traceback instead of the canonical Unix exit code 130. Fix: map the
+   exception to `_EXIT_INTERRUPTED = 130` and document it in the module
+   docstring's Exit codes section.
+3. **Unexpected `Exception`** — any other failure (sqlite
+   `ProgrammingError`, `OSError` on db open, etc.) printed a full
+   traceback. Fix: catch `Exception` (deliberately narrower than
+   `BaseException`) and print `parallax: <str(exc)>` to stderr, returning
+   `_EXIT_USER_ERROR`. Format matches the existing
+   `print(f"backup failed: {exc}", ...)` style already in the file.
+
+### Why wrap at `main()` — same layer as `_ensure_utf8_streams()`
+The cp950 UTF-8 fix established `main()` as the outer guard: fix-once,
+protects every subcommand. Putting the try/except inside each `_cmd_*`
+would duplicate the arm across seven functions and miss exceptions
+raised by argparse or `_open_conn`. The dispatch body was extracted
+verbatim into a private `_dispatch(argv) -> int` so the wrapping is
+pure structure, not logic change.
+
+### SystemExit is intentionally NOT caught
+The general arm uses `Exception`, not `BaseException`. `SystemExit`
+(raised by `argparse` on `--help`, unknown subcommand, type-coerce
+failure, or an explicit `sys.exit()` inside a command) therefore keeps
+propagating out of `main()` untouched. Concretely: `parallax --help`
+still exits 0 and `parallax bogus` still exits 2 — argparse's contract
+with the shell is preserved. `KeyboardInterrupt` is listed before the
+generic `Exception` arm to document intent even though it is a
+BaseException.
+
+### Tests
+- `tests/test_cli_robustness.py` adds 7 tests across 3 classes:
+  (1) KI → 130 via monkeypatched `_dispatch`; (2) BrokenPipe → 0 with
+  `_silence_broken_pipe` called exactly once; (3) `RuntimeError('boom')`
+  → `_EXIT_USER_ERROR` with `parallax: boom` on stderr AND no
+  `Traceback`/`File "` substrings; (4) `SystemExit(2)` propagates —
+  asserts `pytest.raises(SystemExit).value.code == 2`; (5)
+  `_silence_broken_pipe()` tolerates `io.StringIO` stdout (no fileno);
+  (6) `main(['--help'])` still exits 0 via `SystemExit`; (7) seeded_db
+  happy-path `main(['inspect','events','--session','s1'])` → 0 with
+  `session.start` in stdout — proves the `_dispatch` extraction did not
+  break the normal code path.
+
+### Verification
+- `python -m pytest tests/` → 374 passed, 88.94% coverage.
+- `ruff check parallax/cli.py tests/test_cli_robustness.py` → clean.
+
+### Reviewer-tests nits (post-ship, 2026-04-19)
+Two-agent review returned APPROVED-WITH-NITS on the initial outer-guard
+ship. Three missing-test recommendations + one tightening addressed:
+
+1. **3-line stderr-BrokenPipe hardening inside the Exception arm.**
+   The reviewer noted that if `sys.stderr` itself is a closed pipe, the
+   `print(f"parallax: {exc}", file=sys.stderr)` call in main()'s Exception
+   arm would raise BrokenPipeError and propagate uncaught — defeating the
+   outer guard's whole point. Fix: wrap that single print in a nested
+   `try: ... except BrokenPipeError: _silence_broken_pipe()`. The return
+   statement (`return _EXIT_USER_ERROR`) stays outside the nested block
+   so the exit code is the same regardless of whether the stderr write
+   succeeded. Three production lines total (cli.py:443-445).
+2. **3 new regression tests in tests/test_cli_robustness.py:**
+   - `test_broken_pipe_on_stderr_during_exception_arm_does_not_propagate`
+     — monkeypatches `_dispatch` to raise `RuntimeError("boom")` and
+     `sys.stderr` to a `_BrokenStderr` helper class whose first `.write`
+     raises BrokenPipeError. Asserts `main([])` returns `_EXIT_USER_ERROR`
+     and no BrokenPipeError propagates. `_BrokenStderr` declares
+     `encoding='utf-8'` so print()'s codec path works before reaching
+     the failing write.
+   - `test_subcommand_help_still_exits_zero` — calls
+     `main(['inspect', '--help'])` inside `pytest.raises(SystemExit)`
+     and asserts `ei.value.code == 0`. Proves argparse subparser --help
+     dispatch survives the outer-guard refactor.
+   - `test_dispatch_bare_invocation_returns_usage` — calls
+     `cli_mod._dispatch([])` *directly* (not via main — main's argparse
+     default would short-circuit before hitting the bare-invocation arm)
+     and asserts `rc == _EXIT_USAGE`. Closes the coverage gap on
+     `parser.print_help(sys.stderr); return _EXIT_USAGE`.
+3. **Tightened `test_unexpected_exception_returns_user_error_and_prints_to_stderr`:**
+   added `assert captured.out == ""` so the test fails if the error
+   message ever gets misrouted to stdout. Catches a silent-regression
+   class that `"parallax: boom" in captured.err` alone would miss.
+
+### Verification (post-nits)
+- `python -m pytest tests/test_cli_robustness.py --no-cov` → 10 passed.
+- `python -m pytest tests/ --no-cov` → 377 passed, 1 deselected.
+- `ruff check parallax/cli.py tests/test_cli_robustness.py tests/test_cli_cp950.py`
+  → clean.
+
+---
+
+## 2026-04-19 — P0 stability: CLI cp950 UnicodeEncodeError fix
+
+### Shipped
+- **`parallax.cli._ensure_utf8_streams()`** flips `sys.stdout` and
+  `sys.stderr` to `encoding='utf-8', errors='replace'` as the first
+  statement in `main()`. Self-gated: skips streams already on utf-8
+  (case-insensitive, dash-insensitive compare), skips streams without
+  a callable `reconfigure` attribute (pytest capture, `io.StringIO`),
+  and swallows `AttributeError / LookupError / ValueError / OSError`
+  from the reconfigure call itself. Best-effort hardening — the CLI
+  never aborts on stream setup.
+
+### Reproducer
+On Windows cmd.exe at active codepage cp950 (Traditional Chinese) or
+cp1252 (US-Latin), `parallax inspect retrieve "<CJK query>"` crashed
+with `UnicodeEncodeError` the moment the retrieve loop tried to print
+a hit whose `title` contained characters outside the codepage. The
+env-level workaround (setting `PYTHONIOENCODING=utf-8` via Claude's
+SessionStart hook) only covered Claude-spawned subprocesses; a human
+typing the command in cmd still hit the crash. LongMemEval /
+repl/debug workflows depend on the CLI not crashing, so this is P0.
+
+### Why entry-point reconfigure beats PYTHONIOENCODING
+`PYTHONIOENCODING` only takes effect at interpreter startup based on
+the parent's environment. Reconfiguring stdout/stderr inside `main()`
+makes the binary robust regardless of how the parent shell is set up,
+and costs nothing when the stream is already utf-8.
+
+### Tolerance for non-reconfigurable streams
+pytest's capture streams, `io.StringIO`, and any mock without a
+`reconfigure` method are skipped via a `getattr(stream, "reconfigure", None)`
+guard — no test harness breaks from this change.
+
+### Tests
+- `tests/test_cli_cp950.py` adds 5 tests: (1) cp950 wrapper flips to
+  utf-8, (2) non-reconfigurable stream tolerated, (3) already-utf-8
+  stream skipped via a `_RecordingTextIOWrapper` counter, (4)
+  reconfigure raising LookupError is swallowed, (5) end-to-end
+  `main(['inspect','retrieve','專案X','--kind','entity','--level','1'])`
+  against a cp1252-strict stdout with a CJK-seeded DB exits 0 and
+  writes the CJK title into the reconfigured utf-8 buffer.
+- Full suite: 367 passed, coverage 88.83%, ruff clean.
+
+---
+
+## 2026-04-19 — v0.4.0 events replay + governance baseline
+
+### Post-review fix (2-agent critic catch)
+- **`updated_at` now survives replay of `*.state_changed`.** Critic
+  flagged that `extract/review.py` updates `state + updated_at` on
+  approve/reject but `replay._apply_claim_state_changed` only wrote
+  `state`, breaking the US-005 "bit-for-bit" guarantee. Fix:
+  `record_claim_state_changed` carries `updated_at` in payload;
+  review.py computes the timestamp once and passes it to both the
+  UPDATE and the event; replay applies it when present (falls back to
+  state-only UPDATE for legacy events). Regression covered by
+  `test_claim_review_updated_at_survives_replay` and
+  `test_memory_state_change_updated_at_survives_replay`.
+
+### Shipped
+- **Events replay (`parallax/replay.py`).** `replay_events(conn, *,
+  into_conn=None)` rebuilds `memories` + `claims` bit-for-bit from the
+  events log in (created_at ASC, event_id ASC) order. Dispatch:
+  `memory.created` / `claim.created` → INSERT from payload,
+  `claim.state_changed` / `memory.state_changed` → UPDATE state +
+  updated_at by target_id, `*.reaffirmed` consumed but does not mutate, unknown types
+  skipped. `backfill_creation_events(conn)` synthesizes creation events
+  for pre-0.4.0 rows using row's own `created_at` to preserve ordering
+  against coexisting state_changed events. Idempotent via NOT EXISTS.
+- **Ingest emits creation events.** `ingest_memory` /
+  `ingest_claim` first-write branch now records `memory.created` /
+  `claim.created` with the full row payload via `record_event`. Event
+  emission sits INSIDE the ingest try-block so a broken events table
+  fails the ingest loudly — no fire-and-forget.
+- **ADR-004: claim dedup includes `source_id`.** Codified formula
+  `sha256(normalize(subject||predicate||object||source_id))` with
+  explicit rejection of subject+predicate+object-only dedup (would
+  collapse provenance signal). Regression coverage:
+  `tests/test_claim_dedup_semantics.py` (4 tests).
+- **Migration dry-run.** `migration_plan(conn) -> MigrationPlan` returns
+  frozen dataclass: `applied`, `pending: tuple[MigrationStep, ...]`,
+  `current_version`, `target_version`. Each `MigrationStep` carries
+  `statements` (DDL) and `row_impact_estimates: dict[table, int]`
+  parsed by regex over STATEMENTS. Function issues SELECTs only — no
+  BEGIN, no DDL — verified identical on repeated calls. CLI:
+  `parallax inspect migrate [--dry-run] [--json]`.
+- **None-sentinel hash fix.** `parallax.hashing.normalize` accepts
+  `*parts: str | None`; `None` is encoded as `\x00\x00NONE\x00\x00`
+  before `||`-join. Closes the collision where `memory(title=None)`
+  and `memory(title='')` hashed identically. `ingest` no longer
+  pre-converts None → "".
+- **`reaffirm` typed surface.** `sqlite_store.reaffirm(conn, *,
+  user_id, kind, entity_id, actor='system') -> str`. Delegates to
+  `record_memory_reaffirmed` for kind='memory', emits
+  `claim.reaffirmed` via `record_event` for kind='claim'. Invalid
+  kinds raise `ValueError` listing valid kinds.
+- **Public API re-exports.** `parallax/__init__.py` `__all__` now
+  carries `content_hash`, `normalize`, `reaffirm`, `migration_plan`,
+  `MigrationPlan`, `MigrationStep`, `migrate_to_latest`,
+  `migrate_down_to`, `applied_versions`, `pending`, `replay_events`,
+  `backfill_creation_events`, `ReplaySummary`, `BackfillSummary`.
+  `tests/test_public_api.py` walks `__all__` and asserts each name
+  imports and is non-None — silent-drift guard.
+- **Version bump.** `pyproject.toml` 0.3.0 → 0.4.0;
+  `parallax.__version__` matches.
+
+### Design notes for future iterations
+- **None sentinel rationale.** Chose `\x00\x00NONE\x00\x00` because the
+  NUL byte cannot appear in user input that has passed through
+  `unicodedata.normalize("NFC", ...)` — the sentinel is consumed
+  inside `normalize()` and never reaches storage, so it does not need
+  to round-trip safely through SQLite TEXT columns.
+- **Replay vs index rebuild.** Deliberately separate code paths. The
+  events log is authoritative for `claims` + `memories` row identity;
+  `parallax/index.py:rebuild_index` continues to recount `doc_count`
+  via active-state scan. Merging the two was out of scope for v0.4.0.
+- **Migration dry-run is read-only by design.** The CLI `inspect
+  migrate` subcommand intentionally does NOT apply migrations — the
+  apply path remains `migrate_to_latest()` in library code. This
+  keeps the `parallax inspect ...` surface uniformly read-only.
+- **Backfill uses row `created_at` not `now()`.** Synthesized create
+  events inherit the row's own `created_at` so a subsequent replay
+  preserves chronological order against any pre-existing
+  `state_changed` events — otherwise backfilled creates would sort
+  after state-change events that reference them, producing a fresh
+  DB whose state is the pre-transition value.
+
+---
+
+## 2026-04-19 — v0.3.0 session continuity minimum closure
+
+### Shipped
+- Migration 0006 adds `events.session_id` + 2 session indexes; `schema.sql`
+  also gains `idx_events_user_time` so fresh bootstraps match migrated DBs.
+- `parallax/hooks.py`: Claude Code hook envelope → events ingestion.
+  Handles SessionStart/End/Stop, UserPromptSubmit, Pre/PostToolUse for
+  Bash/Edit/Write/MultiEdit. File-edit hooks back-link to memories when
+  `vault_path` matches; otherwise embed `_path_sha16` fingerprint.
+- `parallax/retrieve.py`: six-entry explicit retrieval API
+  (`recent_context`, `by_file`, `by_decision`, `by_bug_fix`, `by_timeline`,
+  `by_entity`) returning `RetrievalHit.project(L1|L2|L3)` for progressive
+  disclosure.
+- `parallax/injector.py`: `build_session_reminder()` packs L1 hits into a
+  2000-char-capped `<system-reminder>` with marker-safe truncation.
+- `parallax/cli.py`: `parallax inspect {events,retrieve,inject}` with
+  `--session` and `--explain` flags. Default user resolved at invocation,
+  not import.
+
+### Review fixes applied (HIGH + MED from 2-agent review)
+- FIX-01: LIKE wildcard escaping in `by_file`, `by_entity`, and
+  `hooks._resolve_target_for_file` — `%`, `_`, `\` now match literally.
+  Regression tests in `TestLikeEscape`.
+- FIX-02: N+1 in `by_decision` → single `WHERE claim_id IN (…)` batch.
+- FIX-03: 5× LIKE loop in `by_bug_fix` → single OR-joined query.
+- FIX-04: `by_timeline` now normalizes ISO-8601 via `_iso_normalize()`
+  so `'Z'` and `'+00:00'` produce identical lex-ordered windows;
+  out-of-order `since > until` raises `ValueError` with descriptive msg.
+- FIX-05: Injector `_trim_to_cap` defensive-copies input and reserves
+  marker budget so truncation never corrupts the suffix.
+- FIX-06: Schema.sql gained `idx_events_user_time` (migration-only before).
+- FIX-07: `FILE_EVENT_TYPES` hoisted from injector private `_FILE_EVENT_TYPES`
+  to `retrieve.__all__` — single source of truth.
+- FIX-08: Top-level `import json` in injector (was local lazy import).
+- FIX-09: Added `Write` + `MultiEdit` hook coverage in test_hooks.py.
+
+### Tests
+- 320 passed, 89.44% coverage (target: 80%).
+- 4-SQL acceptance remains green.
+
+### Non-obvious rules for future edits
+- `FILE_EVENT_TYPES` is the public shared tuple — import from
+  `parallax.retrieve`, not from `injector`.
+- `_iso_normalize()` is called ONLY in `by_timeline` and expects tz-aware
+  or naive (coerced to UTC) inputs. Do NOT apply it to `created_at` query
+  values — the DB stores TEXT and lex ordering works iff both sides use
+  the same offset format; normalizing the input is enough.
+- `_like_escape()` in `retrieve.py` uses `\\` as ESCAPE char; if you add a
+  new LIKE query, always pair the escape call with `ESCAPE '\\'` in the
+  SQL.
+
+## 2026-04-18 — Step 3 cleanup: confidence normalization + atomicity + review fixes
+
+### FIX-01 — _coerce_confidence drops score/strength, clamps >100
+- Critic PUSH BACK was right: `score`/`strength` in a2a profile data are
+  REINFORCEMENT COUNTS (1, 2, 3 occurrences), not percentages. Old code did
+  `val/100` blindly, turning `score: 2` into 0.02 confidence — a value that
+  would silently poison retrieval ranking. Dropped both keys from
+  `_CONFIDENCE_KEYS` entirely. Count signal is NOT lost: the generic profile
+  flattener still emits `(Name) --layer:score--> 2` as a claim predicate;
+  only the mis-interpretation as confidence is removed.
+- Kept `Confidence` (already 0-1), `Score`, `Priority`. Only `Score`/`Priority`
+  get /100 treatment, and only when `1 < val <= 100` (the percentage band).
+- Added final `if val > 1.0: val = 1.0` clamp — closes code-reviewer MED #3
+  (out-of-range confidence silently corrupts ranker input).
+- See `_CONFIDENCE_KEYS` comment for the reasoning (non-obvious rule; future
+  edits will be tempted to "restore" score/strength — don't).
+
+### FIX-02 — _short_sha type annotation
+- `_short_sha(*parts: str | None)` → `_short_sha(*parts: str)`. The inner
+  `normalize()` raises TypeError on None, so the old annotation was a lie
+  that weakened type-check coverage on callers.
+
+### FIX-03 — _apply() writes vault BEFORE db (crash-safe ordering)
+- Old order: db INSERT → vault write. If the process dies between, you get
+  db rows whose `vault_path` points at a missing file — silent data
+  integrity hole.
+- New order: vault write → db commit. Mid-run crash leaves harmless orphan
+  vault files which the next `--apply` overwrites idempotently (the
+  `not target.exists()` guard stays true because a2a profile content is
+  stable). See the reordering comment — future readers will be tempted to
+  merge the loops again. Don't.
+
+### FIX-04 — Backfill existing claims via --fix-confidence CLI
+- New helper `_backfill_confidences(plan, db_path)` + `--fix-confidence` CLI
+  flag (in the mutually-exclusive group with --dry-run/--apply).
+- For each (content_hash, source_id) in plan ∩ db, UPDATE confidence to the
+  newly-computed value. content_hash is unchanged, so idempotency of the
+  rest of the pipeline is undisturbed.
+- First run under v2 normalization: scanned 2123, updated 1557 claims
+  (mostly `score`/`strength`-derived values 0.8/0.85 → NULL). Out-of-range
+  count is now 0. 70 claims retain confidence via `Confidence`/`Score`/
+  `Priority` keys; 2053 are NULL (honest — a count of 2 has no confidence
+  interpretation).
+- Log at `migration/logs/confidence-fix.log` with before/after samples.
+
+### FIX-05 — Regression + idempotency re-verification (post-cleanup)
+- `pytest tests/` — 213 passed, 96.15% coverage, 0 regressions.
+- `python migration/a2a_to_parallax.py --apply` — inserts 0/0/0/0/0.
+  Idempotency intact after the backfill (confidence is NOT part of
+  content_hash, so UPDATE doesn't disturb INSERT OR IGNORE semantics).
+- `SELECT COUNT(*) FROM claims WHERE confidence > 1.0 OR confidence < 0` = 0.
+- `PRAGMA foreign_key_check` = 0 rows.
+
+---
+
+## 2026-04-18 — Step 3: Migrate a2a → Parallax (canonical populate + idempotency)
+
+### MIG-01/02 — migration/a2a_to_parallax.py (mapper + dry-run)
+- 4-stage deterministic mapper: sources → memories → claims → events.
+  Frozen dataclasses (SourceRow/MemoryRow/ClaimRow/EventRow). All identities
+  keyed by content_hash of normalized inputs, not ULIDs — two runs produce
+  identical hash sets, which is the foundation of the idempotency guarantee.
+- Sources (7): chroma:chris_memory / chroma:obsidian_memories /
+  chroma:decisions / profile / obsidian_memories_jsonl / decisions_jsonl /
+  discord_style. Each tag gets a source_id = `a2a:<tag>:<sha16(tag)>`.
+- Memories: 3 Chroma collections read via a single shared sqlite3.Connection
+  (snapshot consistency prevents torn reads if Chroma writes mid-migration)
+  + obsidian_memories.jsonl + one fixed-summary discord_style digest.
+  Fresh dry-run: 1190 + 189 + 21 + 191 + 1 = 1592 memories, 0 dupes.
+- Claims: generic profile.json 6-layer flattener (knowledge/personality/
+  decision/identity/policy + conversation_style). (Name) --layer:key-->
+  (value) predicate shape; 0-100 style numeric scores coerced to 0-1
+  confidence; `<layer>:exists=true` fallback for bare items. 2123 claims,
+  0 dupes.
+- Events: decisions.jsonl → 326 events. event_id = `evt-dec-<sha16(payload,
+  idx)>`. Idempotency contract assumes decisions.jsonl is append-only; if
+  ever reordered, drop idx and accept collapse of identical payloads.
+- CLI: `--dry-run | --apply` mutually exclusive (argparse.error on both/
+  neither). `--db`, `--vault`, `--log` overrides. Report writes markdown
+  with source inventory + pre-dedup row counts + (on apply) insert counts.
+
+### MIG-03 — populated parallax.db + vault (apply path)
+- Raw-SQL apply path uses INSERT OR IGNORE on all four tables — bypasses
+  parallax.ingest because this migration doesn't cross-link event.target_id
+  to persisted memory_id/claim_id. Future extensions that do cross-link
+  should switch to ingest_memory/ingest_claim (which re-SELECT after IGNORE
+  and return the surviving id); this script does not need that.
+- Live db: sources 7, memories 1592, claims 2123, events 326,
+  decisions 0, index_state 0. PRAGMA foreign_key_check: 0 violations.
+- Vault: 1592 .md files under vault/users/chris/memories/ distributed
+  chroma/chris_memory 1190, chroma/obsidian_memories 189, chroma/decisions
+  21, obsidian/ 191, discord/ 1. Zero orphan files / zero dangling paths.
+- Post-populate schema upgrade: the existing db predated v0.1.4's migration
+  framework (bootstrapped via executescript(schema.sql) pre-0.1.4). Ran
+  migrate_to_latest(conn) on the live db — applied migrations 1..5
+  cleanly via IF NOT EXISTS, added schema_migrations ledger, added
+  events_no_update / events_no_delete triggers, added claim_metadata +
+  idx_events_user_time. Row counts unchanged (7/1592/2123/326).
+
+### MIG-04 — idempotency proof
+- Three separate re-apply runs all report 0/0/0/0/0 inserts:
+  re-apply.log (pre-schema-upgrade), re-apply-fresh.log, re-apply-
+  postmigrate.log (after migrate_to_latest applied). The UNIQUE indexes
+  on (content_hash, user_id|source_id) for memories/claims plus INSERT OR
+  IGNORE + PK collision on event_id carry the idempotency invariant across
+  schema changes — migrations 1..5 don't touch the UNIQUE constraints on
+  memories/claims, so the dedup keys remain stable.
+
+### MIG-05 — deliverable logs
+- migration/logs/: dry-run-1/2/3/fresh.log, apply.log, apply-v2.log,
+  re-apply.log, re-apply-v2.log, re-apply-fresh.log, re-apply-
+  postmigrate.log, re-apply-final.log, re-verify.log. Triple (dry-run /
+  apply / re-apply) present and auditable.
+
+### Files
+- migration/a2a_to_parallax.py (pre-existing; not modified this session)
+- E:/Parallax/db/parallax.db (populated; schema upgraded to v5)
+- E:/Parallax/vault/users/chris/memories/ (1592 .md files)
+- migration/logs/*.log (3 fresh logs added this session)
+- prd.json (Step 3 PRD with 5 stories, all pass)
+
+### Regression
+- pytest tests/: 213 passed, 96.15% coverage (gate 80%).
+- FK integrity: foreign_key_check = 0 violations.
+- Architect verification: APPROVED (MIG-01..05 all PASS).
+
+### Learnings
+- Content-hash-keyed identities (not ULIDs) are what make `--apply` safe
+  to re-run. If any stage ever switches to ULID-keyed inserts, the
+  idempotency guarantee breaks silently — the row count grows on every
+  re-run but the tests only fail if something explicitly asserts on
+  totals.
+- Populating a db that predates the migration framework requires running
+  migrate_to_latest() after the data load, not before. The framework's
+  CREATE IF NOT EXISTS baseline makes this safe: migrations 1..5 become a
+  no-op for existing tables and additive for the new bits
+  (schema_migrations, triggers, claim_metadata, indexes).
+- discord_style.json's digest has volatile timestamp fields (analyzed_at,
+  total_messages) that would churn content_hash on every regenerate.
+  Fixing the summary to a stable string and pushing the full payload
+  into the vault body keeps idempotency without losing information.
+- Sharing one sqlite3.Connection across the three Chroma collection reads
+  gives snapshot consistency: if Chroma wrote between collection reads,
+  the three reads would otherwise see different universes.
+
+## 2026-04-18 — v0.2.1: Step 2 Backup CLI (parallax backup / parallax restore)
+
+### BCK-01 — parallax/backup.py (WAL checkpoint + tar.gz + manifest)
+- `create_backup(cfg, archive_path) -> BackupManifest`. Three-step contract:
+  (1) `PRAGMA wal_checkpoint(TRUNCATE)` on the live db — fails loudly if the
+  first element of the result tuple is non-zero. A naive cp-without-checkpoint
+  would copy an outdated main-db page set and leave the archive inconsistent.
+  (2) Compute the manifest (schema_version = MAX(schema_migrations.version),
+  per-table row_counts, DISTINCT content_hash counts, sha256 of the db bytes).
+  (3) tar.gz = `db/parallax.db` + `vault/**` + `manifest.json`. Vault is
+  optional — `vault_path.is_dir()` gates the tar.add so a bare-bones install
+  with only a db is still backable.
+- Refuses to overwrite an existing archive (FileExistsError). Silent clobbering
+  would turn backups into single-point-of-failure write targets.
+- Zero non-stdlib deps — tarfile + hashlib + json + sqlite3. Works from a
+  minimal wheel install.
+
+### BCK-02 — parallax/restore.py (extract + verify manifest)
+- `restore_backup(cfg, archive, *, verify=True) -> BackupManifest`. Extract into
+  a `tempfile.TemporaryDirectory`, validate every member via `_is_safe_member`
+  (reject absolute paths, parent-dir traversal, non-regular/non-directory
+  entries), move db + vault into place.
+- `_move_aside` renames any pre-existing target to `<name>.bak-<UTC ts>` with a
+  numeric disambiguator if two restores land in the same second. Restore never
+  silently destroys existing data.
+- Verify path re-opens the restored db and re-computes the full manifest, then
+  diffs against the archive's copy. A corrupted / truncated db raises
+  `RestoreVerificationError` via an explicit `sqlite3.DatabaseError` guard.
+- Chose stdlib `tarfile` + a hand-rolled safe-extract filter over 3.12's
+  `tarfile.data_filter` because Parallax supports 3.11+; the pre-check loop is
+  portable and still rejects the classic tar-traversal attack.
+- Chose manifest.json + sha256 over sqlite3's `.backup()` API because the vault
+  directory needs bundling too. A single manifest gives restore one verification
+  target covering both: db bytes via sha256 + logical integrity via row counts.
+
+### BCK-03 — parallax/cli.py + pyproject [project.scripts]
+- argparse with two subcommands. Exit codes are stable: 0 success, 1 user
+  error (missing file / archive exists), 2 argparse usage, 3 reserved for
+  `RestoreVerificationError` so operators can distinguish a malformed archive
+  from a verify-time drift in their runbooks.
+- `pyproject.toml [project.scripts] parallax = "parallax.cli:main"` is the
+  first entry-point this project has shipped.
+
+### BCK-04 — tests/test_backup_restore.py (9 tests)
+- Headline test `test_backup_restore_round_trip_preserves_acceptance_sql`:
+  seed a full ParallaxConfig (db + vault + one-of-everything rows), snapshot
+  the four Phase-2 acceptance SQL files via `_split_statements`, call
+  create_backup, physically delete the db AND shutil.rmtree the vault, call
+  restore_backup, re-snapshot, assert element-wise equality. The acceptance
+  harness IS the ground truth of backup correctness — if those four SQL
+  statements drift, the backup is broken by definition.
+- `_repack_with_tampered_db` rebuilds the tarball with `db/parallax.db`
+  replaced by a 1-byte placeholder; the verify branch catches it via the
+  sqlite3 DatabaseError guard before the row-count diff.
+- CLI tests use `monkeypatch.setenv("PARALLAX_DB_PATH", ...)` to wire tmp
+  paths without touching the process's real .env.
+
+### BCK-05 — version bump 0.2.0 → 0.2.1
+- pyproject.toml + parallax/__init__.__version__. 0.2.1 is a feature release
+  inside Phase 2 (Step 2 of the roadmap). Phase 3 will bump to 0.3.0.
+
+### BCK-06 — gate
+- 213 tests pass (v0.2.0 baseline: 204; delta = +9 from the backup module).
+- Total coverage 96.15%, --cov-fail-under=80 gate has ~16pp headroom.
+- ruff on the four new files: 0 errors.
+
+### Files
+- parallax/backup.py (new)
+- parallax/restore.py (new)
+- parallax/cli.py (new)
+- tests/test_backup_restore.py (new, 9 tests)
+- pyproject.toml (version + [project.scripts])
+- parallax/__init__.py (__version__)
+- CHANGELOG.md ([0.2.1] entry)
+- docs/cloud.md (v0.2.1 devlog entry)
+
+### Learnings
+- The WAL-checkpoint-before-copy contract is the single most important line in
+  this whole feature. Skipping it doesn't fail loudly — it produces backups
+  that "work" in dev and silently lose writes in prod when the WAL side is
+  non-empty. The pragma-result guard turns the subtle into the obvious.
+- A manifest with both sha256 AND row counts catches two failure modes that a
+  single-mode check would miss: a bit-flip is caught by sha256, a logical
+  half-restore (e.g. vault moved but db didn't) is caught by row counts.
+- The `.bak-<UTC ts>` collision-proofing with a numeric suffix was added after
+  considering Windows's 1-second filesystem mtime granularity.
+
+## 2026-04-18 — v0.2.0: Phase 2 closeout (acceptance SQL harness + coverage gate)
+
+### ACC-01 — tests/acceptance/ four .sql files (SSoT)
+- 01_canonical.sql: SELECT COUNT(*) FROM claims; SELECT COUNT(*) FROM memories;
+  Answers "DB canonical exists" — both counts must be >= 1 after seed.
+- 02_identity.sql: 4 PK lookups (claims/memories/sources/events) + 1 JOIN
+  (claims c JOIN sources s ON c.source_id = s.source_id WHERE c.claim_id = ?).
+  Answers "every object has a PK and the FK is joinable without dropping rows."
+- 03_state_traceable.sql: SELECT actor, created_at, payload_json FROM events
+  WHERE target_kind = ? AND target_id = ? ORDER BY created_at;
+  Answers "any claim's state history is replayable from the events log."
+- 04_rebuild_identical.sql: SELECT index_name, version, doc_count, state
+  FROM index_state WHERE index_name = ? ORDER BY version;
+  Pre/post snapshot of rebuild_index('chroma') — version monotonically
+  increments but doc_count + state are stable when no source data changed.
+
+### ACC-02 — tests/acceptance/test_acceptance_sql.py harness
+- Reads each .sql file via pathlib.Path(__file__).parent — SQL files are
+  the single source of truth, no SQL string is duplicated inline.
+- _split_statements() strips '--' comment lines BEFORE splitting on ';'
+  because a comment line may legitimately contain a semicolon (English
+  prose) and naive split would fracture the statement boundaries.
+- seed fixture: ingest_memory + ingest_claim (with synthetic
+  direct:<user_id> source) + record_claim_state_changed(pending->confirmed)
+  + rebuild_index('chroma'). Touches all six canonical tables.
+- 8 test cases (1 canonical + 4 parametrized identity PKs + 1 JOIN
+  identity + 1 state-replayable + 1 rebuild-idempotent). All GREEN.
+
+### COV-01 — pyproject coverage gate
+- [tool.pytest.ini_options].addopts now: -q --cov=parallax
+  --cov-report=term-missing --cov-fail-under=80
+- [tool.coverage.run].source = ["parallax"] pins the gate to the package.
+- v0.2.0 measured: 204 tests pass, 97.93% total coverage. The gate has
+  ~17pp headroom; future PRs that drop below 80% will fail CI.
+
+### VER-01 — version bump
+- pyproject.toml 0.1.5 -> 0.2.0; parallax.__version__ matches.
+- Phase 2 closeout: spec writes Phase 2 exit = v0.2.0, so we ship v0.2.0
+  rather than v0.1.6 to keep the docs/spec/version triple consistent.
+
+### Files
+- tests/acceptance/__init__.py (new, empty)
+- tests/acceptance/{01_canonical,02_identity,03_state_traceable,04_rebuild_identical}.sql (new)
+- tests/acceptance/test_acceptance_sql.py (new, 8 tests)
+- pyproject.toml (coverage gate + version 0.2.0)
+- parallax/__init__.py (__version__ = "0.2.0")
+- CHANGELOG.md ([0.2.0] entry)
+- docs/cloud.md (v0.2.0 devlog entry)
+
+### Regression
+- python -m pytest tests/ -> 204 passed, coverage 97.93% (gate >= 80%).
+- python -m pytest tests/acceptance/ -> 8 passed.
+
+### Learnings
+- Holding .sql as separate files instead of f-strings inside Python is
+  the smallest CI-friendly path: pytest-parametrize wraps them, the
+  files stay grep-able for SQL reviewers, and the runner gains nothing
+  from inlining (it would only lose the SSoT property).
+- A SQL splitter that splits-then-strips fractures comment lines that
+  contain prose semicolons. Always strip '--' lines BEFORE splitting on
+  ';'. (Caught immediately by 02_identity.sql's "the JOIN" comment.)
+- The acceptance harness intentionally lives in tests/acceptance/ (not
+  tests/) so the suite separation is visible: tests/ is the unit/
+  integration layer, tests/acceptance/ is the four-question DB-layer
+  contract. Both run under the same `python -m pytest tests/` command.
+
+### Phase 2 deferred (out of v0.2.0 scope, tracked for v0.3+)
+- events full per-event replay (today: rebuild_index recounts active rows)
+- schema introspection dry-run / migration plan diff
+- LongMemEval baseline (needs Phase 7 KG projection trigger to mean
+  anything)
+
+## 2026-04-18 — v0.1.5: migration atomicity + claim_metadata FK semantics + events index
+
+### FIX-01 — migration framework atomicity (genuine)
+- v0.1.4 migrate_to_latest's docstring claimed DDL+ledger atomic, but each
+  up() called conn.executescript() which issues an implicit COMMIT before
+  the ledger insert — a half-applied DDL could be recorded as applied if
+  the ledger insert later failed.
+- Refactor: m0001-m0003 now expose `STATEMENTS: list[str]` (and
+  `DOWN_STATEMENTS`) and `up()` / `down()` iterate `conn.execute(stmt)`.
+  No executescript anywhere under parallax/migrations/.
+- Framework wraps each migration in `_manual_tx` contextmanager that sets
+  `isolation_level = None` and issues explicit BEGIN IMMEDIATE / COMMIT /
+  ROLLBACK around `mig.up(conn)` + the ledger INSERT. Same wrap on
+  migrate_down_to for `mig.down(conn)` + ledger DELETE.
+- Tests: TestAtomicityFix01 (a) registers a Migration whose up() does
+  CREATE TABLE then raises, asserts both ledger row absent AND probe table
+  absent; (b) greps every m*.py for "executescript" and fails if found.
+
+### FIX-02 — claim_metadata FK semantics (Migration 0005)
+- v0.1.4 had `superseded_by TEXT REFERENCES claims(claim_id)` with no
+  ON DELETE clause (defaults to NO ACTION = RESTRICT) and no self-cycle
+  guard. Predecessor metadata could not be deleted while a successor
+  pointed at it; rows could declare themselves their own successor.
+- Migration 0005 recreates the table via SQLite table-swap pattern
+  (CREATE _new + INSERT SELECT + DROP + RENAME + recreate index) to add:
+    superseded_by TEXT REFERENCES claims(claim_id) ON DELETE SET NULL
+    CHECK (superseded_by IS NULL OR claim_id != superseded_by)
+- down() reverses to v0.1.4 schema for round-trip safety.
+- Tests: TestClaimMetadataV5Fix02 covers self-supersession block,
+  ON DELETE SET NULL behavior, data preservation across the swap, and
+  down→up round-trip.
+
+### FIX-03 — events(user_id, created_at) covering index (Migration 0004)
+- index.py:_last_event_id watermark scan and any per-user replay query
+  needed `WHERE user_id = ? ORDER BY created_at DESC` to be index-backed;
+  v0.1.4 had no covering index, so they degraded to full scan as the
+  events log grew.
+- Migration 0004: `CREATE INDEX IF NOT EXISTS idx_events_user_time ON
+  events(user_id, created_at)`. down drops it.
+- Tests: TestEventsUserTimeIndexFix03 verifies the index exists, that
+  EXPLAIN QUERY PLAN for the watermark query references it, and that
+  migrate_down_to(3) drops it.
+
+### REG-01 — version + CHANGELOG + introspection
+- pyproject.toml 0.1.4 → 0.1.5; parallax.__version__ matches.
+- CHANGELOG.md: [0.1.5] - 2026-04-18 entry covers all three fixes.
+- tests/test_bootstrap.py.test_bootstrap_runs_migrations now asserts
+  [1, 2, 3, 4, 5]; tests/test_introspection.py uses
+  max(m.version for m in MIGRATIONS) so it tracks the registry size.
+- Full suite: 232 tests pass (was 220-ish before). Ralph-scope ruff clean.
+
+### Design notes for future migrations
+- Migration up() functions MUST issue individual `conn.execute(stmt)`
+  calls. They MUST NOT call `conn.executescript()` — that issues an
+  implicit COMMIT and breaks the framework's atomicity guarantee.
+- For ALTER-incompatible schema changes (FK additions, CHECK additions,
+  NOT NULL on existing column), use the SQLite table-swap pattern. See
+  m0005_claim_metadata_fk for the canonical recipe.
+
+## 2026-04-17 — Parallax P0 core TDD Red→Green
+
+### US-001/002 — parallax/hashing.py
+- normalize(*parts): NFC, strip, None->'', join with "||"
+- content_hash(*parts): sha256(normalize(...).encode('utf-8')).hexdigest()
+- 26 tests pass. Architect APPROVED_WITH_NOTES (non-blocking: BOM, separator collision).
+
+### US-003 — parallax/config.py
+- @dataclass(frozen=True) ParallaxConfig(db_path, vault_path, schema_path)
+- load_config() reads PARALLAX_DB_PATH / VAULT / SCHEMA with project-root defaults
+- Optional .env via python-dotenv (silent if missing)
+- 7 tests pass.
+
+### US-004 — parallax/sqlite_store.py
+- connect(db_path) -> sqlite3.Connection (Row factory, foreign_keys=ON)
+- insert_source / insert_memory / insert_claim: INSERT OR IGNORE (content_hash dedup)
+- insert_event: plain INSERT (append-only)
+- query(conn, sql, params) -> list[sqlite3.Row]
+- reaffirm(conn, *a, **kw) -> None (Phase-0 noop)
+- Source/Memory/Claim/Event frozen dataclasses
+- __all__ whitelist blocks update_event/delete_event
+- 10 tests pass.
+
+### US-005 — parallax/ingest.py
+- synthetic_direct_source_id(user_id) -> 'direct:<uid>'
+- ingest_memory / ingest_claim: auto-create synthetic source when source_id is None
+- UPSERT: SELECT-before-INSERT; duplicate content returns existing id
+- ULIDs via python-ulid
+- 11 tests pass.
+
+### US-006 — parallax/retrieve.py
+- memories_by_user / claims_by_user / claims_by_subject / memory_by_content_hash / claim_by_content_hash
+- list[dict] / Optional[dict]; no Row leak across boundary
+- Optional state filter
+- 10 tests pass.
+
+### US-007 — bootstrap.py
+- bootstrap(target_dir, schema_path=None) -> ParallaxConfig
+- mkdir db/ + vault/; executescript schema.sql
+- Idempotent (schema uses IF NOT EXISTS)
+- CLI via argparse: python bootstrap.py <path>
+- 7 tests pass.
+
+### US-008 — Project scaffolding
+- pyproject.toml (setuptools; deps python-ulid, python-dotenv; black/isort/ruff/pytest config)
+- .gitignore, .env.example, README.md, CHANGELOG.md (Keep-a-Changelog 0.1.0), LICENSE (MIT, Chris, 2026)
+
+### US-009 — Full suite GREEN
+- 71 tests pass (>= 40). Coverage 98% (>= 80%). No DeprecationWarnings from parallax modules.
+
+### Files
+- parallax/: __init__.py, hashing.py, config.py, sqlite_store.py, ingest.py, retrieve.py
+- tests/: test_hashing.py, test_config.py, test_sqlite_store.py, test_ingest.py, test_retrieve.py, test_bootstrap.py
+- root: bootstrap.py, conftest.py, pyproject.toml, .gitignore, .env.example, README.md, CHANGELOG.md, LICENSE, schema.sql, prd.json, progress.txt
+
+### US-010 — ingest.py race-safe UPSERT (P0 follow-up from 2-agent review)
+- Phantom-ID race: old SELECT-then-INSERT could return a ULID that INSERT OR IGNORE silently dropped under concurrent duplicate writes.
+- Fix: INSERT OR IGNORE -> SELECT by UNIQUE (content_hash, user_id/source_id). Always returns the persisted winner's id.
+- Applied to both ingest_memory and ingest_claim. 2 new regression tests verify SELECT-by-returned-id finds exactly 1 row.
+- 73 tests pass (was 71). Coverage 98% (ingest.py still 100%).
+
+### Learnings
+- Schema comments are the authoritative contract for canonicalization (memories: title||summary||vault_path; claims: subject||predicate||object||source_id).
+- NFC unicode normalization is correct for CJK content (Day-0 dedup requirement).
+- UNIQUE index on (content_hash, user_id) for memories — user_id participates so the same content under different users is NOT deduped.
+- UNIQUE index on (content_hash, source_id) for claims — synthetic direct:<uid> closes the NULL hole.
+- INSERT OR IGNORE + SELECT-first pattern gives stable UPSERT semantics that returns the original id.
+
+## 2026-04-17 — Step 4 Open-Source Prep (parallax-kernel v0.1.1)
+
+### Changes
+- S4-01 parallax/__init__.py re-exports 7 public funcs + 4 dataclasses + __version__='0.1.1'.
+- S4-02 examples/quickstart.py (27 non-comment lines). Runs clean; prints ingested memory_id.
+- S4-03 .github/workflows/tests.yml — ubuntu-latest + py3.11 + pip install -e .[dev] + pytest on PR + push to main.
+- S4-04 .gitignore now excludes prd.json, progress.txt, docs/cloud.md, .omc/, vault/, migration/, *.pre-migration.backup*/
+- S4-05 pyproject.toml → name=parallax-kernel, version=0.1.1 (import name stays `parallax`).
+- S4-05 CHANGELOG 0.1.1 entry: US-010 race-safe UPSERT + Step-4 packaging additions.
+- S4-07 README rewritten to three-step reproducible quickstart + Public API table; internal Notion SSoT id removed.
+- schema.sql SSoT comment scrubbed of Notion page id.
+
+### Secret scan (post-gitignore, tracked files only — `git ls-files`)
+- `344f3661|[0-9a-f]{32}` Notion-id pattern : 0 hits in tracked files ✓
+- `chris475604@gmail.com`                   : 0 hits in tracked files ✓
+- `C:[\\/]Users[\\/]user` personal paths    : 0 hits in tracked files ✓
+- `api[_-]?key|password|secret|bearer …`    : only `.gitignore:19 # Secrets / local data` (section label, benign) ✓
+- Notes: vault/ (personal Obsidian corpus), migration/ (hardcoded E:\Cmemory paths), docs/cloud.md (internal dev log),
+  prd.json / progress.txt / .omc/ are all now .gitignore'd and do NOT appear in `git ls-files` output.
+
+### Regression
+- pytest 73 passed. Coverage 98% (parallax/ package).
+
+## 2026-04-18 — parallax/telemetry.py (Ralph telemetry sprint)
+
+### T-01 — parallax/telemetry.py (198 lines, stdlib only)
+- get_logger(name): JSON single-line formatter, idempotent, propagate=False.
+- 4 event emitters: dedup_hit / state_changed / orphan_rejected at INFO; ingest_error at ERROR (also updates last_error and errors_total).
+- Metrics: inc / observe_latency_ms / snapshot / reset. Two-lock design (_METRICS_LOCK + _ERROR_LOCK) so error path doesn't contend with hot metrics path.
+- Latency: bounded ring buffer (_LATENCY_CAP=1024), nearest-rank p50/p95/p99, 0.0 when empty.
+- health(db_path): db_path / table_counts (sources/memories/claims/decisions/events/index_state) / journal_mode (lowercased) / last_error. Missing tables -> 0 via OperationalError catch.
+- __all__ whitelisted (10 names).
+
+### T-02 — parallax/ingest.py wiring
+- time.perf_counter around both ingest_memory/ingest_claim, telemetry.observe_latency_ms in finally.
+- telemetry.emit_dedup_hit + telemetry.inc("dedup_hits_total") on collision.
+- except Exception -> telemetry.emit_ingest_error(...) + re-raise (no silent swallow). errors_total auto-increments inside emit_ingest_error.
+- Successful persist -> telemetry.inc("ingested_total") per call.
+
+### T-03 — re-export + tests
+- parallax/__init__.py re-exports health, __all__ updated.
+- tests/test_telemetry.py: 16 tests. Covers JSON logger idempotence, each emit_* one-line/correct-level, counter roundtrip, latency percentiles on 1..100 sample set, ring buffer cap @ 1024, thread-safety (50x200 inc+observe), health() on fresh bootstrap DB (journal_mode='wal'), missing-tables-surface-as-zero, emit_ingest_error populates last_error + errors_total, health exported from package root, ingest wiring (dedup hit, ingested_total, error path re-raise).
+
+### T-04 — README.md Observability section
+- Level-2 heading between Modules and Testing.
+- Event table, metrics list, runnable snapshot()/health() example, explicit Prometheus-YAGNI note.
+
+### Files
+- parallax/telemetry.py (new, 198 lines)
+- parallax/ingest.py (wired telemetry; parallel session also added None->"" title/summary canonicalization for v0.1.2 boundary contract)
+- parallax/__init__.py (+ health re-export)
+- tests/test_telemetry.py (new, 16 tests)
+- README.md (+ Observability section)
+
+### Regression
+- pytest (excluding pre-existing RED tests from parallel v0.1.2 session): 101 passed.
+- ruff check on 4 touched files: zero errors.
+- Architect verification: APPROVED (9/9 criteria).
+
+### Learnings
+- `_dt.UTC` alias (py3.11+) preferred over `_dt.timezone.utc` under ruff UP017 with target-version=py311.
+- `logger.log(level, msg, extra=payload)` flattens `payload` keys onto the LogRecord, and JSONFormatter picks them up via `record.__dict__` iteration while skipping `_RESERVED` stdlib names.
+- Two-lock split (metrics vs error) avoids coupling the hot path latency tracker to error-state writes.
+
+## 2026-04-18 — v0.1.2 Stress Hardening + Eval-Gap Fill (parallel session)
+
+### S1 — hashing.normalize(None) raises TypeError
+- parallax/hashing.py normalize() raises TypeError (with position info) when any part is None; content_hash propagates.
+- parallax/ingest.py ingest_memory converts title/summary None -> "" BEFORE content_hash (schema allows NULL).
+- tests/test_hashing.py: test_none_raises_type_error + test_none_propagates_type_error; parametrize dropped (None,None) case.
+- tests/test_ingest.py: test_none_title_and_summary_accepted proves ingest still accepts Optional[str] and dedups.
+
+### S2 — Hypothesis fuzz (tests/stress/test_fuzz_ingest.py)
+- Strategies: any-codepoint text (no surrogates), 5k-10k ASCII, NFC pair table, boundary-int user-id suffixes.
+- 7 tests × ~50 examples = ~320/run. Idempotence, NFC collapse, distinct->distinct, schema formula, extremes.
+
+### S3 — Concurrency (tests/stress/test_concurrent_upsert.py)
+- 10 threads × 100 iter identical memory -> 1 row / 1000 equal ids. Same for claims.
+- Mixed 50 contents -> exactly 50 rows / zero phantoms / zero lost UPSERTs.
+
+### S4 — Fault injection (tests/stress/test_fault_injection.py)
+- Mid-ingest proc.terminate (Win+POSIX): persisted >= committed_prefix proves WAL atomicity.
+- Corrupt DB via appended garbage: either recover last consistent state OR raise sqlite3.DatabaseError; no silent corruption.
+- WAL recovery: burst writes + reopen + PRAGMA wal_checkpoint(TRUNCATE) preserves 50 rows and shrinks WAL.
+
+### S5 — target_ref_exists validator
+- parallax/validators.py with target_ref_exists(conn, kind, id) for memory/claim/source/decision; ValueError on unknown kind.
+- parallax.__init__ re-exports target_ref_exists + VALID_TARGET_KINDS.
+- tests/test_validators.py: 10 tests.
+
+### S6 — docs/state-transitions.md
+- Matrix tables for memories/claims/sources/decisions with allowed transitions + triggers.
+- Cross-entity invariants: target_ref_exists gate, terminal states, state_changed event emission.
+
+### S7 — tests/stress/REPORT.md
+- 13 stress tests / 2.70s / 320 hypothesis examples / all PASS.
+- Reproduction commands + findings (no regressions surfaced).
+
+### S8 — Version bump
+- pyproject.toml version = "0.1.2"; hypothesis>=6 added to dev extras.
+- CHANGELOG.md [0.1.2] - 2026-04-18 entry.
+
+### Files
+- parallax/hashing.py (None rejection); parallax/ingest.py (None canonicalization at call site); parallax/validators.py (new); parallax/__init__.py (+target_ref_exists export).
+- tests/stress/__init__.py, tests/stress/conftest.py, tests/stress/test_fuzz_ingest.py, tests/stress/test_concurrent_upsert.py, tests/stress/test_fault_injection.py, tests/stress/REPORT.md.
+- tests/test_hashing.py (RED->GREEN updates); tests/test_ingest.py (+None-accept); tests/test_validators.py (new).
+- docs/state-transitions.md (new); pyproject.toml (version + hypothesis); CHANGELOG.md ([0.1.2] entry).
+
+### Regression
+- Full suite: 129 passed in 6.19s. Coverage 98% (parallax/).
+- Stress suite isolated: 13 passed in 2.70s.
+- parallax/hashing.py, ingest.py, validators.py, telemetry.py at 100%.
+
+### Learnings
+- Hypothesis large_base_example health check fires on >=5k-char text strategies; suppress explicitly.
+- Per-thread sqlite3.Connection from file-backed DB (not :memory:) is the correct concurrency model.
+- proc.terminate() -> TerminateProcess on Win, SIGTERM on POSIX; both produce non-clean exit suitable for crash simulation.
+- SQLite WAL mode makes every `with conn:` commit durable across an unclean process exit — no torn-write mitigation needed at the application layer.
+
+---
+## 2026-04-18 — Telemetry HIGH-severity follow-up sprint (ralph)
+
+Addressed three HIGH findings from the 2-reviewer pass (code-reviewer + critic):
+
+- **F-01 (double stderr emission)**: `ingest.py` was calling both `obs.log.get_logger("parallax.ingest")` and `telemetry.get_logger("parallax.ingest")` — same logger name, so two handlers stacked on the same Logger object and every event emitted twice. Fixed by renaming the telemetry side to `"parallax.ingest.telemetry"`. Verified with a manual script: `obs_logger is tel_logger` → False, each logger holds 1 handler, no duplicates.
+- **F-02 (unbounded `_LATENCY_IDX`)**: `observe_latency_ms` now wraps the index via `(_LATENCY_IDX + 1) % _LATENCY_CAP`. Ring-buffer semantics preserved (len(_LATENCIES) still caps at 1024).
+- **F-03 (SQL f-string in `health()`)**: added `t.isidentifier()` guard before the f-string SELECT. `_HEALTH_TABLES` remains the SSoT allowlist; assertion is defense-in-depth.
+
+**Files changed**: `parallax/ingest.py` (1 line), `parallax/telemetry.py` (~6 lines), `prd.json` (new focused follow-up PRD).
+
+**Regression**: `pytest -q --ignore=tests/test_hashing.py` → 104 passed. Ruff clean on all three touched files. Architect reviewer verdict: APPROVED (all 4 stories pass). Deslop pass found no meaningful slop.
+
+**Out of scope (tracked as follow-up debt)**: obs/ vs telemetry duplication (Reviewer-2's P1), `inc()` open-admission hardening, unwired emitters documentation, README version bump to 0.1.2. These are maintainability items, not HIGH-severity bugs.
+
+**Learning**: When two modules claim the same logger namespace (`parallax.ingest`), Python's `logging.getLogger` returns the SAME Logger object and both handler registries accumulate. Sentinel-based handler dedup (`_parallax_json` vs `_parallax_telemetry`) does not protect against this — the sentinels are different, so each side happily adds its own handler. The fix is namespace separation, not sentinel unification.
+
+## 2026-04-18 — Parallax v0.1.4 — Migration framework + events + transitions + index
+
+### MIG-01/02/03/04 — Migration framework + 0001/0002/0003
+- parallax/migrations/__init__.py: Migration(frozen) + MIGRATIONS list + migrate_to_latest/migrate_down_to/applied_versions/pending/ensure_schema_migrations_table.
+- schema_migrations(version PK INTEGER, name TEXT, applied_at TIMESTAMP). Each up()+ledger insert in same transaction.
+- m0001_initial_schema.py: idempotent CREATE IF NOT EXISTS for sources/memories/claims/decisions/events/index_state + indexes (mirrors schema.sql).
+- m0002_events_append_only.py: events_no_update + events_no_delete BEFORE triggers RAISE(ABORT, 'events are append-only').
+- m0003_claim_metadata.py: claim_metadata sidecar (claim_id PK->claims, reaffirm_count, last_seen_at, superseded_by, superseded_at, created_at, updated_at) + idx on superseded_by.
+- bootstrap.py: replaces executescript(schema.sql) with migrate_to_latest(conn). schema.sql kept as human SSoT only; --schema arg preserved for ParallaxConfig.
+- tests/conftest.py: conn fixture now uses migrate_to_latest so units run against full DDL (triggers + claim_metadata).
+- 27 new test cases in tests/test_migrations.py (registry shape, idempotency, up/down round-trip, trigger UPDATE/DELETE blocked, FK enforcement, columns).
+
+### EVT-01/02 — parallax/events.py + ingest wiring
+- record_event(conn, *, user_id, actor, event_type, target_kind, target_id, payload, approval_tier=None) -> str. ULID + json.dumps(sort_keys=True) + insert_event.
+- (target_kind, target_id) must both be set or both None; orphan target_kind in VALID_TARGET_KINDS triggers target_ref_exists check + emit_orphan_rejected on rejection.
+- record_memory_reaffirmed / record_claim_state_changed convenience helpers.
+- parallax/ingest.ingest_memory: on deduped True, emits record_memory_reaffirmed(conn, user_id, persisted_id) after dedup counter inc, before return — failure surfaces as a real error.
+- 11 new test cases in tests/test_events.py (happy path, orphan rejected, target_pair consistency, sorted-key payload, valid target, helper outputs, ingest emits 0/1/2 reaffirmed).
+
+### TRN-01 — parallax/transitions.py
+- MEMORY_TRANSITIONS / CLAIM_TRANSITIONS / SOURCE_TRANSITIONS / DECISION_TRANSITIONS as dict[str, frozenset[str]].
+- Self-loops on non-terminal states preserved to match docs/state-transitions.md (idempotent re-stage).
+- is_allowed_transition(entity, from_state, to_state) -> bool; ValueError on unknown entity / unknown from_state; unknown to_state returns False.
+- 14 new test cases in tests/test_transitions.py.
+
+### IDX-01 — parallax/index.py
+- rebuild_index(conn, index_name) -> dict. Per-index_name version counter via MAX(version)+1; doc_count = active memories + non-rejected claims; source_watermark = last events.event_id (created_at DESC, event_id DESC); state='ready'.
+- INSERT OR REPLACE (index_name, version) preserves history.
+- 6 new test cases in tests/test_index.py.
+
+### Files
+- parallax/migrations/{__init__,m0001_initial_schema,m0002_events_append_only,m0003_claim_metadata}.py (new)
+- parallax/events.py, parallax/transitions.py, parallax/index.py (new)
+- parallax/__init__.py (re-exports + __version__='0.1.4')
+- parallax/ingest.py (record_memory_reaffirmed wiring on dedup hit)
+- parallax/introspection.py (ParallaxInfo.schema_version: int | None)
+- bootstrap.py (migrate_to_latest replaces executescript)
+- tests/conftest.py (migrate_to_latest fixture)
+- tests/{test_migrations,test_events,test_transitions,test_index}.py (new)
+- tests/test_bootstrap.py (EXPECTED_TABLES += {schema_migrations, claim_metadata})
+- tests/test_introspection.py (schema_version expectation = max(MIGRATIONS).version)
+- pyproject.toml (0.1.3 -> 0.1.4)
+- CHANGELOG.md ([0.1.4] - 2026-04-18 entry)
+
+### Regression
+- pytest tests/ -> 186 passed (was 129 at v0.1.3).
+- ruff check on all touched files -> 0 errors.
+
+### Learnings
+- A migration framework that ships with `CREATE IF NOT EXISTS` migration 0001 upgrades legacy DBs cleanly: existing tables stay, schema_migrations is added, future migrations apply incrementally. No backfill ceremony required because the baseline is idempotent.
+- Triggers fire from any client that opens the DB, including the existing sqlite_store __all__ whitelist — DB-level enforcement is strictly stronger than the app-layer convention. Both layers complement each other (whitelist documents intent; trigger guarantees behavior).
+- Sidecar tables (claim_metadata) decouple identity (dedup-key on claims) from per-occurrence metadata (reaffirm count, supersession). Future state-change writers update the sidecar without invalidating the dedup-key index on claims.
+- record_memory_reaffirmed inside the ingest try block: emission failures propagate, so a broken events table doesn't silently miss reaffirmed semantics — it raises, the ingest fails, the caller knows. "Same try, before return" beats "fire-and-forget".
+- index_state versioning is per-index_name: chroma and memvid maintain independent counters. Source watermark = last event_id lets a future Phase-5 replay resume from a known point.
+
+## 2026-04-18 — ADR backfill (P1 debt from v0.1.3 architect review)
+
+### Files added
+- docs/adr/README.md — index + 6-section template (Status/Context/Decision/Consequences/Alternatives/References), status lifecycle (Proposed/Accepted/Deprecated/Superseded-by), numbering convention (ADR-NNN-<kebab-slug>.md, zero-padded, never reused), index table
+- docs/adr/ADR-001-content-hash-ssot.md — sha256(NFC+strip+'||') SSoT; rejects UUID, UUIDv5, NFKC, None-coerce, canonical-JSON with reasons; separator-collision caveat in Consequences
+- docs/adr/ADR-002-wal-page1-corruption-policy.md — WAL + TRUNCATE checkpoint + 256-byte overwrite at page-1 offset 100; open must recover OR raise DatabaseError; rejects trailing-append and header-only corruption; single-page scope noted
+- docs/adr/ADR-003-target-kind-split.md — asymmetric schema (events no CHECK; decisions CHECK IN ('claim','memory','source')) + asymmetric validators (VALID_TARGET_KINDS vs DECISION_TARGET_KINDS); rejects symmetric-CHECK and no-CHECK alternatives
+
+### Scope discipline
+- Did NOT write ADRs for the other two P1 items (append-only trigger, txn_guard helper) — architect said "revisit when the first decision writer lands"; premature ADRs would freeze a design with no caller.
+- Pure docs; zero code / schema / test changes. No regression surface touched.
+
+### Learnings
+- ADR template is 6 sections in fixed order — a consistent index scan cost for future readers.
+- Status lifecycle + monotonic numbering + never-reused IDs is the Michael Nygard original; keep it.
+- When a code review finding freezes a non-obvious tradeoff into shipped schema/tests, that is the ADR signal. The other direction — pre-writing ADRs for design-not-yet-implemented — produces rot.
+
+## 2026-04-19 — v0.5.0-pre1 retrieval correctness (BUG 1-4)
+
+### Context
+Three-way review (Opus/Sonnet/Claude FS) on 2026-04-19 found 4 LongMemEval-blocking retrieval bugs. Fixed in TDD order 1→2→4→3. BUG 1 and BUG 4 were combined into a single commit because both converge on `_iso_normalize`.
+
+### BUG 1+4 — by_timeline microsecond boundary + naive-ts lex compare
+- Symptom: an event stored at `2024-06-15T12:00:00.500000+00:00` silently dropped out of a query bounded by `...T12:00:00Z`. Root cause: `_iso_normalize` emitted `+00:00`-only form while `now_iso()` stored `.SSSSSS+00:00`; at column position 19 the comparator saw `'+' (0x2B)` < `'.' (0x2E)`, so the subsecond row fell outside the upper bound under SQLite's TEXT lex ordering.
+- Fix: `_iso_normalize(ts, *, kind)` now accepts an explicit `kind='since'|'until'`. For `kind='until'` and microsecond==0, microsecond expands to `999_999`; always emits `timespec='microseconds'` with `+HH:MM` tz-offset form. `now_iso()` pinned to microseconds so stored rows have the invariant width.
+- BUG 4 piggybacks: naive timestamps (no tz) also broke lex compare; the write-side invariant via `now_iso()` keeps every new row well-formed, and the read-side `_iso_normalize(..., kind=...)` shapes both bounds identically.
+- Tests: `tests/test_by_timeline_microsecond_boundary.py` pins all four regression cases (until-subsecond, since-exact, naive fallback, _iso_normalize contract).
+- Commit: `f90e688 fix(retrieve): by_timeline microsecond boundary + naive-ts lex compare (BUG 1+4)`
+
+### BUG 2 — by_bug_fix / by_entity missing ORDER BY on claim SELECT
+- Symptom: when matching claims exceeded `limit`, SQLite returned `limit` rows in heap-order, silently dropping higher-confidence rows. LongMemEval would see the wrong top-K.
+- Fix: appended `ORDER BY confidence DESC, updated_at DESC, claim_id ASC LIMIT ?` to both claim SELECTs. Determinism guaranteed by the claim_id tiebreak (ULIDs are monotonic with updated_at so tie-breaks stay stable across runs).
+- Tests: `tests/test_by_entity_order_by.py` seeds 25 claims with ascending confidence and asserts the top-20 are the high-confidence slice; `tests/test_by_bug_fix_order_by.py` does the same against `by_bug_fix` (via a `_raw_insert_claim` helper that bypasses `claim.created` event emission — otherwise the emitted events would dominate the bug_fix LIKE scan and distort the score sort).
+- Commit: `37947db fix(retrieve): by_entity/by_bug_fix missing ORDER BY on claim SELECT (BUG 2)`
+
+### BUG 3 — content_hash scopes to user_id (ADR-005)
+- Symptom: the 4-part hash `sha256(subject||predicate||object||source_id)` collapsed cross-user same-triple facts that shared an explicit source (synthetic `direct:<user_id>` sources already varied per user so the bug was latent, but any real shared file source would merge two users' identical claims into one row).
+- Fix: 5-part hash `sha256(subject||predicate||object||source_id||user_id)`. UNIQUE index on claims is now `(content_hash, source_id, user_id)`.
+- Migration m0007: in-place rehash of every existing claim via a Python loop inside `BEGIN IMMEDIATE` (individual `conn.execute` — not `executescript`, per m0001 contract), then DROP + CREATE the UNIQUE index with the new columns. `down()` reverses to the 4-part hash.
+- ADR-005 (2026-04-19, Status=Accepted, supersedes ADR-004): the key decision is that a claim's identity is scoped by the *speaker*, not just the triple+source. Two users independently stating `(chris, likes, coffee)` about the same Markdown source are two separate claims, not a dedup hit.
+- Tests: `tests/test_content_hash_user_id_scope.py` covers cross-user distinctness + migration rehash; `tests/test_claim_dedup_semantics.py` updated for the 5-part formula while keeping the ADR-004 same-source idempotence cases green.
+- Commit: `43662a1 fix(ingest): content_hash scopes to user_id + m0007 migration + ADR-005 (BUG 3)`
+
+### Regression
+- `pytest tests/ --cov=parallax` → all green, coverage 89.11% (v0.4.0 floor 88.97%).
+- `ruff check` clean on every file touched by v0.5.0-pre1 (new file m0007, retrieve.py, ingest.py, sqlite_store.py, schema.sql-related tests).
+
+### Learnings
+- Lex-compared timestamps need both a *stored* invariant (always microseconds, always tz-aware) and a *query* invariant (microsecond expansion on `until`). Fixing only one side leaves a boundary hole.
+- `LIMIT` without `ORDER BY` is a silent correctness bug, not a style nit — SQLite is free to return rows in any order, and the heap-scan order happened to be "oldest first" which is the exact opposite of what a confidence-ranked retrieval wants.
+- When a dedup key participates in a cross-user namespace, bake the user into the key. `UNIQUE(content_hash, source_id, user_id)` is the defensive version; putting user_id inside the hash itself is the aggressive version — we picked aggressive because the hash is also used for lookups and having user_id live only in the index would mean two users' identical claims still share a content_hash value (confusing at the API boundary).
+
+## 2026-04-19 — v0.5.0-pre4 m0008 naive-ts CRITICAL fix
+
+### Context
+v0.5.0-pre3 closed out the critic review by pinning the naive-ts same-second edge case as a "known limitation": a stored `2024-06-15T12:00:00` (19 chars) lex-compared LESS than the `_iso_normalize` since-bound `2024-06-15T12:00:00.000000+00:00` (32 chars), so `created_at >= since` evaluated FALSE and the row disappeared. v0.5.0-pre4 promotes the pin to a permanent fix via a one-time corpus normalization.
+
+### m0008 — normalize_naive_created_at
+- New migration `parallax/migrations/m0008_normalize_naive_created_at.py`. Rewrites every TIMESTAMP column across the schema to the exact `now_iso()` canonical form: `YYYY-MM-DDTHH:MM:SS.ffffff+00:00` (32 chars).
+- Columns touched: `sources.ingested_at`, `memories.created_at/updated_at`, `claims.created_at/updated_at`, `claim_metadata.last_seen_at/superseded_at/created_at/updated_at`, `decisions.created_at`, `events.created_at`, `index_state.last_built_at`.
+- Events carries the m0002 append-only triggers (`events_no_update`, `events_no_delete`). `up()` drops them before the sweep, does the UPDATEs, then recreates them before the ambient transaction commits — the append-only contract is preserved against app writes.
+- Sweep runs in Python (one `conn.execute` per modified row) because SQLite cannot reproduce `datetime.fromisoformat` in pure SQL. Rows that are already canonical (length 32) are skipped — no wasted UPDATE statements.
+- Idempotent in two senses: (1) the migration registry records v8 applied, so `migrate_to_latest` is a no-op on re-run; (2) re-invoking `m0008.up()` against the normalized corpus produces byte-identical column values (canonical strings round-trip through `fromisoformat` + `isoformat(timespec='microseconds')`).
+- `down()` is a documented no-op. Corpus normalization is lossless forward but has no faithful inverse — reversing would require fabricating the original shape per row. The ledger rollback still works because `migrate_down_to` removes the v8 row from `schema_migrations` regardless of whether `down()` did anything.
+- `STATEMENTS` exposes the DDL/UPDATE strings so `migration_plan` attributes row-impact estimates to each affected table.
+
+### Test coverage
+- `tests/test_m0008_naive_ts_normalization.py`: 16 cases across shape (naive 19-char, tz-no-micro 25-char, trailing-Z, already-canonical, nullable-stays-null), idempotency (registry short-circuit + direct re-up), events append-only preservation (post-migration UPDATE/DELETE still `IntegrityError`), empty-corpus run, direct `_canonicalize` helper calls, and down()-is-noop.
+- `tests/test_by_timeline_microsecond_boundary.py::TestNaiveTimestampLexCompare::test_naive_iso_same_second_as_since_matches_after_m0008` (renamed): rebuilt to raw-insert a naive row at v7 BEFORE `migrate_to_latest` runs, then asserts `len(hits) == 1` after the migration normalizes the corpus. Previously pinned `hits == []` as a known limitation.
+- `tests/test_migrations.py` and `tests/test_migration_plan.py`: updated version-count expectations from 7 → 8 (4 places).
+
+### Docstring cleanup
+- `parallax/retrieve.py::_iso_normalize` — the "Known limitation (v0.5.0-pre1)" paragraph is removed because the gap no longer exists after m0008.
+
+### Regression
+- `pytest tests/ --cov=parallax` → 421 passed, coverage 89.37% (floor 88.97%).
+- `ruff check parallax/migrations/m0008_normalize_naive_created_at.py parallax/migrations/__init__.py parallax/retrieve.py tests/test_m0008_naive_ts_normalization.py tests/test_by_timeline_microsecond_boundary.py` → clean.
+
+### Learnings
+- Choosing "fix the corpus once" over "patch the reader forever" collapses the compare path back to a single length class. Every future retrieve query that lex-compares a timestamp bound gets to assume the stored side is always 32 chars — no per-row length branching, no two-predicate SQL rewrites to maintain.
+- The events append-only triggers live in m0002; any migration that rewrites events rows has to lift them for the duration of the transaction. Dropping + recreating inside the same ambient `BEGIN IMMEDIATE` keeps the contract live against app connections because they don't see the intermediate state.
+- `_canonicalize` is deliberately a module-private helper rather than a public utility: the only caller is m0008, and keeping it scoped prevents future drift where someone reaches for it from retrieval/ingest code that should be using `now_iso` instead.
+
+## 2026-04-20 — v0.5.0-pre6 reproduce.py skeleton (ADR-006 gate #5 harness)
+
+### Context
+ADR-006 §Acceptance gate #5 demands that the same config, re-run with a different seed / scheduler order, produces `fallback_e2e` scores within ±1pp. Without this gate, the 81.7% fallback floor is noisy and gate #3 (≥95% × full-context) is not meaningful. v0.5.0-pre6 lands the harness skeleton so Day-1 can swap in a real `run_one` with a one-line change.
+
+### Added files
+- `eval/longmemeval/reproduce.py` — frozen dataclasses `ReproduceConfig(label, seed_a, seed_b)` and `ReproduceReport(label, fallback_e2e_a, fallback_e2e_b, max_minus_min, passes_gate, seed_a, seed_b, created_at)`; `reproduce_once(cfg, *, run_fn=_stub_run)` validates both returns through `RunReportV2`, computes `max − min`, compares against `GATE_THRESHOLD = 0.01`. CLI `--label / --seed-a / --seed-b / --out-dir / --dry-run` writes a JSON report and exits 0 iff `passes_gate`.
+- `tests/smoke/test_reproduce.py` — 13 tests across four classes: `TestStubRunSchema` (seed-1/seed-2 validate through `RunReportV2`, same seed yields identical `fallback_e2e`), `TestReproduceOnce` (gate pass/fail cases, symmetry, no-mutation invariant on input cfg, just-under-threshold boundary), `TestWriteReproduceReport` (JSON round-trip + parent-dir creation), `TestCLI` (dry-run writes nothing, non-dry-run produces the 8-field JSON).
+
+### Touched files (pre-existing breakage fixed)
+- `tests/smoke/test_pipeline_v2.py::_build_report` and `eval/longmemeval/sweep_thresholds.py::_stub_report` — both emitted aggregate dicts from before the schema_v2 risk-gate-hook landing, so `RunReportV2(**report)` raised `ValidationError: 6 fields missing`. Added zero-valued defaults for `abstain_on_confident_route`, `abstain_on_fallback`, `bucket_headroom={}`, `classifier_cache_hit_rate`, `answerer_cache_hit_rate`, `baseline_reproduce_variance` so both stubs emit schema-compliant reports again.
+
+### Regression
+- `pytest tests/ --cov=parallax` → 472 passed, 0 failed, 1 deselected, 88.02% coverage (above pyproject 80% floor; dropped from 89.37% baseline because the new pydantic validators in `eval/longmemeval/schema_v2.py` don't live in the `parallax/` coverage denominator — no `parallax/` code regressed).
+- `ruff check eval/longmemeval/reproduce.py tests/smoke/test_reproduce.py` → clean.
+- `ruff check eval/longmemeval/sweep_thresholds.py` → clean after auto-sorting imports.
+
+### Learnings
+- When a stub is deterministic but needs to exercise both branches of a downstream gate (passes vs fails), seeding it off a hash of `(label, seed)` mapped into a realistic range is cheaper than inlining a fixed lookup table and keeps the stub drop-in replaceable when the real `run_one` lands.
+- Testing exact float boundaries (`0.87 - 0.86 == 0.01`) is brittle because IEEE-754 drifts by ~1e-17; cleaner to test "just under" with a larger margin than to loosen the gate comparison to accommodate the edge.
+- Schema drift has long tails: `AggregateV2` gained 6 fields two stories back, but two callers (`sweep_thresholds._stub_report`, the smoke test's `_build_report`) still emitted the old shape until someone actually re-ran the suite. The lesson is to include a schema-gate smoke test for every stub builder, not just rely on downstream test coverage.

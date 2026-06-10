@@ -1,0 +1,17 @@
+# Lane C Phase 1 — Reviewer-flagged Blocker Fixes
+
+## 2026-04-22 — Ralph iteration 2
+Prior Lane C Phase 1 PRD closed; archived as prd_laneC_phase1_closeout_20260422.json.
+38 Lane C tests are GREEN. This iteration only fixes the two blockers from the independent 2-agent review:
+- F1: path traversal via MEMORY.md entry.filename
+- F2: non-atomic per-row commit + TOCTOU between pre-check SELECT and upsert
+
+## Stories
+- [ ] F1 — path traversal guard + tests
+- [ ] F2 — atomic transaction wrapper + tests
+
+## Non-goals (explicitly out of scope)
+- Ruff B008 on export.py:103 (pre-existing codebase pattern — query.py/inspect.py trigger same rule; fixing only this file is inconsistent)
+- SHA-1 → SHA-256 migration for card_id (not a security hash; follow-up)
+- Privacy filter enrichment (passwd/passphrase/bearer/access_token/Unicode normalization) — PRD-spec was the 8 keywords
+- Test path portability (hardcoded Chris Windows path is skipif-guarded; cosmetic)

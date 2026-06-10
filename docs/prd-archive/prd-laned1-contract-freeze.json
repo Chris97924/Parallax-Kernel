@@ -1,0 +1,112 @@
+{
+  "title": "Lane D-1 — MEMORY_ROUTER Contract Freeze (interface-only, zero business logic)",
+  "context": "Lane D-1 is the signature-level freeze of the MEMORY_ROUTER routing layer that sits between parallax.retrieval.Intent (semantic intent, ADR-006) and parallax.server.routes.query.RetrieveKind (HTTP dispatch). Both existing enums stay untouched. This PRD delivers: (a) QueryType — a new 5-value closed-set enum; (b) 4 capability ports as typed Protocols (Query / Ingest / Inspect / Backfill); (c) request/response dataclasses; (d) ArbitrationDecision canonical type; (e) Crosswalk seed mapping table (read-only, from Intent|RetrieveKind -> QueryType); (f) MockMemoryRouter that raises NotImplementedError on every port method; (g) MEMORY_ROUTER flag plumbing, default false; (h) contract-test skeleton gated by xfail so main stays green. Former draft name 'Lane C'; renamed to avoid collision with Lane C Phase 1 (MEMORY.md interception hook in commit 629df02). Explicit non-goals: no business logic, no real adapter, no backfill dry-run runner, no field normalization (memory.body / claim.object_ / event.payload_text unification is deliberately deferred to Lane D-2 as known tech debt, see Sonnet Critic warning in xcouncil Round 2). Rules: TDD RED->xfail->GREEN (skeleton RED is allowed via xfail only; no bare failing tests in main), immutability (frozen dataclasses + tuple containers), KISS/DRY/YAGNI, type hints on every signature, ruff clean, coverage floor 80% preserved. Reviewer: critic (Opus). Rollback: if contract tests drop below 100% on the feature branch, git revert the PR; MEMORY_ROUTER flag remains false. SLA: 30 min to flag-off / revert action, 60-120 min to fully verify (518 baseline tests green + staging no writes + mapping table untouched). Naming (SWAP POINT — Chris can override in one line): QueryType values use Codex-派 (RECENT_CONTEXT / ARTIFACT_CONTEXT / ENTITY_PROFILE / CHANGE_TRACE / TEMPORAL_CONTEXT) because (1) they don't collide with Intent or RetrieveKind — the third-layer abstraction stays abstract, (2) CHANGE_TRACE legitimately covers decision+bug since LongMemEval never exercises by_bug_fix (grep eval/ returns zero). Intent.FALLBACK policy (SWAP POINT — Chris can override): raise UnroutableQueryError on Crosswalk lookup, never silently map to a sentinel, per GPT-OSS recommendation and the project rule 'never silently swallow errors'.",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "QueryType enum — 5-value closed set, signature-level frozen",
+      "priority": 1,
+      "passes": false,
+      "acceptanceCriteria": [
+        "New file parallax/router/types.py exists. It MUST be importable without importing parallax.retrieval or parallax.server (the router package is the new third layer and must not depend on either enum's module).",
+        "types.py defines exactly one enum named QueryType inheriting from (str, Enum). Exactly 5 members, in this order, with these name/value pairs: RECENT_CONTEXT='recent_context', ARTIFACT_CONTEXT='artifact_context', ENTITY_PROFILE='entity_profile', CHANGE_TRACE='change_trace', TEMPORAL_CONTEXT='temporal_context'. SWAP POINT: if Chris names differently, substitute across this entire PRD.",
+        "Each member has a one-line docstring-style comment on its own line directly above the assignment, stating the semantic. REQUIRED text (exact, including the Chinese/English mix): RECENT_CONTEXT = near-term conversation + multi-session continuity; ARTIFACT_CONTEXT = file / path / artifact memory; ENTITY_PROFILE = entity profile (user_fact / preference / named entity); CHANGE_TRACE = decisions + bug fixes (change history); TEMPORAL_CONTEXT = when / before / after time-window queries.",
+        "types.py ALSO defines MappingState as (str, Enum) with exactly three values: MAPPED='mapped', UNMAPPED='unmapped', CONFLICT='conflict'. Order fixed in that sequence.",
+        "types.py ALSO defines one frozen dataclass FieldCandidate with fields (in order): source: str, field_name: str, value: Any, confidence: float. FieldCandidate is fully defined here; ArbitrationDecision (which consumes it) lives in contracts.py and imports FieldCandidate from types.py. The public __all__ of types.py must list exactly: ['QueryType', 'MappingState', 'FieldCandidate'].",
+        "New file tests/router/__init__.py exists (empty) so pytest collects the new test module regardless of rootdir-relative resolution.",
+        "parallax/__init__.py is NOT modified — router is opt-in via explicit `from parallax.router.types import QueryType` imports.",
+        "PRESERVE: parallax/retrieval/contracts.py Intent enum has zero diff.",
+        "PRESERVE: parallax/server/routes/query.py RetrieveKind literal and _dispatch function have zero diff.",
+        "New test tests/router/test_query_type.py asserts: len(list(QueryType)) == 5; list of values is exactly ['recent_context','artifact_context','entity_profile','change_trace','temporal_context']; QueryType('recent_context') is QueryType.RECENT_CONTEXT (value round-trip); QueryType.RECENT_CONTEXT.name == 'RECENT_CONTEXT'; isinstance(QueryType.RECENT_CONTEXT, str) is True.",
+        "New test tests/router/test_query_type.py asserts len(list(MappingState)) == 3 and its values are exactly ['mapped','unmapped','conflict'].",
+        "Subprocess import discipline test in tests/router/test_query_type.py: `python -c 'import parallax.router.types; import sys; assert \"parallax.retrieval\" not in sys.modules; assert \"parallax.server\" not in sys.modules'` exits 0. (Verifies the router package doesn't transitively drag in the other layers.)",
+        "`python -m pytest tests/router/test_query_type.py --no-cov -v` exits 0 with all assertions passing.",
+        "ruff check parallax/router/types.py tests/router/test_query_type.py returns 0 errors."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Four capability ports as runtime_checkable Protocols (signature-level frozen)",
+      "priority": 2,
+      "passes": false,
+      "acceptanceCriteria": [
+        "New file parallax/router/ports.py exists. All four port classes use @runtime_checkable Protocol from typing. ports.py imports directly from parallax.router.contracts (QueryRequest, IngestRequest, IngestResult, BackfillRequest, BackfillReport, HealthReport, RetrievalEvidence) so annotations are real types, not string forward references. Dependency graph: types.py (no deps) ← contracts.py ← ports.py ← mock_adapter.py.",
+        "QueryPort.query exact signature: `def query(self, request: QueryRequest) -> RetrievalEvidence: ...`. Exactly one abstract method; no default implementation.",
+        "IngestPort.ingest exact signature: `def ingest(self, request: IngestRequest) -> IngestResult: ...`. Exactly one abstract method.",
+        "InspectPort.health exact signature: `def health(self) -> HealthReport: ...`. Exactly one abstract method, no arguments beyond self.",
+        "BackfillPort.backfill exact signature: `def backfill(self, request: BackfillRequest) -> BackfillReport: ...`. Exactly one abstract method.",
+        "ports.py public __all__ lists exactly: ['QueryPort', 'IngestPort', 'InspectPort', 'BackfillPort'].",
+        "ports.py does NOT define any concrete class; Protocols only.",
+        "Each port class has a one-sentence class-level docstring stating its capability boundary: QueryPort='Route a typed query request to evidence hits.' / IngestPort='Persist a memory / claim payload into the router store.' / InspectPort='Return the router's health and introspection snapshot.' / BackfillPort='Run a Crosswalk-driven backfill; MUST honour request.dry_run.'",
+        "New test tests/router/test_ports_protocol.py asserts: `isinstance(MockMemoryRouter(), QueryPort)` is True for all four ports (uses runtime_checkable). Test imports MockMemoryRouter from US-004.",
+        "Signature introspection test: for each port class and its single method, inspect.signature(...) yields parameter names exactly ['self', 'request'] for Query/Ingest/Backfill and ['self'] for Inspect; typing.get_type_hints(<method>) resolves to the concrete contract classes (not strings), proving direct imports succeeded and no cycles exist.",
+        "`python -m pytest tests/router/test_ports_protocol.py --no-cov -v` exits 0.",
+        "ruff check parallax/router/ports.py tests/router/test_ports_protocol.py returns 0 errors."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Request / response contracts — frozen dataclasses with explicit field types",
+      "priority": 3,
+      "passes": false,
+      "acceptanceCriteria": [
+        "New file parallax/router/contracts.py exists and re-exports parallax.retrieval.contracts.RetrievalEvidence (NOT redefined — the router consumes the existing ADR-006 evidence type so downstream tooling keeps working).",
+        "QueryRequest(@dataclass(frozen=True)) fields in this order: query_type: QueryType; user_id: str; q: str = ''; limit: int = 10; since: str | None = None; until: str | None = None; level: int = 1.",
+        "IngestRequest(@dataclass(frozen=True)) fields: user_id: str; kind: Literal['memory', 'claim'] ; payload: dict[str, Any]; source_id: str | None = None.",
+        "IngestResult(@dataclass(frozen=True)) fields: kind: Literal['memory', 'claim']; identifier: str; deduped: bool.",
+        "BackfillRequest(@dataclass(frozen=True)) fields: user_id: str; crosswalk_version: str; dry_run: bool = True; scope: Literal['all', 'sample'] = 'sample'.",
+        "BackfillReport(@dataclass(frozen=True)) fields: rows_examined: int; rows_mapped: int; rows_unmapped: int; rows_conflict: int; writes_performed: int; arbitrations: tuple[ArbitrationDecision, ...]. INVARIANT (enforced in test, not __post_init__): `writes_performed == 0` when request.dry_run is True.",
+        "HealthReport(@dataclass(frozen=True)) fields: ok: bool; flag_enabled: bool; query_type_count: int; ports_registered: tuple[str, ...]; crosswalk_seed_hash: str.",
+        "ArbitrationDecision(@dataclass(frozen=True)) fields in this order: canonical_field: str; state: MappingState; selected: FieldCandidate | None; candidates: tuple[FieldCandidate, ...]; reason_code: str; reason: str; confidence: float; requires_manual_review: bool. MUST support to_json_line() -> str (json.dumps with MappingState.value and tuple->list coercion, deterministic key order via sort_keys=True).",
+        "contracts.py public __all__ lists exactly: ['QueryRequest','IngestRequest','IngestResult','BackfillRequest','BackfillReport','HealthReport','ArbitrationDecision','RetrievalEvidence'].",
+        "All dataclasses are @dataclass(frozen=True) and hashable (no mutable default values, lists replaced with tuples).",
+        "New test tests/router/test_contracts.py asserts for every dataclass: (a) frozen=True (attempt to set attribute raises FrozenInstanceError), (b) required fields match the list above by name+type (using dataclasses.fields), (c) BackfillReport.writes_performed==0 when dry_run round-tripped through a minimal invariant helper.",
+        "test_contracts.py asserts ArbitrationDecision.to_json_line() output is stable across two calls with identical inputs (no timestamps, no random ordering) and json.loads round-trips to a dict whose 'state' key equals the MappingState string value.",
+        "`python -m pytest tests/router/test_contracts.py --no-cov -v` exits 0.",
+        "ruff check parallax/router/contracts.py tests/router/test_contracts.py returns 0 errors."
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "MockMemoryRouter (all four ports, NotImplementedError with clear messages) + Crosswalk seed mapping (read-only)",
+      "priority": 4,
+      "passes": false,
+      "acceptanceCriteria": [
+        "New file parallax/router/mock_adapter.py defines class MockMemoryRouter that implements all four Protocols structurally (no explicit inheritance — Protocols are duck-typed).",
+        "MockMemoryRouter.query(request) raises NotImplementedError('Lane D-1 freeze: MockMemoryRouter.query is intentionally unimplemented; real adapter lands in Lane D-2') verbatim.",
+        "MockMemoryRouter.ingest(request) raises NotImplementedError with message 'Lane D-1 freeze: MockMemoryRouter.ingest is intentionally unimplemented; real adapter lands in Lane D-2'.",
+        "MockMemoryRouter.backfill(request) raises NotImplementedError with message 'Lane D-1 freeze: MockMemoryRouter.backfill is intentionally unimplemented; real adapter lands in Lane D-2'.",
+        "MockMemoryRouter.health() returns a real HealthReport (NOT NotImplementedError) with: ok=True; flag_enabled=<read from parallax.router.config.MEMORY_ROUTER at call time>; query_type_count=5; ports_registered=('QueryPort','IngestPort','InspectPort','BackfillPort'); crosswalk_seed_hash=<sha256 hex digest of the seed mapping JSON, deterministic order>. Rationale: health is the one sanity probe that must work even in frozen mode so /inspect never returns 500.",
+        "New file parallax/router/crosswalk_seed.py defines CROSSWALK_SEED as a frozen types.MappingProxyType wrapping a plain dict. Keys are the string literals below; values are QueryType members. Exact entries (all must be present, no more, no less): 'Intent.TEMPORAL' -> QueryType.TEMPORAL_CONTEXT; 'Intent.MULTI_SESSION' -> QueryType.RECENT_CONTEXT; 'Intent.PREFERENCE' -> QueryType.ENTITY_PROFILE; 'Intent.USER_FACT' -> QueryType.ENTITY_PROFILE; 'Intent.KNOWLEDGE_UPDATE' -> QueryType.CHANGE_TRACE; 'RetrieveKind.recent' -> QueryType.RECENT_CONTEXT; 'RetrieveKind.file' -> QueryType.ARTIFACT_CONTEXT; 'RetrieveKind.decision' -> QueryType.CHANGE_TRACE; 'RetrieveKind.bug' -> QueryType.CHANGE_TRACE; 'RetrieveKind.entity' -> QueryType.ENTITY_PROFILE; 'RetrieveKind.timeline' -> QueryType.TEMPORAL_CONTEXT. NOTE: 'Intent.FALLBACK' is intentionally absent from this mapping.",
+        "crosswalk_seed.py also defines UnroutableQueryError(Exception) and a public helper resolve(legacy: str) -> QueryType that looks up CROSSWALK_SEED[legacy] and raises UnroutableQueryError(f'legacy key {legacy!r} is unmapped (likely Intent.FALLBACK)') when missing. Rationale: Intent.FALLBACK policy = raise, never silent map. SWAP POINT — Chris can override to return a sentinel.",
+        "crosswalk_seed.py __all__ lists exactly: ['CROSSWALK_SEED', 'resolve', 'UnroutableQueryError', 'seed_hash'].",
+        "seed_hash() -> str returns sha256 hex of json.dumps(dict(CROSSWALK_SEED) with QueryType coerced to .value, sorted keys, no whitespace). Same call returns the same string byte-for-byte.",
+        "New test tests/router/test_mock_and_seed.py asserts: each of query/ingest/backfill raises NotImplementedError and the message CONTAINS the substring 'Lane D-1 freeze'; health() returns a HealthReport with ok=True and ports_registered tuple exactly matching the four port names; MockMemoryRouter is structurally a QueryPort, IngestPort, InspectPort, BackfillPort via isinstance (proves runtime_checkable).",
+        "test_mock_and_seed.py asserts: resolve('Intent.TEMPORAL') is QueryType.TEMPORAL_CONTEXT; resolve('Intent.FALLBACK') raises UnroutableQueryError; resolve('RetrieveKind.bug') is QueryType.CHANGE_TRACE; len(CROSSWALK_SEED) == 11 (5 mapped Intents excluding FALLBACK, + 6 RetrieveKinds); seed_hash() returns the same value on two calls and len(seed_hash()) == 64.",
+        "`python -m pytest tests/router/test_mock_and_seed.py --no-cov -v` exits 0.",
+        "ruff check parallax/router/mock_adapter.py parallax/router/crosswalk_seed.py tests/router/test_mock_and_seed.py returns 0 errors."
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "MEMORY_ROUTER flag wiring + contract-test skeleton gated by xfail + full-suite green",
+      "priority": 5,
+      "passes": false,
+      "acceptanceCriteria": [
+        "New file parallax/router/config.py exports MEMORY_ROUTER as a module-level Final[bool]. Default reads from os.getenv('MEMORY_ROUTER', 'false').strip().lower() == 'true'. Accepted truthy: only the literal 'true' (case-insensitive). Anything else -> False.",
+        "config.py ALSO exposes a helper `is_router_enabled() -> bool` that re-reads the env var at call time (for tests that want to mutate os.environ and observe change). The module-level Final captures the value at import time (production path); the helper is the dynamic path. Both must be exported.",
+        "config.py __all__ lists exactly: ['MEMORY_ROUTER', 'is_router_enabled'].",
+        "New file parallax/router/__init__.py re-exports: QueryType, MappingState, FieldCandidate, ArbitrationDecision, QueryRequest, IngestRequest, IngestResult, BackfillRequest, BackfillReport, HealthReport, RetrievalEvidence, QueryPort, IngestPort, InspectPort, BackfillPort, MockMemoryRouter, CROSSWALK_SEED, resolve, UnroutableQueryError, seed_hash, MEMORY_ROUTER, is_router_enabled. No other public names.",
+        "`python -c 'import parallax; from parallax.router import QueryType, MEMORY_ROUTER; assert MEMORY_ROUTER is False'` exits 0 in the default test env (no MEMORY_ROUTER var set).",
+        "`python -c 'import os; os.environ[\"MEMORY_ROUTER\"]=\"true\"; from parallax.router.config import is_router_enabled; assert is_router_enabled() is True'` exits 0.",
+        "New test tests/router/test_flag_wiring.py asserts: default MEMORY_ROUTER==False; truthy case-insensitive ('TRUE','True','true') via monkeypatch and is_router_enabled() returns True; every other string ('1','yes','on','') returns False; HealthReport from MockMemoryRouter().health() reflects the current flag value.",
+        "New test file tests/router/test_contract_skeleton.py contains one @pytest.mark.xfail(strict=True, reason='Lane D-1 freeze: real adapter arrives in Lane D-2; mock deliberately raises') test per port method (query, ingest, backfill) that instantiates MockMemoryRouter and calls the method with minimal valid kwargs. Each test MUST be strict xfail so if a future accidental implementation stops raising, the suite turns red.",
+        "test_contract_skeleton.py also contains ONE non-xfail test that calls MockMemoryRouter().health() and asserts ok==True, query_type_count==5, and ports_registered is the 4-tuple of port class names.",
+        "No test file in tests/router/ uses plain `pytest.fail` or bare `assert False` as a placeholder. Skeleton RED is xfail-only; main stays green.",
+        "Full suite: `cd E:/Parallax && python -m pytest tests/ -q` exits 0. Coverage gate (existing cov-fail-under 80) still passes. The xfail tests show as xfailed in the summary, not as failures.",
+        "ruff check parallax/router/ tests/router/ returns 0 errors.",
+        "parallax/server/routes/query.py, parallax/retrieval/contracts.py, parallax/retrieve.py all have zero diff at the end of this story (preservation check: `git diff --name-only origin/main -- parallax/retrieval/ parallax/server/ parallax/retrieve.py` lists zero files)."
+      ]
+    }
+  ]
+}

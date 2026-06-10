@@ -1,0 +1,98 @@
+{
+  "title": "Lane C Phase 1 — MEMORY.md interception via Parallax (Path A, schema-first)",
+  "context": "Parallax × DPKG Lane C Phase 1. Make Parallax the single source of truth for Claude Code's MEMORY.md. Path A architecture: new entity_kind=memory_card in Parallax, ingest existing 4-section memory into it, export endpoint renders MEMORY.md byte-compatibly + returns companion file bodies. SessionStart hook regenerates MEMORY.md.preview (dry-run) on session start. Phase 2 (pm2 daemon + SQLite cache) is later. Rules: TDD RED→GREEN→REFACTOR every test, coverage >= 80%, 200-400 lines/file (max 800), immutability (frozen dataclasses / return new dicts), no secret-bearing cards ingest-or-exported, do not touch parallax/injector.build_session_reminder, do not edit settings.json outside D6.",
+  "stories": [
+    {
+      "id": "D1",
+      "title": "Parallax schema — memory_card entity + m0010 migration",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/migrations/m0010_memory_cards.py exists with STATEMENTS list (no executescript), up()/down() functions",
+        "up() creates table memory_cards(id TEXT PRIMARY KEY, user_id TEXT NOT NULL, category TEXT NOT NULL CHECK(category IN ('user','feedback','project','reference')), name TEXT NOT NULL, filename TEXT NOT NULL, description TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMP NOT NULL, updated_at TIMESTAMP NOT NULL)",
+        "up() creates UNIQUE index idx_memory_cards_user_filename ON memory_cards(user_id, filename)",
+        "down() drops index then table",
+        "m0010_memory_cards registered in parallax/migrations/__init__.py MIGRATIONS list AND _MIGRATION_MODULES dict at version=10",
+        "tests/test_memory_card_schema.py: migrate_to_latest on fresh DB creates memory_cards table with exact columns; migrate_down_to(9) drops it; round-trip up→down→up succeeds; CHECK constraint rejects category='bogus' with IntegrityError; UNIQUE(user_id, filename) rejects duplicate with IntegrityError",
+        "`python -m pytest tests/test_memory_card_schema.py -q` exits 0 with all assertions passing"
+      ]
+    },
+    {
+      "id": "D2",
+      "title": "parallax/ingest/memory_md.py — MEMORY.md + companion parser & ingest",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/ingest/__init__.py exists (package) and does NOT change any existing ingest module behaviour",
+        "parallax/ingest/memory_md.py defines parse_memory_md(text: str) -> list[MemoryMdEntry] where MemoryMdEntry is a frozen dataclass(category, title, filename, description)",
+        "parse_memory_md splits into 4 sections keyed by '# User' / '# Projects (Active)' / '# Feedback' / '# Reference' headings; maps each heading to category 'user'/'project'/'feedback'/'reference'; each bullet line parsed as '- [Title](filename.md) — description' (em-dash) and tolerates ' - ' ASCII fallback",
+        "parse_companion(path: pathlib.Path) -> CompanionFile with fields name, description, type, body — reads YAML-style frontmatter delimited by '---' lines at the top; body is everything after the closing '---'",
+        "ingest_memory_md(conn, *, memory_md_path, user_id) -> IngestReport reads MEMORY.md, then for each entry reads the companion file from the same directory, validates, and upserts into memory_cards with id=sha1(user_id+filename)[:16]; sets created_at on insert, updated_at on both insert and update",
+        "Idempotent: calling ingest_memory_md twice on the same input produces the same row count (report.cards_inserted + cards_updated total stays stable)",
+        "Missing companion file for an entry → report.skipped_missing_companion includes that filename; function does NOT raise",
+        "Malformed frontmatter → report.skipped_malformed includes that filename; function does NOT raise",
+        "tests/integration/test_ingest_memory_md.py: test_parse_memory_md_4_sections, test_parse_companion_frontmatter, test_idempotent_ingest, test_real_chris_memory_md (reads C:/Users/user/.claude/projects/C--Users-user/memory/MEMORY.md; asserts >= 10 cards ingested AND category distribution includes all 4 categories), test_missing_companion_skipped, test_malformed_frontmatter_skipped",
+        "All tests pass under `python -m pytest tests/integration/test_ingest_memory_md.py -q`"
+      ]
+    },
+    {
+      "id": "D3",
+      "title": "GET /export/memory_md endpoint (auth-gated, stable ordering)",
+      "priority": 3,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/server/routes/export.py exists with APIRouter(prefix='/export', tags=['export'], dependencies=[Depends(require_auth)])",
+        "GET /export/memory_md returns {'memory_md': str, 'companion_files': {filename: body, ...}}",
+        "memory_md rendering: header '# User' then cards, blank line, '# Projects (Active)' then cards, blank line, '# Feedback' then cards, blank line, '# Reference' then cards; each card '- [Title](filename.md) — description'; em-dash (U+2014); trailing newline at end of file",
+        "Sections with no cards still emit the header so round-trip format stays stable",
+        "Section order fixed: User → Projects (Active) → Feedback → Reference; within a section, rows ordered by (name ASC, filename ASC) for deterministic output",
+        "Router registered in parallax/server/app.py create_app() via app.include_router(export_router) alongside existing routers",
+        "tests/server/test_export.py: test_round_trip (ingest the real C:/Users/user/.claude/projects/C--Users-user/memory/MEMORY.md → export → parse both forms identical semantically; byte-equality tolerance is 'ignores trailing whitespace differences on bullet lines'), test_empty_db (4 section headers emitted, no rows), test_render_format (sort stable across two calls), test_auth_required (missing bearer → 401 when PARALLAX_TOKEN set)",
+        "All tests pass under `python -m pytest tests/server/test_export.py -q`"
+      ]
+    },
+    {
+      "id": "D4",
+      "title": "Secret-keyword privacy filter (ingest and export both enforce)",
+      "priority": 4,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/ingest/memory_md.py (or a new parallax/ingest/privacy.py helper) defines SECRET_KEYWORDS = ('password','token','api_key','api-key','secret','credential','.env','private_key') and contains_secret(text: str) -> bool that does case-insensitive substring matching across all keywords",
+        "ingest_memory_md: if contains_secret(description) or contains_secret(body) or contains_secret(name) is True for an entry, skip it and append to report.skipped_privacy (count and filenames recorded)",
+        "/export/memory_md applies the same filter as a belt-and-braces second pass: any row whose description/body/name matches is excluded from BOTH memory_md rendering and companion_files dict",
+        "tests/test_privacy_filter.py: inject rows with body containing 'password=abc', description containing 'api_key', name containing 'secret_xyz' → none appear in export response; matching is case-insensitive ('PASSWORD', 'API_KEY' also filtered); benign keywords like 'tokenization' MUST still be filtered (substring match by spec); test also verifies ingest report.skipped_privacy fired",
+        "All tests pass under `python -m pytest tests/test_privacy_filter.py -q`"
+      ]
+    },
+    {
+      "id": "D5",
+      "title": "Hook script: C:/Users/user/.claude/scripts/parallax_memory/regenerate.py",
+      "priority": 5,
+      "passes": true,
+      "acceptanceCriteria": [
+        "C:/Users/user/.claude/scripts/parallax_memory/regenerate.py exists as a stdlib-only Python script (urllib.request, pathlib, json, os, sys, difflib, time); NO extra pip deps required",
+        "Reads bearer token from C:/Users/user/.claude/parallax_token (strip whitespace); if file missing → exit 0 silently",
+        "GETs http://localhost:8765/export/memory_md with Authorization: Bearer <token>, timeout=0.8 seconds; on any URLError/timeout/connection refused/non-200 response → exit 0 silently (do not raise, do not print to stdout)",
+        "On success: writes memory_md body to C:/Users/user/.claude/projects/C--Users-user/memory/MEMORY.md.preview; writes each companion_files[filename] to <same dir>/<filename>.preview (e.g. user_chris_identity.md.preview); NEVER touches the live MEMORY.md or companion files",
+        "Unified diff vs current live MEMORY.md (and each companion) appended to C:/Users/user/.claude/scripts/parallax_memory/diff.log with a timestamp header; log rotates when it exceeds 1 MiB (truncate-and-restart — old contents discarded; no .1 rotation)",
+        "Environment variable PARALLAX_REGEN_DRY_RUN defaults to '1'; when set to '0' AND test harness injects PARALLAX_REGEN_APPLY=1 sentinel, the script WOULD promote .preview → live (Phase 2 plumbing). For Phase 1 we keep dry-run behaviour ALWAYS — any attempt to run with both flags set still only writes .preview and logs 'phase2_not_enabled'",
+        "tests/test_regenerate.py (under E:/Parallax/tests/): test_dry_run_writes_preview_only (mock urllib to return a fake response; assert MEMORY.md.preview created, MEMORY.md untouched), test_fallback_when_parallax_down (mock urllib to raise ConnectionRefusedError; assert exit 0 and no preview written AND no stdout output), test_timeout_uses_old_file (mock urllib to raise socket.timeout; exit 0, no preview), test_missing_token_file_silent (token path missing → exit 0 silently), test_diff_log_rotation (seed diff.log with 1.1 MiB of bytes → after run, size < 1 MiB)",
+        "All tests pass under `python -m pytest tests/test_regenerate.py -q` — tests import the script via importlib.util from its absolute path"
+      ]
+    },
+    {
+      "id": "D6",
+      "title": "SessionStart hook registration in ~/.claude/settings.json (dry-run ON)",
+      "priority": 6,
+      "passes": true,
+      "acceptanceCriteria": [
+        "~/.claude/settings.json gains a SessionStart hook entry that runs C:/Users/user/.claude/scripts/parallax_memory/regenerate.py via `python` with PARALLAX_REGEN_DRY_RUN=1 in env",
+        "The hook timeout is at most 1500ms (0.8s request + margin) so it never stalls session start",
+        "Existing SessionStart hooks are preserved — the new entry is appended, not a replacement",
+        "A dry-run smoke check: running `python C:/Users/user/.claude/scripts/parallax_memory/regenerate.py` manually with Parallax NOT running exits 0 in < 2s (validates the fail-silent path works end-to-end on this host)",
+        "If Parallax IS running and a valid token is present, a MEMORY.md.preview appears in the memory dir and its first line matches '# User'",
+        "Documentation: E:/Parallax/docs/lane-c-phase1.md describes the hook install, dry-run env var, 7-day observation plan, and Phase 2 (pm2 + SQLite cache) pointer"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+# Lane C Phase 1 — Progress Log
+
+## 2026-04-22 — Ralph iteration complete
+
+All 6 stories done. 38 new tests passing, coverage 87.34% (≥ 80% floor).
+
+## Conventions observed
+- Migration pattern: parallax/migrations/m00NN_name.py exports STATEMENTS list + up(conn)/down(conn). Register in parallax/migrations/__init__.py MIGRATIONS list + _MIGRATION_MODULES dict.
+- Route pattern: APIRouter(prefix=..., tags=..., dependencies=[Depends(require_auth)]). Register via app.include_router() in parallax/server/app.py create_app().
+- Auth: require_auth from parallax.server.auth handles both single-token and multi-user modes; current_user_id(request, fallback) resolves authenticated principal.
+- Testing: pytest; tests live in tests/, tests/server/, tests/integration/; coverage gate 80% enforced in pyproject.toml addopts.
+- Existing MEMORY.md uses `# Section` markdown headers (H1). Companion files use `---\nname:\ndescription:\ntype:\n---\nbody` YAML-ish frontmatter.
+- `parallax/ingest.py` exists as a module — could not make `parallax/ingest/` a package. Put memory_md logic at top-level `parallax/memory_md.py` instead.
+- Hook timeout in settings.json is in SECONDS (e.g. "timeout": 5 is 5s), not ms. Used timeout: 2 for regenerate hook.
+
+## Stories
+- [x] D1 — m0010 memory_cards migration (parallax/migrations/m0010_memory_cards.py; 5 tests)
+- [x] D2 — parallax/memory_md.py parser + ingest (parallax/memory_md.py; 10 tests)
+- [x] D3 — GET /export/memory_md endpoint (parallax/server/routes/export.py + schemas.py + app.py; 6 tests)
+- [x] D4 — privacy filter (embedded in parallax/memory_md.py; 8 tests) — applied at both ingest and export
+- [x] D5 — hook script regenerate.py (C:/Users/user/.claude/scripts/parallax_memory/regenerate.py; 9 tests)
+- [x] D6 — settings.json hook registration + docs/lane-c-phase1.md
+
+## End-to-end check
+Real MEMORY.md ingest: 8 cards (2 privacy-filtered because their bodies contain the substring "token" — longmemeval project card and v0.6 arch card). Category distribution after filter: user×1, project×2, feedback×3, reference×2.
+
+Smoke: `python C:/Users/user/.claude/scripts/parallax_memory/regenerate.py` with Parallax down → exit 0 in ~156ms. No preview written, no stdout, no stderr.
+
+## Coverage
+- parallax/memory_md.py: 96%
+- parallax/server/routes/export.py: 100%
+- parallax/migrations/m0010_memory_cards.py: covered via schema tests
+- Overall 87.34% (gate 80%)
+
+## Design decisions (resolved)
+1. `parallax/ingest/` package collision — used top-level `parallax/memory_md.py` instead.
+2. Privacy filter: substring match as specified. `token` in body filters the longmemeval card (expected per spec).
+3. Hook script: stdlib-only; kwargs on main() for test injection; Phase 2 guard logs 'phase2_not_enabled' if someone sets DRY_RUN=0.
+4. Export rendering: name field from DB (companion frontmatter name), not the MEMORY.md link label — round-trip correct for re-ingest.
+5. conftest.py guards coverage gate for test_regenerate.py-only runs (script lives outside the parallax package; covering it would not move the parallax coverage number anyway, and we didn't want test-file-scoped runs to fail the gate).
+
+## Pre-existing unrelated failures (out of scope)
+- tests/smoke/test_reproduce.py — 8 failures (pre-existing before this ralph run)
+- tests/test_longmemeval_parse_verdict.py — 1 failure (pre-existing)
+- tests/test_longmemeval_no_memory.py — 2 errors (pre-existing)
+- tests/test_llm_call_keys.py — 1 failure (pre-existing)

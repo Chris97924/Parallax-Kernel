@@ -1,0 +1,36 @@
+{
+  "title": "Lane C Phase 1 — Reviewer-flagged blocker fixes",
+  "context": "Two blockers surfaced by the independent 2-agent review (code-reviewer + verifier) on 2026-04-22 against the freshly-shipped Lane C Phase 1 work. Scope: fix them, prove they're fixed with new RED→GREEN tests, keep the existing 38 Lane C tests green, keep the repo's 80% coverage floor intact. Do NOT expand scope to the other review findings (ruff B008 is a pre-existing codebase pattern; SHA-1 card_id, thicker privacy filter, hardcoded test paths are follow-up work outside this PRD). Rules: TDD RED→GREEN→REFACTOR, immutability, KISS/DRY/YAGNI, type hints, ruff clean on touched files.",
+  "stories": [
+    {
+      "id": "F1",
+      "title": "Block path traversal in ingest_memory_md companion resolution",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/memory_md.py ingest_memory_md: after constructing companion_path = companion_dir / entry.filename, validate that companion_path.resolve() is inside companion_dir.resolve() (use Path.is_relative_to on Python 3.11+)",
+        "When the resolved path escapes companion_dir, the entry is skipped and its filename appended to report.skipped_malformed (NOT skipped_privacy, NOT skipped_missing_companion — malformed is the right bucket because the filename itself is illegal input)",
+        "Guard applies BEFORE companion_path.exists() check so a crafted '../something' filename cannot trigger arbitrary-file existence probes either",
+        "tests/test_memory_md_path_traversal.py (new file): test_filename_with_parent_escape_rejected (filename='../escape.md' → skipped_malformed contains '../escape.md'), test_absolute_path_filename_rejected (filename='/etc/passwd' or 'C:/windows/win.ini' on Windows → skipped), test_benign_relative_filename_still_ingests (filename='user_ok.md' in the same dir → ingested normally), test_symlink_escape_rejected is OPTIONAL (skip on Windows without symlink privileges)",
+        "All tests in the new file plus the existing 10 tests in tests/integration/test_ingest_memory_md.py still pass",
+        "Ruff check on parallax/memory_md.py remains clean (no new violations introduced)"
+      ]
+    },
+    {
+      "id": "F2",
+      "title": "Atomic transaction wrapper around ingest_memory_md card loop (eliminate TOCTOU + partial-ingest risk)",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/memory_md.py ingest_memory_md: replace the per-row conn.commit() with a single transaction wrapping the entire entry loop. Use the same manual BEGIN IMMEDIATE / COMMIT / ROLLBACK pattern as parallax/migrations/__init__.py _manual_tx (or a context manager factored from it) — NOT conn.executescript and NOT the implicit autocommit that sqlite3 applies",
+        "The pre-check SELECT (detect insert vs update) and the ON CONFLICT upsert for a given row MUST execute inside the same transaction so a concurrent writer cannot mis-classify the two",
+        "On any exception inside the loop, the whole transaction is rolled back — partial ingest state is never committed. The exception is re-raised so callers see the failure (this is a change in observable behaviour compared to the old per-row commit; we accept that).",
+        "report.cards_inserted + cards_updated still accurately reflect what landed in the DB (they should equal the number of new-primary-key rows + conflict-update rows that survived the transaction)",
+        "tests/test_memory_md_atomicity.py (new file): test_ingest_is_atomic_on_failure — arrange a companion that parses OK but whose CompanionFile body triggers a monkeypatched conn.execute to raise on the 2nd row; assert that AFTER the call, the memory_cards table contains ZERO rows for that user (not 1), and the ValueError propagates. test_single_transaction_round_trip — monkeypatch conn.execute to count BEGIN/COMMIT pairs; assert exactly one of each for a 3-entry ingest. test_concurrent_update_not_misclassified (skip if sqlite3 on this Python build lacks WAL support) — optional.",
+        "All 10 existing tests in tests/integration/test_ingest_memory_md.py still pass, including test_idempotent_ingest (the idempotency contract is preserved: second ingest_memory_md call produces cards_inserted=0, cards_updated=N)",
+        "No partial-state regression: after a simulated mid-run crash, the DB rows are all-or-nothing",
+        "Ruff check on parallax/memory_md.py remains clean"
+      ]
+    }
+  ]
+}

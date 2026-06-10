@@ -1,0 +1,103 @@
+{
+  "title": "Phase B — GA (post-hackathon scaffold)",
+  "context": "Phase B (B1-B7) from the 2026-04-18/19 3-Lane roadmap. Scope: ship deploy artifacts, multi-user auth, web viewer, cloud backup, pipx install path, and open-source docs. External-account items (Railway/Fly deploy, Cloudflare cert, S3 bucket) ship as templates + dry-run validated configs, NOT live deployments. License is MIT (already set). All stories must keep the 80% coverage floor and keep existing Phase A server tests green.",
+  "stories": [
+    {
+      "id": "B1",
+      "title": "Cloud deploy artifacts (Dockerfile + fly.toml + deploy docs)",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Dockerfile at repo root builds parallax-server image from Python 3.11-slim, installs .[server], CMD runs `parallax serve --host 0.0.0.0 --port 8080`",
+        "deploy/fly.toml present with [http_service] port=8080, internal_port=8080, health check on /healthz (interval+timeout), PARALLAX_DB_PATH volume mount",
+        "deploy/railway.json template present as alternative PaaS target",
+        "docs/deploy.md documents fly.io + railway deploy steps, env var list (PARALLAX_TOKEN, PARALLAX_DB_PATH, etc.)",
+        "fly.toml structural check: required sections [app], [http_service], [[mounts]] present"
+      ]
+    },
+    {
+      "id": "B2",
+      "title": "TLS templates (Caddyfile + Cloudflare tunnel config + docs)",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "deploy/Caddyfile template with reverse-proxy to 127.0.0.1:8080 + automatic HTTPS block",
+        "deploy/cloudflared.yml template with ingress rule mapping public hostname → localhost:8080",
+        "docs/tls.md covers both Caddy-direct and Cloudflare-tunnel paths, explains when to pick which",
+        "cloudflared.yml passes YAML structural check (tunnel/credentials-file/ingress fields present)"
+      ]
+    },
+    {
+      "id": "B3",
+      "title": "Multi-user token scheme (token ↔ user_id binding)",
+      "priority": 3,
+      "passes": true,
+      "acceptanceCriteria": [
+        "Migration m0009 adds table api_tokens(token_hash TEXT PK, user_id TEXT NOT NULL, created_at TEXT NOT NULL, revoked_at TEXT, label TEXT)",
+        "parallax/server/auth.py extended: when PARALLAX_MULTI_USER=1, bearer token is looked up against api_tokens and returns user_id principal (falls back to single-token mode when env unset)",
+        "Request state carries authenticated user_id; ingest/query routes use it to scope writes/reads (no cross-user leak)",
+        "CLI: `parallax token create --user-id <id> [--label L]` prints new token once, `parallax token list`, `parallax token revoke <token_hash_prefix>`",
+        "Token stored as sha256 hash only; plaintext token shown to user once at creation",
+        "tests/server/test_multi_user_auth.py covers: token create→validate, wrong-token→401, revoked-token→401, cross-user isolation (user A cannot read user B claims via /query), single-token mode still works when PARALLAX_MULTI_USER unset"
+      ]
+    },
+    {
+      "id": "B4",
+      "title": "Web viewer (raw events / claims / retrieval path)",
+      "priority": 4,
+      "passes": true,
+      "acceptanceCriteria": [
+        "New module parallax/server/viewer.py mounts GET /viewer/ serving a single-page HTML with 3 tabs",
+        "Tab 'events': GET /viewer/events.json reads parallax.replay.replay_events (or sqlite_store directly), returns last N events JSON; UI lists them in a table",
+        "Tab 'claims': GET /viewer/claims.json reads claims_by_user, returns claim rows; UI lists subject/predicate/object/confidence",
+        "Tab 'retrieve': GET /viewer/retrieve?q=... calls explain_retrieve and returns the RetrievalTrace JSON; UI renders stages + near_miss notes",
+        "Viewer is gated behind same auth dep (require_auth) and PARALLAX_VIEWER_ENABLED env (default 0 in production, 1 in dev)",
+        "retrieve.json `kind` param uses Literal allow-list (FastAPI 422 on unknown kinds instead of 500)",
+        "tests/server/test_viewer.py: GET /viewer/ returns 200 + HTML, /viewer/events.json returns seeded event, /viewer/retrieve?q=... returns trace structure, auth still enforced"
+      ]
+    },
+    {
+      "id": "B5",
+      "title": "pipx install path",
+      "priority": 5,
+      "passes": true,
+      "acceptanceCriteria": [
+        "pyproject.toml [project.scripts] entry `parallax` exists",
+        "pyproject.toml [project.optional-dependencies] 'server' extra includes fastapi + uvicorn",
+        "README 'Install' section documents `pipx install 'parallax-kernel[server]'` as the recommended user path",
+        "docs/install.md lists pipx requirements (Python 3.11+, pipx itself) and common troubleshooting",
+        "Build wheel succeeds: `python -m build` produces dist/parallax_kernel-*.whl",
+        "Smoke: installing the built wheel into a fresh venv then running `parallax --help` exits 0"
+      ]
+    },
+    {
+      "id": "B6",
+      "title": "Cloud backup/restore (S3-compatible)",
+      "priority": 6,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/backup.py extended with `upload_to(archive_path, destination_uri)` supporting s3://bucket/key; uses boto3 if installed (optional dep [cloud])",
+        "CLI: `parallax backup --to s3://bucket/key` uploads after local archive + then optionally removes local tmp",
+        "CLI: `parallax restore --from s3://bucket/key` downloads to tmp then restores",
+        "pyproject.toml [project.optional-dependencies] gets a 'cloud' extra with boto3>=1.34",
+        "tests/test_backup_cloud.py uses moto (or monkeypatch boto3 client) to verify upload→download round-trip is bit-identical",
+        "Docs section in docs/deploy.md documents AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / custom endpoint (for Backblaze B2, Cloudflare R2) env vars"
+      ]
+    },
+    {
+      "id": "B7",
+      "title": "GitHub open source polish (CONTRIBUTING + ARCHITECTURE + mkdocs site)",
+      "priority": 7,
+      "passes": true,
+      "acceptanceCriteria": [
+        "CONTRIBUTING.md at repo root: dev setup (venv + pip install -e .[dev]), test commands (pytest + coverage floor), ADR workflow reference, PR checklist (tests, coverage, ruff clean, CHANGELOG entry)",
+        "ARCHITECTURE.md at repo root: 3-layer data flow (capture → compress → retrieve), 6-object schema diagram in ASCII, hub-and-spoke v0.6 server layout, retrieval API surface, pointer to docs/adr/ for ADRs",
+        "mkdocs.yml at repo root with material theme, nav covering: Home, Install, Architecture, Deploy, ADRs index",
+        "docs/ structure for mkdocs: docs/index.md, docs/install.md, docs/architecture.md, docs/deploy.md, docs/tls.md, docs/adr/index.md listing all ADRs",
+        "`pip install mkdocs mkdocs-material && mkdocs build --strict` completes without errors",
+        "LICENSE (already MIT) referenced from CONTRIBUTING.md",
+        "CHANGELOG.md gets a new unreleased section listing B1-B7 entries"
+      ]
+    }
+  ]
+}

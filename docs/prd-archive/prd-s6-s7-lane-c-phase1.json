@@ -1,0 +1,38 @@
+{
+  "title": "Lane C Phase 1 — Stability hardening (S6 + S7) before Phase 2 switchover",
+  "context": "Lane C Phase 1 shipped + two reviewer blockers fixed. Before the 7-day observation window ends and Phase 2 flips the .preview→live switch, two stability defects would cause silent data corruption at switchover: (1) the substring-based privacy filter has a real false-positive rate against Chris's actual MEMORY.md (2 out of 10 cards wrongly blocked because the word 'token' appears in prose), and (2) the hook's preview writes are not atomic and Phase 2 has no health-ground-truth file to check. This PRD fixes both, narrowly. Explicit non-goals: S1 (ingest auto-sync) and S3 (preview staleness metadata) are recorded as follow-ups — they need schema changes + new HTTP endpoints and should be a separate PRD before Phase 2 actually flips. Rules: TDD RED→GREEN→REFACTOR, immutability, KISS/DRY/YAGNI, type hints, ruff clean, coverage floor 80%.",
+  "stories": [
+    {
+      "id": "S7",
+      "title": "Privacy filter: body-only + pattern-based (fix false-positive on 'token' prose)",
+      "priority": 1,
+      "passes": true,
+      "acceptanceCriteria": [
+        "parallax/memory_md.py: keep SECRET_KEYWORDS and contains_secret as they are (don't break other callers); add a NEW helper body_looks_like_secret(body: str) -> bool that uses a compiled regex, not substring match",
+        "The new regex matches a secret-looking key=value or key:value pattern: case-insensitive trigger word (password|token|api[-_]?key|api[-_]?token|secret|credential|private[-_]?key|\\.env) followed by optional whitespace, then ':' or '=' or ': ', then optional whitespace, then a high-entropy-looking value of 8+ consecutive [\\w\\-./+] chars. Examples it MUST match: 'password: hunter2xyz', 'PASSWORD=abc12345', 'token: ghp_abc123def456', 'api_key = sk-xyzabc789', 'api-key: abc123def456', 'credential: admin_secret_xyz', 'private_key = -----BEGIN', '.env=secret_value_123', 'SECRET=xyz123abc'.",
+        "Examples the new regex MUST NOT match (previously mis-flagged by substring filter): 'token 月度 cap lesson', 'API key rotation policy doc', 'secret santa gift list', 'password reset flow', 'credential store documentation', '.env file should not be committed', 'Hub-and-spoke HTTP server'",
+        "ingest_memory_md: replace the old `contains_secret(entry.description) or contains_secret(companion.body) or contains_secret(companion.name)` check with a body-ONLY pattern check: `body_looks_like_secret(companion.body)`. Rationale recorded in the function docstring: name/description/title cannot plausibly be a secret; filter scope narrows to body where user might paste code.",
+        "Exports route (parallax/server/routes/export.py) updates its belt-and-braces filter the same way: check `body_looks_like_secret(c['body'])` only; drop the name/description checks there. Do NOT remove the belt-and-braces check itself — keep it at export time for defense-in-depth.",
+        "tests/test_privacy_filter_v2.py (new): test_pattern_matches_real_secrets (8 positive cases covering each trigger word), test_pattern_rejects_prose_mentions (7 negative cases including 'token 月度 cap lesson'), test_body_only_scope (a card with name='secret_xyz' passes because name is no longer checked; a card with body='password=hunter2xyz' fails), test_real_chris_memory_md_no_false_positives (skipif not on Chris host — ingest the real MEMORY.md and assert all 10 entries land as cards or missing-companion, NONE in skipped_privacy)",
+        "Back-compat: existing tests/test_privacy_filter.py behaviour may change — if a test there encodes the old substring-based behaviour (e.g. 'tokenization' gets filtered because it contains 'token'), UPDATE that test's assertion to reflect the new behaviour and leave a comment that says the substring filter was intentionally removed for being too aggressive. Do NOT delete tests.",
+        "All tests pass under `cd E:/Parallax && python -m pytest tests/test_privacy_filter.py tests/test_privacy_filter_v2.py tests/integration/test_ingest_memory_md.py tests/server/test_export.py tests/test_memory_md_path_traversal.py tests/test_memory_md_atomicity.py tests/test_memory_card_schema.py tests/test_regenerate.py --no-cov -v`. Coverage gate still passes on full suite."
+      ]
+    },
+    {
+      "id": "S6",
+      "title": "regenerate.py: atomic preview rename + last-run.json health file",
+      "priority": 2,
+      "passes": true,
+      "acceptanceCriteria": [
+        "C:/Users/user/.claude/scripts/parallax_memory/regenerate.py: write_preview now writes to a '.preview.tmp' in the same directory, then os.replace() to the final '.preview' path. On Windows os.replace is atomic (same-drive rename). Crash mid-write leaves the previous .preview untouched — never a half file.",
+        "Same atomic-rename contract for every companion .preview file written. If the companion body write fails, the orchestrating main() function catches the OSError, logs to last-run.json with ok=false, and returns 0 (fail-silent contract unchanged).",
+        "New file on disk at C:/Users/user/.claude/scripts/parallax_memory/last-run.json after every hook invocation. Schema: {\"timestamp\": ISO-8601 UTC, \"ok\": bool, \"reason\": str, \"cards_written\": int, \"elapsed_ms\": int, \"parallax_reachable\": bool}. Atomic-write that file the same way (tmp + os.replace).",
+        "'reason' values are enumerated: 'ok' | 'token_missing' | 'parallax_unreachable' | 'timeout' | 'http_error' | 'json_error' | 'write_error' | 'phase2_not_enabled'. Any unexpected exception becomes reason='unexpected:<type>'.",
+        "Every existing silent-exit path in main() now writes last-run.json before returning 0. No exception ever propagates out of main() — same fail-silent contract as Phase 1.",
+        "tests/test_regenerate_atomic.py (new): test_write_preview_uses_atomic_replace (monkeypatch os.replace and assert it's called once per preview file, not Path.write_text → final path directly), test_last_run_json_on_success (main returns 0 + last-run.json has ok=true reason=ok cards_written>=1), test_last_run_json_on_parallax_down (connection refused → last-run.json has ok=false reason=parallax_unreachable), test_last_run_json_on_timeout (socket.timeout → reason=timeout), test_last_run_json_on_missing_token (token file absent → reason=token_missing), test_last_run_json_on_phase2_flag (PARALLAX_REGEN_DRY_RUN=0 → reason=phase2_not_enabled, ok=false), test_half_write_recovery (monkeypatch write_text on the tmp to raise after the tmp is written but before replace → assert final .preview is the OLD content, NOT corrupted).",
+        "All 9 existing tests in tests/test_regenerate.py still pass (they were written against the kwargs-injection contract which is unchanged).",
+        "Hook still exits 0 in <2 seconds when Parallax is down (smoke test): `time python C:/Users/user/.claude/scripts/parallax_memory/regenerate.py` with Parallax down."
+      ]
+    }
+  ]
+}

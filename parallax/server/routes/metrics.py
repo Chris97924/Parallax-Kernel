@@ -307,20 +307,35 @@ def _format_prometheus_labels(labels: dict[str, str]) -> str:
     return "{" + ",".join(rendered) + "}"
 
 
-def _render_aphelion_total() -> str:
-    """Expose the live prometheus_client Aphelion counter without duplicating gauges."""
+def _render_default_registry_counter(name: str) -> str:
+    """Render a live prometheus_client Counter from the DEFAULT registry as text.
+
+    ``name`` is the Counter's *base* name (no ``_total`` suffix), e.g.
+    ``"parallax_aphelion"`` or ``"parallax_canary_shadow_attempts"``. The
+    matching collector exposes a ``<name>_total`` sample per label-set; this
+    renders the HELP/TYPE header plus every sample line in Prometheus text
+    format, preserving all labels via ``_format_prometheus_labels``.
+
+    Counters incremented into ``prometheus_client.REGISTRY`` (the default
+    registry) are otherwise invisible to ``/metrics``: ``_build_payload``
+    serializes a *fresh* ``CollectorRegistry``, so default-registry series
+    must be plucked out explicitly. Returns ``""`` when the metric is not
+    registered (e.g. no observation yet), matching the prior aphelion
+    special-case behavior byte-for-byte.
+    """
+    total_name = f"{name}_total"
     for metric in REGISTRY.collect():
-        if metric.name != "parallax_aphelion":
+        if metric.name != name:
             continue
         lines = [
-            f"# HELP parallax_aphelion_total {metric.documentation}",
-            "# TYPE parallax_aphelion_total counter",
+            f"# HELP {total_name} {metric.documentation}",
+            f"# TYPE {total_name} counter",
         ]
         for sample in metric.samples:
-            if sample.name != "parallax_aphelion_total":
+            if sample.name != total_name:
                 continue
             labels = _format_prometheus_labels(sample.labels)
-            lines.append(f"parallax_aphelion_total{labels} {sample.value}")
+            lines.append(f"{total_name}{labels} {sample.value}")
         return "\n".join(lines) + "\n"
     return ""
 
@@ -452,7 +467,21 @@ def _build_payload() -> str:
     )
     policy_gauge.labels(policy_version=POLICY_VERSION_DEFAULT).set(1.0)
 
-    return generate_latest(reg).decode("utf-8") + _render_aphelion_total()
+    # Default-registry Counters that bypass the fresh CollectorRegistry above.
+    # ``parallax_aphelion`` is the M4 split counter; the two
+    # ``parallax_canary_shadow_*`` counters are incremented by
+    # ``parallax.canary_shadow.observe`` into the DEFAULT registry and would
+    # otherwise never appear in a scrape (the M4 canary observability blind
+    # spot). Render each explicitly via the same helper.
+    default_registry_counters = "".join(
+        _render_default_registry_counter(name)
+        for name in (
+            "parallax_aphelion",
+            "parallax_canary_shadow_attempts",
+            "parallax_canary_shadow_outcomes",
+        )
+    )
+    return generate_latest(reg).decode("utf-8") + default_registry_counters
 
 
 @router.get("/metrics", response_class=PlainTextResponse)

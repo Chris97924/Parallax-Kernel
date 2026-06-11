@@ -445,3 +445,124 @@ def test_build_payload_skips_keys_that_sanitize_to_empty(
     finally:
         for k in bad_keys:
             registry.pop(k, None)
+
+
+# ---------------------------------------------------------------------------
+# M4 canary shadow counters surface through /metrics (default-registry pluck)
+# ---------------------------------------------------------------------------
+#
+# Regression guard for the production bug found during the first deploy of the
+# canary shadow observer (Stage-1 entry 2026-06-11): ``canary_shadow.observe``
+# increments two Counters into the prometheus_client DEFAULT registry, but
+# ``_build_payload`` serializes a *fresh* CollectorRegistry, so the counters
+# incremented invisibly and ``/metrics`` emitted no ``parallax_canary_shadow_*``
+# samples. PR #59's tests asserted via ``REGISTRY.get_sample_value`` (default
+# registry, in-process) and never through the endpoint — that was the blind
+# spot. These tests scrape the live endpoint body to close it.
+
+
+def _force_canary_observation(
+    monkeypatch: pytest.MonkeyPatch, *, outcome: str = "diverge"
+) -> tuple[str, str]:
+    """Drive exactly one canary observation through ``canary_shadow.observe``.
+
+    Sets ``PARALLAX_CANARY_SHADOW_FRACTION=1.0`` and pins ``random.random``
+    to 0.0 so the per-request RNG gate always samples, then observes a
+    non-``skipped`` ``DualReadResult``. Returns the ``(user_id, traffic_source)``
+    label pair used so the caller can assert on the exact label-set.
+    """
+    from typing import cast
+
+    from parallax import canary_shadow
+    from parallax.retrieval.contracts import RetrievalEvidence
+    from parallax.router.contracts import DualReadResult
+    from parallax.router.discrepancy_live import DualReadOutcome
+
+    monkeypatch.setenv("PARALLAX_CANARY_SHADOW_FRACTION", "1.0")
+    monkeypatch.setattr(canary_shadow.random, "random", lambda: 0.0)
+
+    evidence = RetrievalEvidence(hits=({"id": "x", "kind": "memory"},), stages=("test",))
+    result = DualReadResult(
+        outcome=cast(DualReadOutcome, outcome),
+        primary=evidence,
+        secondary=evidence,
+        correlation_id="corr-metrics-endpoint",
+        latency_primary_ms=1.0,
+        latency_secondary_ms=1.0,
+        aphelion_unreachable_reason=None,
+    )
+    user_id = "metrics-endpoint-user"
+    traffic_source = "synthetic"
+    canary_shadow.observe(result, user_id=user_id, traffic_source=traffic_source)
+    return user_id, traffic_source
+
+
+def test_metrics_exposes_canary_shadow_counters(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real canary observation surfaces both counters with correct labels.
+
+    The counters live in the prometheus_client DEFAULT registry; the bug was
+    that ``_build_payload`` never plucked them out (unlike the aphelion
+    counter). Assert the HELP/TYPE headers AND a value line carrying every
+    label for both ``attempts`` and ``outcomes``.
+    """
+    user_id, traffic_source = _force_canary_observation(monkeypatch, outcome="diverge")
+
+    body = client.get("/metrics").text
+
+    # HELP / TYPE headers present for both counters.
+    assert "# HELP parallax_canary_shadow_attempts_total " in body
+    assert "# TYPE parallax_canary_shadow_attempts_total counter" in body
+    assert "# HELP parallax_canary_shadow_outcomes_total " in body
+    assert "# TYPE parallax_canary_shadow_outcomes_total counter" in body
+
+    # attempts labels: stage / user_id / traffic_source (sorted by _format_prometheus_labels).
+    attempts_line = (
+        f'parallax_canary_shadow_attempts_total{{stage="s4",'
+        f'traffic_source="{traffic_source}",user_id="{user_id}"}}'
+    )
+    assert any(ln.startswith(attempts_line) for ln in body.splitlines()), (
+        f"missing attempts sample line in:\n{body}"
+    )
+
+    # outcomes labels add `outcome`; the observed result was a diverge.
+    outcomes_line = (
+        f'parallax_canary_shadow_outcomes_total{{outcome="diverge",stage="s4",'
+        f'traffic_source="{traffic_source}",user_id="{user_id}"}}'
+    )
+    assert any(ln.startswith(outcomes_line) for ln in body.splitlines()), (
+        f"missing outcomes sample line in:\n{body}"
+    )
+
+
+def test_metrics_canary_counter_value_increments_through_endpoint(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scraped sample value tracks the number of observations.
+
+    Two observations of the same label-set must render a value of >= 2.0
+    through the endpoint (default registry is process-global, so other tests
+    may have incremented the same series — assert monotone-after-delta rather
+    than an absolute equality).
+    """
+    user_id, traffic_source = _force_canary_observation(monkeypatch, outcome="match")
+
+    def _scraped_attempts() -> float:
+        body = client.get("/metrics").text
+        prefix = (
+            f'parallax_canary_shadow_attempts_total{{stage="s4",'
+            f'traffic_source="{traffic_source}",user_id="{user_id}"}} '
+        )
+        for ln in body.splitlines():
+            if ln.startswith(prefix):
+                return float(ln[len(prefix) :])
+        raise AssertionError(f"attempts sample not found in:\n{body}")
+
+    before = _scraped_attempts()
+
+    # One more observation; reuse the already-patched RNG + env via the helper.
+    _force_canary_observation(monkeypatch, outcome="match")
+    after = _scraped_attempts()
+
+    assert after == pytest.approx(before + 1.0), f"{before} -> {after}"

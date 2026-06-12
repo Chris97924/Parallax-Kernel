@@ -91,7 +91,8 @@ def test_flag_off_is_byte_identical_to_lexical(monkeypatch):
 @pytest.fixture()
 def _flag_on(monkeypatch):
     monkeypatch.setenv(SEMANTIC_RETRIEVAL_ENV, "1")
-    # No PARALLAX_EMBEDDING_BASE_URL → factory yields the offline stub.
+    # No PARALLAX_EMBEDDING_BASE_URL → no live provider → degrades to lexical
+    # (stub vectors must not participate in production ranked fusion).
     monkeypatch.delenv("PARALLAX_EMBEDDING_BASE_URL", raising=False)
 
 
@@ -157,10 +158,45 @@ def test_flag_on_empty_store_returns_empty(_flag_on):
     assert transcript == ""
 
 
-def test_flag_on_degrades_to_lexical_on_provider_error(_flag_on, monkeypatch):
-    """A failing embedding provider must not crash retrieval (lexical-only)."""
+def test_flag_on_no_live_provider_degrades_to_lexical(_flag_on):
+    """FLAG ON but no BASE_URL → output is byte-identical to lexical path.
+
+    Stub dense vectors must not participate in ranked RRF fusion — hash-random
+    vectors at equal weight can drop strong lexical matches from top_k.
+    """
+    from parallax.retrieval.config import SEMANTIC_RETRIEVAL_ENV
+
+    q = _fixture_question()
+
+    # Baseline: flag OFF (pure lexical).
+    import os
+
+    with ephemeral_store() as conn:
+        ingest_question(conn, q)
+        old_val = os.environ.pop(SEMANTIC_RETRIEVAL_ENV, None)
+        try:
+            lexical_out = build_from_parallax_retrieval(conn, q)
+        finally:
+            if old_val is not None:
+                os.environ[SEMANTIC_RETRIEVAL_ENV] = old_val
+
+    # Flag ON, no BASE_URL → must equal lexical.
+    with ephemeral_store() as conn:
+        ingest_question(conn, q)
+        hybrid_out = build_from_parallax_retrieval(conn, q)
+
+    assert hybrid_out == lexical_out
+
+
+def test_flag_on_degrades_to_lexical_on_provider_error(monkeypatch):
+    """A failing live embedding provider must not crash retrieval (degrades to lexical)."""
     from eval.longmemeval import store as store_mod
     from parallax.retrieval.embeddings import EmbeddingError
+
+    monkeypatch.setenv("PARALLAX_SEMANTIC_RETRIEVAL", "1")
+    # Set a BASE_URL so has_live_embedding_provider() returns True and the hybrid
+    # path is entered; then the boom provider simulates the Ollama call failing.
+    monkeypatch.setenv("PARALLAX_EMBEDDING_BASE_URL", "http://127.0.0.1:11434")
 
     class _BoomProvider:
         dim = 3

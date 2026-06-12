@@ -13,6 +13,7 @@ retrieval without changing this surface.
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -22,11 +23,13 @@ from typing import Iterator
 
 from parallax import ingest_memory, memories_by_user, migrate_to_latest
 from parallax.retrieval.config import semantic_retrieval_enabled
-from parallax.retrieval.embeddings import get_embedding_provider
+from parallax.retrieval.embeddings import get_embedding_provider, has_live_embedding_provider
 from parallax.retrieval.semantic import hybrid_rank
 from parallax.sqlite_store import connect
 
 from eval.longmemeval.dataset import Question
+
+logger = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -119,11 +122,29 @@ def _select_rows_lexical(question: str, rows: list[dict], top_k: int) -> list[di
 def _select_rows_hybrid(question: str, rows: list[dict], top_k: int) -> list[dict]:
     """Hybrid lexical + dense (RRF) selection — M8 path (flag ON).
 
-    Embeds ``title + summary`` per row via the env-configured provider (stub
-    offline, bge-m3 on GB10), fuses with lexical ranking, keeps top_k. Ties
-    break on vault_path ascending — same determinism contract as the lexical
-    path. A dense-side failure degrades to lexical-only inside ``hybrid_rank``.
+    When a live embedding provider is configured (``PARALLAX_EMBEDDING_BASE_URL``
+    is set), embeds ``title + summary`` per row via bge-m3 on GB10 and fuses
+    with lexical ranking via RRF. Ties break on vault_path ascending — same
+    determinism contract as the lexical path.
+
+    When no live provider is configured, falls back to lexical-only rather than
+    fusing hash-random stub vectors into ranked results (stub fused at equal RRF
+    weight can push exact lexical hits out of ``top_k``).
+
+    A dense-side failure during a live call degrades to lexical-only inside
+    ``hybrid_rank``.
     """
+    if not has_live_embedding_provider():
+        # No live Ollama URL — stub vectors carry no semantic signal.  Running
+        # RRF fusion with a hash-random provider can corrupt retrieval results
+        # by pushing strong lexical matches out of top_k.  Degrade to the
+        # lexical path instead.
+        logger.debug(
+            "PARALLAX_EMBEDDING_BASE_URL not set; semantic retrieval "
+            "degrades to lexical-only (no stub fusion in production)"
+        )
+        return _select_rows_lexical(question, rows, top_k)
+
     texts = [f"{r.get('title') or ''} {r.get('summary') or ''}".strip() for r in rows]
     # Lower tie_break value wins; rank rows by vault_path so ties resolve the
     # same way the lexical path does (ascending vault_path).

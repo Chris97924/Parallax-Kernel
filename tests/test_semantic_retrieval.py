@@ -17,6 +17,7 @@ from parallax.retrieval.embeddings import (
     EmbeddingError,
     OllamaEmbeddingProvider,
     get_embedding_provider,
+    has_live_embedding_provider,
 )
 from parallax.retrieval.semantic import (
     RRF_K_DEFAULT,
@@ -374,6 +375,21 @@ def test_factory_returns_stub_without_base_url(monkeypatch):
     monkeypatch.delenv("PARALLAX_EMBEDDING_BASE_URL", raising=False)
     provider = get_embedding_provider()
     assert isinstance(provider, DeterministicStubProvider)
+
+
+def test_has_live_provider_false_without_base_url(monkeypatch):
+    monkeypatch.delenv("PARALLAX_EMBEDDING_BASE_URL", raising=False)
+    assert has_live_embedding_provider() is False
+
+
+def test_has_live_provider_true_with_base_url(monkeypatch):
+    monkeypatch.setenv("PARALLAX_EMBEDDING_BASE_URL", "http://gb10:11434")
+    assert has_live_embedding_provider() is True
+
+
+def test_has_live_provider_false_with_empty_base_url(monkeypatch):
+    monkeypatch.setenv("PARALLAX_EMBEDDING_BASE_URL", "   ")
+    assert has_live_embedding_provider() is False
 
 
 def test_factory_returns_ollama_with_base_url(monkeypatch):

@@ -34,6 +34,7 @@ __all__ = [
     "DeterministicStubProvider",
     "OllamaEmbeddingProvider",
     "get_embedding_provider",
+    "has_live_embedding_provider",
     "DEFAULT_OLLAMA_BASE_URL",
     "DEFAULT_EMBEDDING_MODEL",
     "STUB_DIM",
@@ -160,6 +161,21 @@ class OllamaEmbeddingProvider:
 
 _FACTORY_LOCK = threading.Lock()
 
+_EMBEDDING_BASE_URL_ENV = "PARALLAX_EMBEDDING_BASE_URL"
+
+
+def has_live_embedding_provider() -> bool:
+    """Return True when a live Ollama URL is configured in the environment.
+
+    Use this to guard code that should not run stub-backed dense retrieval in
+    production. When False, callers should degrade to lexical-only rather than
+    fusing hash-random stub vectors into ranked results.
+
+    Env:
+        PARALLAX_EMBEDDING_BASE_URL  Non-empty value selects the live path.
+    """
+    return bool(os.environ.get(_EMBEDDING_BASE_URL_ENV, "").strip())
+
 
 def get_embedding_provider() -> EmbeddingProvider:
     """Build a provider from the environment.
@@ -173,7 +189,7 @@ def get_embedding_provider() -> EmbeddingProvider:
         PARALLAX_EMBEDDING_BASE_URL  Ollama base URL (selects the live path).
         PARALLAX_EMBEDDING_MODEL     model name (default ``bge-m3``).
     """
-    base_url = os.environ.get("PARALLAX_EMBEDDING_BASE_URL", "").strip()
+    base_url = os.environ.get(_EMBEDDING_BASE_URL_ENV, "").strip()
     if not base_url:
         return DeterministicStubProvider()
     model = os.environ.get("PARALLAX_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL).strip()

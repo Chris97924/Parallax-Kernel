@@ -129,7 +129,15 @@ class OllamaEmbeddingProvider:
         return [self._embed_one(t) for t in texts]
 
     def _embed_one(self, text: str) -> list[float]:
-        import httpx  # type: ignore[import]  # lazy: stub path never imports httpx
+        # Lazy import: the stub path never imports httpx, and httpx lives in the
+        # [dev]/[extract] extras — not core deps. In a core install a missing
+        # httpx must surface as EmbeddingError so callers (hybrid_rank) degrade
+        # to lexical-only instead of crashing.
+        try:
+            import httpx  # type: ignore[import]
+        except ImportError as exc:
+            logger.warning("httpx unavailable for Ollama embeddings: %s", exc)
+            raise EmbeddingError("httpx not installed (pip install '.[extract]')") from exc
 
         payload = {"model": self.model, "prompt": text}
         try:

@@ -327,6 +327,44 @@ def test_ollama_provider_strips_trailing_slash():
     assert provider.base_url == "http://gb10:11434"
 
 
+def test_ollama_provider_missing_httpx_raises_embedding_error(monkeypatch):
+    # In a core install httpx is absent (it lives in the [dev]/[extract] extras).
+    # The lazy import failure must convert to EmbeddingError so hybrid_rank
+    # degrades to lexical-only instead of crashing.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "httpx":
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    provider = OllamaEmbeddingProvider(base_url="http://gb10:11434")
+    with pytest.raises(EmbeddingError):
+        provider.embed(["x"])
+
+
+def test_hybrid_rank_degrades_when_httpx_missing(monkeypatch):
+    # End-to-end: a missing httpx through the live provider must let
+    # hybrid_rank fall back to lexical-only (no crash).
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fake_import(name, *args, **kwargs):
+        if name == "httpx":
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    provider = OllamaEmbeddingProvider(base_url="http://gb10:11434")
+    texts = ["irrelevant", "tennis match recap"]
+    ranked = hybrid_rank("tennis", texts, provider)
+    assert ranked[0] == 1  # lexical-only ordering survives
+
+
 # ---------------------------------------------------------------------------
 # get_embedding_provider factory
 # ---------------------------------------------------------------------------

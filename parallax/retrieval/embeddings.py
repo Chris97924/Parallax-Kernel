@@ -1,0 +1,173 @@
+"""Embedding providers for M8 semantic retrieval.
+
+Two backends speak the :class:`EmbeddingProvider` protocol:
+
+* :class:`DeterministicStubProvider` — pure-stdlib, hash-seeded vectors. No
+  network. Used by every unit test and as the offline default so importing
+  this module never makes a network call.
+* :class:`OllamaEmbeddingProvider` — ``httpx`` against an Ollama server serving
+  ``bge-m3`` (1024-dim). Base URL is operator config (env, default GB10).
+
+:func:`get_embedding_provider` is the env-driven factory: it returns the stub
+unless ``PARALLAX_EMBEDDING_BASE_URL`` selects the live Ollama provider.
+
+``httpx`` is imported lazily inside :class:`OllamaEmbeddingProvider` so the
+stub path (and module import) carries no dependency on it being installed —
+mirroring how ``sentence-transformers`` is optional in
+``parallax.retrieval.retrievers``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+import os
+import random
+import threading
+from collections.abc import Sequence
+from typing import Protocol, runtime_checkable
+
+__all__ = [
+    "EmbeddingProvider",
+    "EmbeddingError",
+    "DeterministicStubProvider",
+    "OllamaEmbeddingProvider",
+    "get_embedding_provider",
+    "DEFAULT_OLLAMA_BASE_URL",
+    "DEFAULT_EMBEDDING_MODEL",
+    "STUB_DIM",
+    "BGE_M3_DIM",
+]
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_OLLAMA_BASE_URL = "http://192.168.1.134:11434"
+DEFAULT_EMBEDDING_MODEL = "bge-m3"
+STUB_DIM = 64
+BGE_M3_DIM = 1024
+
+
+class EmbeddingError(RuntimeError):
+    """Raised when an embedding backend cannot produce vectors.
+
+    Callers degrade to lexical-only on this error — a retrieval must never
+    crash because the embedding server is unreachable.
+    """
+
+
+@runtime_checkable
+class EmbeddingProvider(Protocol):
+    """Embeds text into fixed-dimension float vectors.
+
+    ``id`` is a stable identity used in the per-call embedding cache key so two
+    providers never share cached vectors. ``dim`` is the output dimensionality.
+    """
+
+    dim: int
+    id: str
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """Return one vector per input text, in order. May raise EmbeddingError."""
+        ...
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm == 0.0:
+        return vec
+    return [x / norm for x in vec]
+
+
+class DeterministicStubProvider:
+    """Hash-seeded deterministic embeddings — no network, stdlib only.
+
+    Same text → identical unit vector; different texts → different vectors.
+    Useful for tests and as the offline fallback when the flag is on but no
+    live provider is configured.
+    """
+
+    def __init__(self, *, dim: int = STUB_DIM) -> None:
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        self.dim = dim
+        self.id = f"stub-{dim}"
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return [self._embed_one(t) for t in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        seed_bytes = hashlib.blake2b((text or "").encode("utf-8"), digest_size=8).digest()
+        rng = random.Random(int.from_bytes(seed_bytes, "big"))
+        vec = [rng.gauss(0.0, 1.0) for _ in range(self.dim)]
+        return _l2_normalize(vec)
+
+
+class OllamaEmbeddingProvider:
+    """Embeddings from an Ollama server (default model ``bge-m3``, 1024-dim).
+
+    ``base_url`` is caller/operator-controlled and **not validated**. Do not
+    wire it to untrusted configuration — a malicious value could redirect the
+    request at an internal service (SSRF). Pin it in deployment code.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: str = DEFAULT_EMBEDDING_MODEL,
+        base_url: str = DEFAULT_OLLAMA_BASE_URL,
+        dim: int = BGE_M3_DIM,
+        timeout: float = 30.0,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.dim = dim
+        self.timeout = timeout
+        self.id = f"ollama:{model}@{self.base_url}"
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return [self._embed_one(t) for t in texts]
+
+    def _embed_one(self, text: str) -> list[float]:
+        import httpx  # type: ignore[import]  # lazy: stub path never imports httpx
+
+        payload = {"model": self.model, "prompt": text}
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/api/embeddings",
+                json=payload,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Ollama embedding request failed: %s", exc)
+            raise EmbeddingError(str(exc)) from exc
+
+        embedding = body.get("embedding") if isinstance(body, dict) else None
+        if not isinstance(embedding, list) or not embedding:
+            raise EmbeddingError(f"Ollama response missing 'embedding': {body!r:.120}")
+        return [float(x) for x in embedding]
+
+
+_FACTORY_LOCK = threading.Lock()
+
+
+def get_embedding_provider() -> EmbeddingProvider:
+    """Build a provider from the environment.
+
+    Returns :class:`OllamaEmbeddingProvider` when ``PARALLAX_EMBEDDING_BASE_URL``
+    is set (live path); otherwise the deterministic stub. Importing this module
+    or calling this factory never makes a network call — the Ollama provider
+    defers the HTTP client import until ``embed`` is invoked.
+
+    Env:
+        PARALLAX_EMBEDDING_BASE_URL  Ollama base URL (selects the live path).
+        PARALLAX_EMBEDDING_MODEL     model name (default ``bge-m3``).
+    """
+    base_url = os.environ.get("PARALLAX_EMBEDDING_BASE_URL", "").strip()
+    if not base_url:
+        return DeterministicStubProvider()
+    model = os.environ.get("PARALLAX_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL).strip()
+    with _FACTORY_LOCK:
+        return OllamaEmbeddingProvider(model=model or DEFAULT_EMBEDDING_MODEL, base_url=base_url)

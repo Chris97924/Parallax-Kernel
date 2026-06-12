@@ -21,6 +21,9 @@ from tempfile import TemporaryDirectory
 from typing import Iterator
 
 from parallax import ingest_memory, memories_by_user, migrate_to_latest
+from parallax.retrieval.config import semantic_retrieval_enabled
+from parallax.retrieval.embeddings import get_embedding_provider
+from parallax.retrieval.semantic import hybrid_rank
 from parallax.sqlite_store import connect
 
 from eval.longmemeval.dataset import Question
@@ -92,6 +95,48 @@ def dump_via_memories(conn: sqlite3.Connection, user_id: str) -> str:
     return "\n".join(f"{r['title']}\n{r['summary']}" for r in rows_sorted)
 
 
+def _select_rows_lexical(question: str, rows: list[dict], top_k: int) -> list[dict]:
+    """BM25-stub selection — the pre-M8 default path (flag OFF).
+
+    Score each row by lexical token overlap with the question, keep top_k.
+    Ties break on vault_path ascending so reruns are deterministic. Behavior
+    is byte-identical to the original inline implementation.
+    """
+    q_tokens = _tokenize(question)
+
+    def _score(row: dict[str, object]) -> float:
+        blob = f"{row.get('title') or ''} {row.get('summary') or ''}"
+        tokens = _tokenize(blob)
+        return len(q_tokens & tokens) / max(1, len(q_tokens))
+
+    scored: list[tuple[float, dict]] = [(_score(r), r) for r in rows]
+    # Primary: relevance descending. Secondary: vault_path ascending so
+    # zero-score ties (and any other ties) resolve deterministically.
+    scored.sort(key=lambda item: (-item[0], item[1].get("vault_path") or ""))
+    return [r for _, r in scored[:top_k]]
+
+
+def _select_rows_hybrid(question: str, rows: list[dict], top_k: int) -> list[dict]:
+    """Hybrid lexical + dense (RRF) selection — M8 path (flag ON).
+
+    Embeds ``title + summary`` per row via the env-configured provider (stub
+    offline, bge-m3 on GB10), fuses with lexical ranking, keeps top_k. Ties
+    break on vault_path ascending — same determinism contract as the lexical
+    path. A dense-side failure degrades to lexical-only inside ``hybrid_rank``.
+    """
+    texts = [f"{r.get('title') or ''} {r.get('summary') or ''}".strip() for r in rows]
+    # Lower tie_break value wins; rank rows by vault_path so ties resolve the
+    # same way the lexical path does (ascending vault_path).
+    order = sorted(range(len(rows)), key=lambda i: rows[i].get("vault_path") or "")
+    tie_break = [0.0] * len(rows)
+    for position, i in enumerate(order):
+        tie_break[i] = float(position)
+
+    provider = get_embedding_provider()
+    ranked_idx = hybrid_rank(question, texts, provider, tie_break=tie_break)
+    return [rows[i] for i in ranked_idx[:top_k]]
+
+
 def build_from_parallax_retrieval(
     conn: sqlite3.Connection,
     q: Question,
@@ -136,18 +181,10 @@ def build_from_parallax_retrieval(
     if not rows:
         return ""
 
-    q_tokens = _tokenize(q.question)
-
-    def _score(row: dict[str, object]) -> float:
-        blob = f"{row.get('title') or ''} {row.get('summary') or ''}"
-        tokens = _tokenize(blob)
-        return len(q_tokens & tokens) / max(1, len(q_tokens))
-
-    scored: list[tuple[float, dict]] = [(_score(r), r) for r in rows]
-    # Primary: relevance descending. Secondary: vault_path ascending so
-    # zero-score ties (and any other ties) resolve deterministically.
-    scored.sort(key=lambda item: (-item[0], item[1].get("vault_path") or ""))
-    kept = [r for _, r in scored[:top_k]]
+    if semantic_retrieval_enabled():
+        kept = _select_rows_hybrid(q.question, rows, top_k)
+    else:
+        kept = _select_rows_lexical(q.question, rows, top_k)
 
     # Restore chronological order for the emitted transcript — relevance is used
     # only to choose which rows survive the top_k + char budget.

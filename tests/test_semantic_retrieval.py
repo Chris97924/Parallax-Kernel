@@ -287,16 +287,58 @@ def test_ollama_provider_request_shape_and_parse(monkeypatch):
         captured["url"] = url
         captured["json"] = json
         captured["timeout"] = timeout
-        return _FakeResponse({"embedding": [0.1, 0.2, 0.3]})
+        return _FakeResponse({"embeddings": [[0.1, 0.2, 0.3]]})
 
     monkeypatch.setattr(httpx, "post", _fake_post)
-    provider = OllamaEmbeddingProvider(
-        model="bge-m3", base_url="http://gb10:11434", dim=3
-    )
+    provider = OllamaEmbeddingProvider(model="bge-m3", base_url="http://gb10:11434", dim=3)
     out = provider.embed(["hello"])
     assert out == [[0.1, 0.2, 0.3]]
-    assert captured["url"] == "http://gb10:11434/api/embeddings"
-    assert captured["json"] == {"model": "bge-m3", "prompt": "hello"}
+    # Modern Ollama: POST /api/embed with a batched `input` list, response
+    # `embeddings` is a list-of-vectors in input order.
+    assert captured["url"] == "http://gb10:11434/api/embed"
+    assert captured["json"] == {"model": "bge-m3", "input": ["hello"]}
+
+
+def test_ollama_provider_batch_yields_vectors_in_order(monkeypatch):
+    import httpx
+
+    captured = {}
+
+    def _fake_post(url, json, timeout):  # noqa: A002
+        captured["json"] = json
+        # One request for the whole batch; vectors returned in input order.
+        return _FakeResponse({"embeddings": [[1.0, 0.0], [0.0, 2.0], [3.0, 3.0]]})
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    provider = OllamaEmbeddingProvider(base_url="http://gb10:11434", dim=2)
+    out = provider.embed(["a", "b", "c"])
+    assert out == [[1.0, 0.0], [0.0, 2.0], [3.0, 3.0]]
+    # Single batched call carries every input.
+    assert captured["json"] == {"model": "bge-m3", "input": ["a", "b", "c"]}
+
+
+def test_ollama_provider_empty_texts_skips_http(monkeypatch):
+    import httpx
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("no HTTP call should fire for empty input")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+    provider = OllamaEmbeddingProvider(base_url="http://gb10:11434")
+    assert provider.embed([]) == []
+
+
+def test_ollama_provider_length_mismatch_raises_embedding_error(monkeypatch):
+    import httpx
+
+    def _fake_post(url, json, timeout):  # noqa: A002
+        # Two inputs but only one vector back — must not silently truncate.
+        return _FakeResponse({"embeddings": [[0.1, 0.2, 0.3]]})
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    provider = OllamaEmbeddingProvider(base_url="http://gb10:11434")
+    with pytest.raises(EmbeddingError):
+        provider.embed(["x", "y"])
 
 
 def test_ollama_provider_http_error_raises_embedding_error(monkeypatch):
@@ -315,7 +357,20 @@ def test_ollama_provider_bad_shape_raises_embedding_error(monkeypatch):
     import httpx
 
     def _fake_post(url, json, timeout):  # noqa: A002
-        return _FakeResponse({"not_embedding": []})
+        return _FakeResponse({"not_embeddings": []})
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    provider = OllamaEmbeddingProvider(base_url="http://gb10:11434")
+    with pytest.raises(EmbeddingError):
+        provider.embed(["x"])
+
+
+def test_ollama_provider_empty_vector_raises_embedding_error(monkeypatch):
+    import httpx
+
+    def _fake_post(url, json, timeout):  # noqa: A002
+        # Right count, but an empty vector is not a usable embedding.
+        return _FakeResponse({"embeddings": [[]]})
 
     monkeypatch.setattr(httpx, "post", _fake_post)
     provider = OllamaEmbeddingProvider(base_url="http://gb10:11434")

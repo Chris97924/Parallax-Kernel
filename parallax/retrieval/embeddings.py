@@ -127,9 +127,14 @@ class OllamaEmbeddingProvider:
         self.id = f"ollama:{model}@{self.base_url}"
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        return [self._embed_one(t) for t in texts]
+        # One batched request: modern Ollama POST /api/embed accepts a list of
+        # inputs and returns them in input order. This both speaks the current
+        # API (legacy /api/embeddings would 404 on a current server) and removes
+        # the O(rows) per-text HTTP round-trips of the old per-row loop.
+        inputs = list(texts)
+        if not inputs:
+            return []
 
-    def _embed_one(self, text: str) -> list[float]:
         # Lazy import: the stub path never imports httpx, and httpx lives in the
         # [dev]/[extract] extras — not core deps. In a core install a missing
         # httpx must surface as EmbeddingError so callers (hybrid_rank) degrade
@@ -140,10 +145,10 @@ class OllamaEmbeddingProvider:
             logger.warning("httpx unavailable for Ollama embeddings: %s", exc)
             raise EmbeddingError("httpx not installed (pip install '.[extract]')") from exc
 
-        payload = {"model": self.model, "prompt": text}
+        payload = {"model": self.model, "input": inputs}
         try:
             resp = httpx.post(
-                f"{self.base_url}/api/embeddings",
+                f"{self.base_url}/api/embed",
                 json=payload,
                 timeout=self.timeout,
             )
@@ -153,10 +158,18 @@ class OllamaEmbeddingProvider:
             logger.warning("Ollama embedding request failed: %s", exc)
             raise EmbeddingError(str(exc)) from exc
 
-        embedding = body.get("embedding") if isinstance(body, dict) else None
-        if not isinstance(embedding, list) or not embedding:
-            raise EmbeddingError(f"Ollama response missing 'embedding': {body!r:.120}")
-        return [float(x) for x in embedding]
+        embeddings = body.get("embeddings") if isinstance(body, dict) else None
+        if not isinstance(embeddings, list) or len(embeddings) != len(inputs):
+            raise EmbeddingError(
+                f"Ollama response 'embeddings' missing or wrong length "
+                f"(expected {len(inputs)}): {body!r:.120}"
+            )
+        vectors: list[list[float]] = []
+        for vec in embeddings:
+            if not isinstance(vec, list) or not vec:
+                raise EmbeddingError(f"Ollama response vector empty or not a list: {body!r:.120}")
+            vectors.append([float(x) for x in vec])
+        return vectors
 
 
 _FACTORY_LOCK = threading.Lock()

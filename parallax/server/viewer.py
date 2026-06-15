@@ -17,11 +17,11 @@ import dataclasses
 import sqlite3
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse
 
 from parallax.retrieve import RetrievalTrace, claims_by_user, explain_retrieve
-from parallax.server.auth import require_auth
+from parallax.server.auth import current_user_id, require_auth
 from parallax.server.deps import get_conn
 
 __all__ = ["router"]
@@ -182,42 +182,42 @@ def viewer_index() -> HTMLResponse:
 
 @router.get("/events.json")
 def viewer_events(
+    request: Request,
     user_id: str | None = Query(None, max_length=128),
     limit: int = Query(100, ge=1, le=1000),
     conn: sqlite3.Connection = _CONN_DEP,
 ) -> list[dict[str, Any]]:
-    """Return events DESC by created_at.
+    """Return events DESC by created_at, scoped to the authed principal.
 
     Args:
-        user_id: Optional filter — when omitted, returns events for all users.
+        request: Inbound request — carries ``request.state.user_id`` in
+            multi-user mode so the authenticated principal can be bound.
+        user_id: Caller-supplied filter. In multi-user mode it is ignored
+            in favour of the authenticated principal (a disagreement is
+            logged as a leak attempt). In single-token / open mode it is
+            used as-is, and is required (omitting it raises 400).
         limit: Max rows to return (default 100, max 1000).
         conn: Injected DB connection.
 
     Returns:
         List of event dicts with event_id, kind, target_kind, target_id,
-        payload, and created_at fields.
+        payload, and created_at fields — always scoped to one user.
 
-    Warning:
-        In multi-user mode (PARALLAX_MULTI_USER=1, B3), the unscoped path
-        lets a holder of any valid token read every user's events. The
-        viewer is gated behind PARALLAX_VIEWER_ENABLED (default 0) and
-        is intended only for single-operator dev deployments.
+    Note:
+        ``current_user_id`` mirrors the pattern in
+        :mod:`parallax.server.routes.query`: in multi-user mode the bound
+        principal wins so a caller can only ever read its OWN events; the
+        previous unscoped full-table path (which leaked every user's events
+        to any valid-token holder) has been removed.
     """
-    if user_id:
-        rows = conn.execute(
-            "SELECT event_id, event_type AS kind, target_kind, target_id, "
-            "payload_json AS payload, created_at "
-            "FROM events WHERE user_id = ? "
-            "ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT event_id, event_type AS kind, target_kind, target_id, "
-            "payload_json AS payload, created_at "
-            "FROM events ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    resolved_user_id = current_user_id(request, user_id)
+    rows = conn.execute(
+        "SELECT event_id, event_type AS kind, target_kind, target_id, "
+        "payload_json AS payload, created_at "
+        "FROM events WHERE user_id = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (resolved_user_id, limit),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 

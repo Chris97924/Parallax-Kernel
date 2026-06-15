@@ -180,10 +180,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
     if claim_id:
         try:
             parsed = _uuid_mod.UUID(claim_id)
-        except ValueError:
+        except ValueError as err:
             raise AuditRowValidationError(
                 f"'claim_id' must be a valid UUID, got {claim_id!r}"
-            )
+            ) from err
         if parsed.version != 7:
             raise AuditRowValidationError(
                 f"'claim_id' must be UUID v7, got version {parsed.version}"
@@ -198,10 +198,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
     if package_id:
         try:
             parsed = _uuid_mod.UUID(package_id)
-        except ValueError:
+        except ValueError as err:
             raise AuditRowValidationError(
                 f"'package_id' must be a valid UUID, got {package_id!r}"
-            )
+            ) from err
         if parsed.version != 7:
             raise AuditRowValidationError(
                 f"'package_id' must be UUID v7, got version {parsed.version}"
@@ -216,10 +216,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
     if emid:
         try:
             parsed = _uuid_mod.UUID(emid)
-        except ValueError:
+        except ValueError as err:
             raise AuditRowValidationError(
                 f"'envelope_message_id' must be a valid UUID, got {emid!r}"
-            )
+            ) from err
         if parsed.version != 4:
             raise AuditRowValidationError(
                 f"'envelope_message_id' must be UUID v4, got version {parsed.version}"
@@ -239,10 +239,10 @@ def _validate_field_formats(row: Mapping[str, Any]) -> None:
             )
         try:
             datetime.strptime(ts, _TS_FORMAT)
-        except ValueError:
+        except ValueError as err:
             raise AuditRowValidationError(
                 f"'ts' is not a valid ISO 8601 UTC timestamp, got {ts!r}"
-            )
+            ) from err
 
     # signer_manifest_digest: sha256 hex OR empty string (unsigned packages)
     smd = row.get("signer_manifest_digest", "")

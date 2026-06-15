@@ -92,6 +92,42 @@ def _seed_event(db_path: pathlib.Path, *, event_id: str, user_id: str) -> None:
         conn.close()
 
 
+def _seed_claim(
+    db_path: pathlib.Path,
+    *,
+    claim_id: str,
+    user_id: str,
+    subject: str,
+) -> None:
+    """Insert a source + claim row for ``user_id`` (claims FK source_id)."""
+    conn = connect(db_path)
+    try:
+        source_id = f"src-{claim_id}"
+        conn.execute(
+            "INSERT INTO sources(source_id, uri, kind, content_hash, "
+            "user_id, ingested_at, state) "
+            "VALUES (?, ?, 'test', ?, ?, ?, 'active')",
+            (source_id, f"test://{claim_id}", f"hash-{claim_id}", user_id, now_iso()),
+        )
+        conn.execute(
+            "INSERT INTO claims(claim_id, user_id, subject, predicate, object, "
+            "source_id, content_hash, confidence, state, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'is', 'a thing', ?, ?, 1.0, 'active', ?, ?)",
+            (
+                claim_id,
+                user_id,
+                subject,
+                source_id,
+                f"hash-{claim_id}",
+                now_iso(),
+                now_iso(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture()
 def mu_viewer_db_path(tmp_path: pathlib.Path) -> pathlib.Path:
     """Fresh migrated DB for the multi-user viewer tests."""
@@ -303,6 +339,46 @@ class TestViewerEventsCrossUserIsolation:
         assert ids == ["evt-bob"]
 
 
+class TestViewerClaimsCrossUserIsolation:
+    """Safety-critical: viewer_claims must never leak across principals.
+
+    The /viewer/claims.json route takes a required ?user_id and queries
+    WHERE user_id = ? but (before the fix) does NOT bind the authenticated
+    principal — so any valid-token holder could read another user's claims
+    by passing their user_id. After the fix current_user_id() binds the
+    authed principal so a caller can only ever read its OWN claims.
+    """
+
+    def test_spoofed_user_id_does_not_leak(
+        self, mu_viewer_client: TestClient, mu_viewer_db_path: pathlib.Path
+    ) -> None:
+        alice_bearer = _create_token(mu_viewer_db_path, user_id="alice")
+        _create_token(mu_viewer_db_path, user_id="bob")
+        _seed_claim(
+            mu_viewer_db_path,
+            claim_id="clm-alice",
+            user_id="alice",
+            subject="AliceSecret",
+        )
+        _seed_claim(
+            mu_viewer_db_path,
+            claim_id="clm-bob",
+            user_id="bob",
+            subject="BobSecret",
+        )
+
+        # Alice's token explicitly requests bob's claims — must be ignored.
+        resp = mu_viewer_client.get(
+            "/viewer/claims.json",
+            params={"user_id": "bob"},
+            headers={"Authorization": f"Bearer {alice_bearer}"},
+        )
+        assert resp.status_code == 200
+        subjects = [c["subject"] for c in resp.json()]
+        assert "BobSecret" not in subjects, "leaked bob's claims to alice"
+        assert "AliceSecret" in subjects
+
+
 class TestViewerClaimsJson:
     def test_returns_seeded_claim(self, viewer_client: TestClient) -> None:
         resp = viewer_client.get("/viewer/claims.json", params={"user_id": "u1"})
@@ -352,6 +428,50 @@ class TestViewerRetrieveJson:
         assert len(hits) >= 1
         # The seeded claim (Paris is a city) must appear as a hit.
         assert any(h.get("entity_kind") == "claim" for h in hits)
+
+
+class TestViewerRetrieveCrossUserIsolation:
+    """Safety-critical: viewer_retrieve must never leak across principals.
+
+    The /viewer/retrieve.json route takes a required ?user_id and passes it
+    straight to explain_retrieve (which scopes WHERE user_id = ?) but
+    (before the fix) does NOT bind the authenticated principal — so any
+    valid-token holder could explain another user's retrieval by passing
+    their user_id. After the fix current_user_id() binds the authed
+    principal so a caller can only ever retrieve over its OWN data.
+    """
+
+    def test_spoofed_user_id_does_not_leak(
+        self, mu_viewer_client: TestClient, mu_viewer_db_path: pathlib.Path
+    ) -> None:
+        alice_bearer = _create_token(mu_viewer_db_path, user_id="alice")
+        _create_token(mu_viewer_db_path, user_id="bob")
+        _seed_claim(
+            mu_viewer_db_path,
+            claim_id="clm-alice",
+            user_id="alice",
+            subject="AliceTopic",
+        )
+        _seed_claim(
+            mu_viewer_db_path,
+            claim_id="clm-bob",
+            user_id="bob",
+            subject="BobTopic",
+        )
+
+        # Alice's token explains a retrieval over bob's data — must be ignored.
+        resp = mu_viewer_client.get(
+            "/viewer/retrieve.json",
+            params={"q": "BobTopic", "kind": "by_entity", "user_id": "bob"},
+            headers={"Authorization": f"Bearer {alice_bearer}"},
+        )
+        assert resp.status_code == 200
+        hits = resp.json().get("hits", [])
+        # bob's claim must never appear in alice's retrieval trace.
+        leaked = [h for h in hits if h.get("entity_id") == "clm-bob"]
+        assert not leaked, "leaked bob's claim into alice's retrieval"
+        # The trace must be scoped to alice (params echo the bound principal).
+        assert resp.json()["params"]["user_id"] == "alice"
 
 
 class TestViewerDisabledReturns404:

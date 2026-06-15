@@ -14,9 +14,9 @@ Covers:
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sqlite3
-import os
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -27,7 +27,6 @@ from parallax.router.circuit_breaker import get_breaker_state
 from parallax.router.inflight import get_inflight_count, inflight_gauge
 from parallax.server.app import create_app
 from parallax.sqlite_store import connect
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -351,7 +351,8 @@ class TestHealthMultiUserRedaction:
         import secrets
 
         from parallax.server.auth import hash_token
-        from parallax.sqlite_store import connect as _connect, now_iso
+        from parallax.sqlite_store import connect as _connect
+        from parallax.sqlite_store import now_iso
 
         plaintext = secrets.token_urlsafe(24)
         c = _connect(mu_db_path)

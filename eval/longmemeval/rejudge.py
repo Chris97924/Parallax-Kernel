@@ -30,14 +30,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from eval.longmemeval.dataset import Question
 from eval.longmemeval.gemini import GeminiResult, call
 from eval.longmemeval.pipeline import (
-    AnswerRecord,
     JUDGE_SYSTEM,
+    AnswerRecord,
     build_judge_prompt,
     parse_verdict,
 )
-from eval.longmemeval.dataset import Question
 
 _write_lock = threading.Lock()
 logger = logging.getLogger("rejudge")

@@ -44,8 +44,12 @@ from parallax.server.auth import (
 )
 from parallax.server.deps import DBFactory, default_db_factory
 from parallax.server.lifespan import parallax_lifespan
-from parallax.server.middleware.dual_read_snapshot import install_middleware as install_dual_read_snapshot_middleware
-from parallax.server.middleware.traffic_source import install_middleware as install_traffic_source_middleware
+from parallax.server.middleware.dual_read_snapshot import (
+    install_middleware as install_dual_read_snapshot_middleware,
+)
+from parallax.server.middleware.traffic_source import (
+    install_middleware as install_traffic_source_middleware,
+)
 from parallax.server.routes.admin.circuit_breaker import router as admin_circuit_breaker_router
 from parallax.server.routes.backfill import router as backfill_router
 from parallax.server.routes.event import router as event_router

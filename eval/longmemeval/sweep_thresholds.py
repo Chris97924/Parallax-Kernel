@@ -25,9 +25,9 @@ import pathlib
 import sys
 from typing import Any
 
+from eval.longmemeval.schema_v2 import RunReportV2, write_run_report_v2
 from parallax.eval.constants import FALLBACK_FLOOR
 from parallax.retrieval.contracts import Intent
-from eval.longmemeval.schema_v2 import RunReportV2, write_run_report_v2
 
 RULE_THRESHOLDS: tuple[float, ...] = (0.75, 0.80, 0.85)
 FLASH_THRESHOLDS: tuple[float, ...] = (0.65, 0.70, 0.75)

@@ -16,18 +16,17 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Iterator
 
+from eval.longmemeval.dataset import Question
 from parallax import ingest_memory, memories_by_user, migrate_to_latest
 from parallax.retrieval.config import semantic_retrieval_enabled
 from parallax.retrieval.embeddings import get_embedding_provider, has_live_embedding_provider
 from parallax.retrieval.semantic import hybrid_rank
 from parallax.sqlite_store import connect
-
-from eval.longmemeval.dataset import Question
 
 logger = logging.getLogger(__name__)
 

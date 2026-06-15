@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pathlib
 import sqlite3
-import textwrap
 
 import pytest
 
@@ -14,7 +13,6 @@ from parallax.memory_md import (
     ingest_memory_md,
 )
 from parallax.migrations import migrate_to_latest
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

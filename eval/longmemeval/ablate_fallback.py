@@ -15,15 +15,14 @@ import argparse
 import dataclasses
 import datetime as _dt
 import itertools
-import json
 import pathlib
 import sys
 from typing import Any
 
+from eval.longmemeval.schema_v2 import RunReportV2, write_run_report_v2
 from parallax.eval.constants import FALLBACK_FLOOR
 from parallax.llm.call import call as llm_call  # noqa: F401  (ensures cache wiring)
 from parallax.retrieval.contracts import Intent
-from eval.longmemeval.schema_v2 import RunReportV2, write_run_report_v2
 
 K_GRID: tuple[int, ...] = (16, 24, 32, 48)
 CLAIMS_EVENTS_RATIO_GRID: tuple[tuple[float, float], ...] = (

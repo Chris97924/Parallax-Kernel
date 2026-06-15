@@ -33,7 +33,6 @@ from parallax import (
 )
 from parallax.hashing import content_hash
 
-
 # ---------------------------------------------------------------------------
 # transition_claim_state — atomic mutation + audit
 # ---------------------------------------------------------------------------

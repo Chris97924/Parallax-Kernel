@@ -40,8 +40,14 @@ services:
       - GF_SERVER_HTTP_PORT=3000
       - GF_AUTH_ANONYMOUS_ENABLED=false
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      # Admin password is read from a Docker secret file (gitignored), never
+      # committed. `docker compose up` hard-fails if the secret source file is
+      # missing — copy grafana_admin_password.secret.example to
+      # grafana_admin_password.secret and put a strong password in it.
+      - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_admin_password
       - GF_INSTALL_PLUGINS=
+    secrets:
+      - grafana_admin_password
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - /home/chris/parallax-kernel/grafana/dashboards:/var/lib/grafana/dashboards:ro
@@ -51,3 +57,7 @@ volumes:
   prometheus-data:
   alertmanager-data:
   grafana-data:
+
+secrets:
+  grafana_admin_password:
+    file: ./grafana_admin_password.secret

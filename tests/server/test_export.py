@@ -7,6 +7,7 @@ Privacy belt-and-braces: rows bypassing ingest filter are dropped at export.
 from __future__ import annotations
 
 import pathlib
+import secrets
 import sqlite3
 
 import pytest
@@ -16,7 +17,8 @@ from fastapi.testclient import TestClient
 from parallax.memory_md import ingest_memory_md, parse_memory_md
 from parallax.migrations import migrate_to_latest
 from parallax.server import create_app
-from parallax.sqlite_store import connect
+from parallax.server.auth import hash_token
+from parallax.sqlite_store import connect, now_iso
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -333,3 +335,168 @@ class TestRoundTripRealMemoryMd:
         assert by_cat.get("project", 0) >= 1
         assert by_cat.get("feedback", 0) >= 1
         assert by_cat.get("reference", 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-user cross-tenant isolation (secfix lock-in)
+# ---------------------------------------------------------------------------
+#
+# GET /export/memory_md renders a user's *entire* MEMORY.md plus every
+# companion-file body, so an IDOR here is a full memory dump. The route binds
+# the authenticated principal via current_user_id(request, user_id) and scopes
+# the SQL `WHERE user_id = ?` (export.py:105-106). These tests lock that in:
+# they assert that in multi-user mode the attacker-supplied ?user_id is IGNORED
+# in favour of the token's principal. They go RED if the route is reverted to
+# trusting the raw ?user_id (i.e. the pre-fix IDOR behaviour) and GREEN with the
+# fix — the regression guard the mandate requires for the principal-override
+# paths.
+
+
+def _make_mu_app(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[FastAPI, pathlib.Path]:
+    """App with multi-user auth enabled, pointed at a fresh migrated tmp DB."""
+    db_p = tmp_path / "export_mu.db"
+    boot = connect(db_p)
+    try:
+        migrate_to_latest(boot)
+    finally:
+        boot.close()
+
+    monkeypatch.setenv("PARALLAX_MULTI_USER", "1")
+    monkeypatch.delenv("PARALLAX_TOKEN", raising=False)
+    monkeypatch.setenv("PARALLAX_DB_PATH", str(db_p))
+
+    def factory() -> sqlite3.Connection:
+        return connect(db_p)
+
+    return create_app(db_factory=factory), db_p
+
+
+def _mint_token(db_p: pathlib.Path, *, user_id: str) -> str:
+    """Mint a bearer token for *user_id*; store only its hash, return plaintext."""
+    plaintext = secrets.token_urlsafe(24)
+    conn = connect(db_p)
+    try:
+        conn.execute(
+            "INSERT INTO api_tokens(token_hash, user_id, created_at, revoked_at, label) "
+            "VALUES (?, ?, ?, NULL, ?)",
+            (hash_token(plaintext), user_id, now_iso(), "export-test"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return plaintext
+
+
+def _seed_card(
+    db_p: pathlib.Path,
+    *,
+    row_id: str,
+    user_id: str,
+    name: str,
+    filename: str,
+    body: str,
+) -> None:
+    conn = connect(db_p)
+    try:
+        conn.execute(
+            "INSERT INTO memory_cards "
+            "(id, user_id, category, name, filename, description, "
+            "body, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            (row_id, user_id, "user", name, filename, f"{name} desc", body),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestExportCrossUserIsolation:
+    def test_spoofed_user_id_does_not_leak_other_users_export(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Alice's token + ?user_id=bob → Alice's export only; Bob's never leaks."""
+        app, db_p = _make_mu_app(tmp_path, monkeypatch)
+        alice_token = _mint_token(db_p, user_id="alice")
+        _mint_token(db_p, user_id="bob")
+
+        _seed_card(
+            db_p,
+            row_id="alice_row",
+            user_id="alice",
+            name="Alice Card",
+            filename="alice_card.md",
+            body="alice body, nothing secret",
+        )
+        _seed_card(
+            db_p,
+            row_id="bob_row",
+            user_id="bob",
+            name="Bob Private Card",
+            filename="bob_private.md",
+            body="bob body, must stay private",
+        )
+
+        with TestClient(app) as client:
+            resp = client.get(
+                "/export/memory_md",
+                params={"user_id": "bob"},  # spoof attempt under Alice's token
+                headers={"Authorization": f"Bearer {alice_token}"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        md = body["memory_md"]
+        companions = body["companion_files"]
+
+        # Bob's data must NOT appear despite ?user_id=bob.
+        assert "Bob Private Card" not in md
+        assert "bob_private.md" not in md
+        assert "bob_private.md" not in companions
+        assert all("must stay private" not in v for v in companions.values())
+
+        # Alice (the authed principal) sees her OWN card.
+        assert "Alice Card" in md
+        assert "alice_card.md" in companions
+
+    def test_each_principal_sees_only_own_export(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bob's token (no ?user_id) → only Bob's export, never Alice's."""
+        app, db_p = _make_mu_app(tmp_path, monkeypatch)
+        _mint_token(db_p, user_id="alice")
+        bob_token = _mint_token(db_p, user_id="bob")
+
+        _seed_card(
+            db_p,
+            row_id="alice_row",
+            user_id="alice",
+            name="Alice Card",
+            filename="alice_card.md",
+            body="alice body",
+        )
+        _seed_card(
+            db_p,
+            row_id="bob_row",
+            user_id="bob",
+            name="Bob Private Card",
+            filename="bob_private.md",
+            body="bob body",
+        )
+
+        with TestClient(app) as client:
+            resp = client.get(
+                "/export/memory_md",
+                headers={"Authorization": f"Bearer {bob_token}"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        md = body["memory_md"]
+        companions = body["companion_files"]
+
+        assert "Bob Private Card" in md
+        assert "bob_private.md" in companions
+        assert "Alice Card" not in md
+        assert "alice_card.md" not in companions

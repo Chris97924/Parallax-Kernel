@@ -303,6 +303,18 @@ def current_user_id(request: Request, fallback: str | None) -> str:
       identifiers are ignored (and a warning is logged if they disagree).
     * Otherwise returns ``fallback`` unchanged.
     * Raises 400 when neither is available.
+
+    .. warning::
+       **Only multi-user mode is a tenant boundary.** In single-token mode
+       (``PARALLAX_TOKEN`` set, ``PARALLAX_MULTI_USER`` off) and in open
+       mode (no token), ``request.state.user_id`` is never set, so this
+       returns the *client-supplied* ``fallback`` (the ``?user_id`` query
+       param / body field) verbatim. Any holder of the single shared token
+       — or anyone at all in open mode — can therefore address any
+       ``user_id``. Single-token mode is a **single trust domain**, not a
+       multi-tenant boundary: run one token per tenant, or set
+       ``PARALLAX_MULTI_USER=1`` for genuine per-user isolation. See
+       ``docs/deploy.md`` → "Auth modes & tenancy".
     """
     authed = getattr(request.state, "user_id", None)
     if authed:

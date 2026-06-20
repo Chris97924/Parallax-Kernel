@@ -17,11 +17,11 @@ import dataclasses
 import sqlite3
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse
 
 from parallax.retrieve import RetrievalTrace, claims_by_user, explain_retrieve
-from parallax.server.auth import require_auth
+from parallax.server.auth import current_user_id, require_auth
 from parallax.server.deps import get_conn
 
 __all__ = ["router"]
@@ -182,68 +182,83 @@ def viewer_index() -> HTMLResponse:
 
 @router.get("/events.json")
 def viewer_events(
+    request: Request,
     user_id: str | None = Query(None, max_length=128),
     limit: int = Query(100, ge=1, le=1000),
     conn: sqlite3.Connection = _CONN_DEP,
 ) -> list[dict[str, Any]]:
-    """Return events DESC by created_at.
+    """Return events DESC by created_at, scoped to the authed principal.
 
     Args:
-        user_id: Optional filter — when omitted, returns events for all users.
+        request: Inbound request — carries ``request.state.user_id`` in
+            multi-user mode so the authenticated principal can be bound.
+        user_id: Caller-supplied filter. In multi-user mode it is ignored
+            in favour of the authenticated principal (a disagreement is
+            logged as a leak attempt). In single-token / open mode it is
+            used as-is, and is required (omitting it raises 400).
         limit: Max rows to return (default 100, max 1000).
         conn: Injected DB connection.
 
     Returns:
         List of event dicts with event_id, kind, target_kind, target_id,
-        payload, and created_at fields.
+        payload, and created_at fields — always scoped to one user.
 
-    Warning:
-        In multi-user mode (PARALLAX_MULTI_USER=1, B3), the unscoped path
-        lets a holder of any valid token read every user's events. The
-        viewer is gated behind PARALLAX_VIEWER_ENABLED (default 0) and
-        is intended only for single-operator dev deployments.
+    Note:
+        ``current_user_id`` mirrors the pattern in
+        :mod:`parallax.server.routes.query`: in multi-user mode the bound
+        principal wins so a caller can only ever read its OWN events; the
+        previous unscoped full-table path (which leaked every user's events
+        to any valid-token holder) has been removed.
     """
-    if user_id:
-        rows = conn.execute(
-            "SELECT event_id, event_type AS kind, target_kind, target_id, "
-            "payload_json AS payload, created_at "
-            "FROM events WHERE user_id = ? "
-            "ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT event_id, event_type AS kind, target_kind, target_id, "
-            "payload_json AS payload, created_at "
-            "FROM events ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    resolved_user_id = current_user_id(request, user_id)
+    rows = conn.execute(
+        "SELECT event_id, event_type AS kind, target_kind, target_id, "
+        "payload_json AS payload, created_at "
+        "FROM events WHERE user_id = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (resolved_user_id, limit),
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
 @router.get("/claims.json")
 def viewer_claims(
+    request: Request,
     user_id: str = Query(..., min_length=1, max_length=128),
     limit: int = Query(100, ge=1, le=1000),
     conn: sqlite3.Connection = _CONN_DEP,
 ) -> list[dict[str, Any]]:
-    """Return claims for a user via claims_by_user.
+    """Return claims for a user via claims_by_user, scoped to the principal.
 
     Args:
-        user_id: Required user identifier.
+        request: Inbound request — carries ``request.state.user_id`` in
+            multi-user mode so the authenticated principal can be bound.
+        user_id: Caller-supplied filter. In multi-user mode it is ignored
+            in favour of the authenticated principal (a disagreement is
+            logged as a leak attempt). In single-token / open mode it is
+            used as-is, and is required.
         limit: Max rows (default 100, max 1000).
         conn: Injected DB connection.
 
     Returns:
         List of claim dicts with subject, predicate, object, confidence,
-        and state fields (plus claim_id, user_id, etc.).
+        and state fields (plus claim_id, user_id, etc.) — always scoped to
+        one user.
+
+    Note:
+        Same principal-binding pattern as :func:`viewer_events`: in
+        multi-user mode the bound principal wins so a caller can only ever
+        read its OWN claims; trusting the request-supplied ``user_id`` was
+        an IDOR that leaked any user's claims to any valid-token holder.
     """
-    all_claims = claims_by_user(conn, user_id)
+    resolved_user_id = current_user_id(request, user_id)
+    all_claims = claims_by_user(conn, resolved_user_id)
     return all_claims[:limit]
 
 
 @router.get("/retrieve.json")
 def viewer_retrieve(
+    request: Request,
     q: str = Query("", description="query text (subject for by_entity, path for file)"),
     kind: Literal[
         "by_entity", "recent", "file", "decision", "bug", "entity", "timeline"
@@ -251,25 +266,38 @@ def viewer_retrieve(
     user_id: str = Query(..., min_length=1, max_length=128),
     conn: sqlite3.Connection = _CONN_DEP,
 ) -> dict[str, Any]:
-    """Run explain_retrieve and return serialized RetrievalTrace.
+    """Run explain_retrieve and return serialized RetrievalTrace, scoped.
 
     Args:
+        request: Inbound request — carries ``request.state.user_id`` in
+            multi-user mode so the authenticated principal can be bound.
         q: Query text — subject for entity, path for file.
         kind: One of recent, file, decision, bug, entity, timeline. The
             alias ``by_entity`` is normalized to ``entity``.
-        user_id: Required user identifier.
+        user_id: Caller-supplied filter. In multi-user mode it is ignored
+            in favour of the authenticated principal (a disagreement is
+            logged as a leak attempt). In single-token / open mode it is
+            used as-is, and is required.
         conn: Injected DB connection.
 
     Returns:
         Serialized :class:`parallax.retrieve.RetrievalTrace` via
-        ``dataclasses.asdict``.
+        ``dataclasses.asdict`` — always scoped to one user.
+
+    Note:
+        Same principal-binding pattern as :func:`viewer_events`: in
+        multi-user mode the bound principal wins so a caller can only ever
+        retrieve over its OWN data; trusting the request-supplied
+        ``user_id`` was an IDOR that explained any user's retrieval to any
+        valid-token holder.
     """
+    resolved_user_id = current_user_id(request, user_id)
     # Normalize the UI alias "by_entity" → "entity"
     resolved_kind = "entity" if kind == "by_entity" else kind
     trace: RetrievalTrace = explain_retrieve(
         conn,
         kind=resolved_kind,
-        user_id=user_id,
+        user_id=resolved_user_id,
         query_text=q,
     )
     return dataclasses.asdict(trace)

@@ -18,8 +18,8 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Mapping
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final

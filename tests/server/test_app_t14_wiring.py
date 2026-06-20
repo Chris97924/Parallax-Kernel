@@ -18,10 +18,8 @@ from fastapi.testclient import TestClient
 from parallax.migrations import migrate_to_latest
 from parallax.router.inflight import get_inflight_count, inflight_gauge
 from parallax.server.app import create_app
-from parallax.server.lifespan import parallax_lifespan
 from parallax.server.middleware.dual_read_snapshot import DualReadSnapshotMiddleware
 from parallax.sqlite_store import connect
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -115,7 +113,6 @@ def test_create_app_no_query_route_change(app):
 
     Walk all routes and verify DualReadRouter is not the endpoint callable.
     """
-    from parallax.router.dual_read import DualReadRouter
 
     for route in app.routes:
         if not hasattr(route, "path"):

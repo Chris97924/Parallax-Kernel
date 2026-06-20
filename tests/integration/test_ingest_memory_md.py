@@ -10,8 +10,6 @@ import pytest
 
 from parallax.memory_md import (
     CompanionFile,
-    IngestReport,
-    MemoryMdEntry,
     ingest_memory_md,
     parse_companion,
     parse_memory_md,

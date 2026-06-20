@@ -189,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
                 q = future_to_q[fut]
                 try:
                     rec, dt = fut.result()
-                except Exception as exc:  # noqa: BLE001
+                except Exception:  # noqa: BLE001
                     logger.exception("worker crashed for %s", q.question_id)
                     continue
                 records.append(rec)

@@ -9,8 +9,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import socket
-import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -180,7 +178,7 @@ class TestTimeoutUsesOldFile:
 
         monkeypatch.setenv("PARALLAX_REGEN_DRY_RUN", "1")
 
-        with patch.object(urllib.request, "urlopen", side_effect=socket.timeout()):
+        with patch.object(urllib.request, "urlopen", side_effect=TimeoutError()):
             code = regen.main(
                 memory_dir=memory_dir,
                 token_path=token_file,

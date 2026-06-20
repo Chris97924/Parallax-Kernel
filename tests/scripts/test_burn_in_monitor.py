@@ -131,7 +131,6 @@ def test_prom_query_helper_parses_scalar_result() -> None:
     The existing helper ``r['data']['result'][0]['value'][1]`` still works
     because sum() always returns exactly one result vector element.
     """
-    import json
 
     # Simulated Prometheus API response for a sum() query that returns 12.0
     prom_response = {

@@ -2,3 +2,6 @@ prometheus-data/
 alertmanager-data/
 grafana-data/
 *.log
+# Docker secret source files (real credentials) — never commit. The committed
+# *.secret.example templates are unaffected (they end in .example, not .secret).
+*.secret

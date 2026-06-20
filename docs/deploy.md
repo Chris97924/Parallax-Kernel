@@ -10,11 +10,31 @@
 | Variable | Required | Description |
 |---|---|---|
 | `PARALLAX_TOKEN` | **Critical** | Bearer token for API authentication. Set before exposing publicly. |
+| `PARALLAX_MULTI_USER` | Multi-tenant only | Set to `1` to enable per-user token isolation (see "Auth modes & tenancy"). Off by default. |
 | `PARALLAX_DB_PATH` | Recommended | Path to SQLite database file (default: in-memory / cwd). |
 | `PARALLAX_VAULT_PATH` | Recommended | Path to vault directory for file storage. |
 
 **Never expose the server publicly without setting `PARALLAX_TOKEN`.**
 When unset, the server runs in open mode (localhost dev only).
+
+### Auth modes & tenancy
+
+Parallax has three auth modes, and **only multi-user mode is a tenant boundary**:
+
+| Mode | Config | `?user_id` handling | Isolation guarantee |
+|---|---|---|---|
+| **Open** | no token | client-supplied value used as-is | none — localhost dev only |
+| **Single-token** | `PARALLAX_TOKEN` set, `PARALLAX_MULTI_USER` off | client-supplied value used as-is | **single trust domain** — any holder of the shared token can address any `user_id` |
+| **Multi-user** | `PARALLAX_TOKEN` set, `PARALLAX_MULTI_USER=1` | ignored; principal is bound from the token's `api_tokens` row | per-user — a token can only ever read/write its own `user_id` |
+
+In **single-token mode** (the default once `PARALLAX_TOKEN` is set), the
+`?user_id` query param / body field is **not** an access-control boundary: it
+selects which user's data to read or write, and the single shared token
+authorizes all of them. This is correct for a single-tenant deployment (one
+person / one trust domain). **Do not treat a single shared token as separation
+between distinct tenants.** For genuine per-user isolation — distinct tenants who
+must not see each other's data — issue one token per tenant in the `api_tokens`
+table and run with `PARALLAX_MULTI_USER=1`.
 
 ---
 

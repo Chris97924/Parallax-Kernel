@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import socket
 import urllib.request
 from pathlib import Path
 from unittest.mock import patch
@@ -195,7 +194,7 @@ class TestLastRunTimeout:
 
         monkeypatch.setenv("PARALLAX_REGEN_DRY_RUN", "1")
 
-        with patch.object(urllib.request, "urlopen", side_effect=socket.timeout()):
+        with patch.object(urllib.request, "urlopen", side_effect=TimeoutError()):
             code = regen.main(
                 memory_dir=tmp_path / "memory",
                 token_path=token_file,

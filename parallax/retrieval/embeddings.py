@@ -37,6 +37,7 @@ __all__ = [
     "has_live_embedding_provider",
     "DEFAULT_OLLAMA_BASE_URL",
     "DEFAULT_EMBEDDING_MODEL",
+    "EMBEDDING_BASE_URL_ENV",
     "STUB_DIM",
     "BGE_M3_DIM",
 ]
@@ -174,7 +175,11 @@ class OllamaEmbeddingProvider:
 
 _FACTORY_LOCK = threading.Lock()
 
-_EMBEDDING_BASE_URL_ENV = "PARALLAX_EMBEDDING_BASE_URL"
+#: Env var selecting the live Ollama provider (non-empty value enables it).
+#: Public so tests and callers reference the name without hard-coding the string.
+EMBEDDING_BASE_URL_ENV = "PARALLAX_EMBEDDING_BASE_URL"
+# Backward-compatible private alias (pre-existing internal references).
+_EMBEDDING_BASE_URL_ENV = EMBEDDING_BASE_URL_ENV
 
 
 def has_live_embedding_provider() -> bool:

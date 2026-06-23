@@ -26,6 +26,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -39,7 +40,7 @@ from eval.longmemeval.pipeline import AnswerRecord, run_one
 _write_lock = threading.Lock()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = Path("E:/LongMemEval/data")
+DATA_DIR = Path(os.environ.get("LONGMEMEVAL_DATA_DIR", "E:/Workspace/longmemeval/data"))
 
 SPLIT_FILES = {
     "oracle": DATA_DIR / "longmemeval_oracle.json",

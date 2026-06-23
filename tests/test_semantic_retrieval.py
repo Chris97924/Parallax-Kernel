@@ -13,6 +13,7 @@ import pytest
 from parallax.retrieval import embeddings as emb
 from parallax.retrieval.embeddings import (
     BGE_M3_DIM,
+    EMBEDDING_BASE_URL_ENV,
     DeterministicStubProvider,
     EmbeddingError,
     OllamaEmbeddingProvider,
@@ -254,6 +255,44 @@ def test_hybrid_rank_degrades_to_lexical_on_embedding_error():
     assert ranked[0] == 1
 
 
+def test_hybrid_rank_dense_overturns_a_lexical_distractor():
+    # M8 quality contract at the fusion level: the answer-bearing doc (index 1)
+    # is lexically WEAK — it shares no query token — but semantically STRONG
+    # (dense rank 1). A lexical DISTRACTOR (index 0) shares two high-IDF query
+    # tokens in an unrelated sense, so lexical-only ranks IT first and buries
+    # the answer.
+    #
+    # The distractor is lexical rank 1 + dense rank 2; the answer is lexical
+    # rank 2 + dense rank 1. Symmetric 2-list RRF *ties* them — which is exactly
+    # why the eval store passes a ``tie_break`` (by vault_path) so the tie
+    # resolves toward the answer. Here we mirror that production call: the
+    # answer carries the lowest tie_break, and hybrid must surface it above the
+    # distractor it lost to under pure lexical scoring.
+    query = "kernel memory model"
+    texts = [
+        "kernel memory popcorn jar",  # 0 distractor: 2 lexical hits, dense-far
+        "rust borrow checker ownership",  # 1 ANSWER: 0 lexical hits, dense-near
+        "unrelated weather forecast",  # 2 noise
+    ]
+    vecs = {
+        "kernel memory model": [1.0, 0.0, 0.0],
+        "kernel memory popcorn jar": [0.0, 1.0, 0.0],  # lexical hit, dense-far
+        "rust borrow checker ownership": [0.97, 0.05, 0.0],  # dense-near, no lexical
+        "unrelated weather forecast": [0.0, 0.0, 1.0],  # neither
+    }
+    provider = _NearProvider(vecs)
+
+    lexical_only = lexical_rank(query, texts)
+    assert lexical_only.index(0) < lexical_only.index(1)  # distractor buries answer
+
+    # tie_break: the answer (index 1) wins ties — same contract the store gives
+    # the answer row via its ascending vault_path position.
+    tie_break = [1.0, 0.0, 2.0]
+    ranked = hybrid_rank(query, texts, provider, tie_break=tie_break)
+    assert ranked[0] == 1  # answer surfaces to the top under fusion
+    assert ranked.index(1) < ranked.index(0)  # answer now beats the distractor
+
+
 def test_hybrid_rank_empty_texts():
     assert hybrid_rank("q", [], DeterministicStubProvider()) == []
 
@@ -426,8 +465,14 @@ def test_hybrid_rank_degrades_when_httpx_missing(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_embedding_base_url_env_constant_value():
+    # The public constant must name the documented env var so tests and callers
+    # reference it without hard-coding the literal string.
+    assert EMBEDDING_BASE_URL_ENV == "PARALLAX_EMBEDDING_BASE_URL"
+
+
 def test_factory_returns_stub_without_base_url(monkeypatch):
-    monkeypatch.delenv("PARALLAX_EMBEDDING_BASE_URL", raising=False)
+    monkeypatch.delenv(EMBEDDING_BASE_URL_ENV, raising=False)
     provider = get_embedding_provider()
     assert isinstance(provider, DeterministicStubProvider)
 

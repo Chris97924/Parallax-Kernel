@@ -39,7 +39,9 @@ class TestSyntheticSource:
     ) -> None:
         ingest_memory(conn, user_id="chris", title="a", summary="b", vault_path="p1.md")
         ingest_memory(conn, user_id="chris", title="c", summary="d", vault_path="p2.md")
-        rows = query(conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", ("direct:chris",))
+        rows = query(
+            conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", ("direct:chris",)
+        )
         assert rows[0]["n"] == 1
 
 
@@ -249,18 +251,26 @@ class TestExternalSourceLazyCreate:
 
 class TestIngestClaimUpsert:
     def test_returns_non_empty_id(self, conn: sqlite3.Connection) -> None:
-        cid = ingest_claim(conn, user_id="chris", subject="chris", predicate="likes", object_="coffee")
+        cid = ingest_claim(
+            conn, user_id="chris", subject="chris", predicate="likes", object_="coffee"
+        )
         assert isinstance(cid, str) and len(cid) > 0
 
     def test_duplicate_claim_absorbed(self, conn: sqlite3.Connection) -> None:
-        c1 = ingest_claim(conn, user_id="chris", subject="chris", predicate="likes", object_="coffee")
-        c2 = ingest_claim(conn, user_id="chris", subject="chris", predicate="likes", object_="coffee")
+        c1 = ingest_claim(
+            conn, user_id="chris", subject="chris", predicate="likes", object_="coffee"
+        )
+        c2 = ingest_claim(
+            conn, user_id="chris", subject="chris", predicate="likes", object_="coffee"
+        )
         assert c1 == c2
         rows = query(conn, "SELECT COUNT(*) AS n FROM claims", ())
         assert rows[0]["n"] == 1
 
     def test_content_hash_matches_schema_formula(self, conn: sqlite3.Connection) -> None:
-        cid = ingest_claim(conn, user_id="chris", subject="chris", predicate="likes", object_="coffee")
+        cid = ingest_claim(
+            conn, user_id="chris", subject="chris", predicate="likes", object_="coffee"
+        )
         expected = content_hash("chris", "likes", "coffee", "direct:chris", "chris")
         row = query(conn, "SELECT content_hash FROM claims WHERE claim_id = ?", (cid,))[0]
         assert row["content_hash"] == expected
@@ -300,5 +310,7 @@ class TestIngestClaimUpsert:
             source_id="src-xyz",
         )
         # The synthetic source should NOT be created.
-        rows = query(conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", ("direct:chris",))
+        rows = query(
+            conn, "SELECT COUNT(*) AS n FROM sources WHERE source_id = ?", ("direct:chris",)
+        )
         assert rows[0]["n"] == 0

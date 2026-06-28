@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-
-import sys
 
 import parallax.llm.call as call_module
 from parallax.llm.call import LLMCallError, RateLimitError, _call_gemini, call

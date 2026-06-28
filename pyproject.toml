@@ -86,3 +86,9 @@ select = ["E", "F", "I", "UP", "B"]
 # (backup.py, introspection.py, telemetry.py, validators.py, restore.py,
 # plus several test files). Plan to turn it on in a dedicated repo-wide
 # cleanup pass so reviewers can audit each site in isolation.
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom requires ``Depends(...)`` in argument
+# defaults; B008 flags it as a function call in defaults. Treat it as an
+# immutable call so the documented FastAPI pattern stays lint-clean.
+extend-immutable-calls = ["fastapi.Depends"]

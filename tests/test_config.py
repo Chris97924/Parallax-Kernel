@@ -51,7 +51,10 @@ class TestLoadConfig:
         assert cfg.schema_path.is_absolute()
         # Defaults point inside the project root
         assert PROJECT_ROOT in cfg.db_path.parents or cfg.db_path.parent == PROJECT_ROOT / "db"
-        assert cfg.vault_path == (PROJECT_ROOT / "vault").resolve() or cfg.vault_path.parts[-1] == "vault"
+        assert (
+            cfg.vault_path == (PROJECT_ROOT / "vault").resolve()
+            or cfg.vault_path.parts[-1] == "vault"
+        )
         assert cfg.schema_path.name == "schema.sql"
 
     def test_env_overrides_applied(

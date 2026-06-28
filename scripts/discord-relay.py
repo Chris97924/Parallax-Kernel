@@ -143,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003 — base override
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+        sys.stderr.write(f"[{self.log_date_time_string()}] {fmt % args}\n")
 
 
 def main() -> None:

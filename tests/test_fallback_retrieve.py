@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -188,3 +189,124 @@ def test_embedding_cache_reused(monkeypatch):
     assert any(s > 1 for s in first_sizes), (
         "first call should have encoded the item pool in bulk"
     )
+
+
+def _seed_events(
+    conn: sqlite3.Connection,
+    rows: list[tuple[str, str, str]],
+    user_id: str = "u1",
+) -> None:
+    """Seed the events table.
+
+    ``rows`` is a list of ``(event_id, event_type, payload_json)`` tuples.
+    Timestamps are assigned strictly increasing so the candidate ordering is
+    deterministic. ``payload_json`` is written verbatim into the TEXT column so
+    malformed / non-JSON payloads can be exercised.
+    """
+    for i, (event_id, event_type, payload_json) in enumerate(rows):
+        ts = f"2026-05-{(i % 28) + 1:02d}T08:{i:02d}:00Z"
+        conn.execute(
+            """
+            INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                user_id,
+                "system",  # actor
+                event_type,
+                "claim",  # target_kind
+                f"tgt_{i}",  # target_id
+                payload_json,
+                "auto",  # approval_tier
+                ts,
+            ),
+        )
+    conn.commit()
+
+
+def test_event_branch_payload_text_blob_extraction():
+    """Exercise the events branch of ``_fetch_candidates`` (retrievers.py 128-139).
+
+    The base fixture seeds zero events, so the event payload-extraction code is
+    otherwise never run. This seeds one event per documented ``payload_json``
+    shape and asserts the extracted ``text_blob`` (carried in each hit's
+    ``text`` as ``"{event_type}: {text_blob}"``) for every shape:
+
+      1. ``{"text": ...}``    -> the ``text`` value
+      2. ``{"content": ...}`` -> the ``content`` value
+      3. ``{"summary": ...}`` -> the ``summary`` value
+      4. dict with none of those keys -> ``json.dumps(parsed)`` fallback
+      5. non-JSON / malformed string -> raw payload (JSONDecodeError except path)
+
+    Deterministic: sentence-transformers is absent in CI, so the bm25-stub path
+    selects every candidate when ``k_max`` exceeds the pool size.
+    """
+    conn = sqlite3.connect(":memory:")
+    _make_schema(conn)
+
+    nokeys_payload = '{"kind": "delta", "extra": "no text keys"}'
+    # The fallback dumps the *parsed* dict back out with ensure_ascii=False.
+    nokeys_expected = json.dumps(json.loads(nokeys_payload), ensure_ascii=False)
+    malformed_payload = "raw echo malformed <<< not json"
+
+    # (event_id, event_type, payload_json, expected_text_blob)
+    cases = [
+        ("ev_text", "evt_text", '{"text": "alpha tennis note"}', "alpha tennis note"),
+        ("ev_cont", "evt_content", '{"content": "bravo coffee body"}', "bravo coffee body"),
+        ("ev_summ", "evt_summary", '{"summary": "charlie summary line"}', "charlie summary line"),
+        ("ev_none", "evt_nokeys", nokeys_payload, nokeys_expected),
+        ("ev_raw", "evt_malformed", malformed_payload, malformed_payload),
+    ]
+    _seed_events(conn, [(eid, etype, pj) for eid, etype, pj, _ in cases])
+
+    # k_max well above the 5-event pool so the bm25 stub keeps every candidate.
+    evidence = fallback_retrieve(conn, "u1", "alpha bravo charlie", k_max=32)
+
+    event_hits = [h for h in evidence.hits if h["kind"] == "event"]
+    # Every seeded event must come back tagged as an event (the whole pool is
+    # events here, so all five survive ranking + token budget).
+    assert {h["id"] for h in event_hits} == {eid for eid, _, _, _ in cases}, (
+        f"missing event hits: {sorted(h['id'] for h in event_hits)}"
+    )
+
+    by_id = {h["id"]: h for h in event_hits}
+    for event_id, event_type, _payload, expected_blob in cases:
+        hit = by_id[event_id]
+        # The event branch composes text as "{event_type}: {text_blob}".
+        assert hit["text"] == f"{event_type}: {expected_blob}", (
+            f"{event_id}: got {hit['text']!r}, expected text_blob {expected_blob!r}"
+        )
+
+
+def test_event_branch_key_precedence_and_empty_values():
+    """Teeth for the ``text or content or summary or dumps`` precedence chain.
+
+    A regression that reorders the keys, drops the ``json.dumps`` fallback, or
+    treats empty strings as present would change these blobs and fail here.
+    """
+    conn = sqlite3.connect(":memory:")
+    _make_schema(conn)
+
+    all_three = '{"text": "T", "content": "C", "summary": "S"}'  # text wins
+    cont_summ = '{"content": "C", "summary": "S"}'  # content wins
+    summ_only = '{"summary": "S"}'  # summary wins
+    empty_text = '{"text": "", "content": "real body"}'  # empty falsy -> content
+    empty_dict = "{}"  # no keys -> json.dumps("{}") == "{}"
+
+    cases = [
+        ("ev_p1", "p1", all_three, "T"),
+        ("ev_p2", "p2", cont_summ, "C"),
+        ("ev_p3", "p3", summ_only, "S"),
+        ("ev_p4", "p4", empty_text, "real body"),
+        ("ev_p5", "p5", empty_dict, "{}"),
+    ]
+    _seed_events(conn, [(eid, etype, pj) for eid, etype, pj, _ in cases])
+
+    evidence = fallback_retrieve(conn, "u1", "anything", k_max=32)
+    by_id = {h["id"]: h for h in evidence.hits if h["kind"] == "event"}
+    assert set(by_id) == {eid for eid, _, _, _ in cases}
+
+    for event_id, event_type, _payload, expected_blob in cases:
+        assert by_id[event_id]["text"] == f"{event_type}: {expected_blob}", (
+            f"{event_id}: got {by_id[event_id]['text']!r}, expected {expected_blob!r}"
+        )

@@ -226,7 +226,7 @@ def test_wal_reads_not_blocked_by_writes(tmp_path: pathlib.Path) -> None:
     assert reader_count_series, "reader recorded zero samples"
     # Monotonic non-decreasing: WAL readers see a stable snapshot per
     # statement, so each successive SELECT sees ≥ previous.
-    for prev, curr in zip(reader_count_series, reader_count_series[1:]):
+    for prev, curr in zip(reader_count_series, reader_count_series[1:], strict=False):
         assert curr >= prev, (
             f"reader saw count regression {prev} -> {curr}; series={reader_count_series}"
         )

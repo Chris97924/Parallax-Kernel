@@ -16,7 +16,7 @@ from enum import Enum
 INSUFFICIENT_EVIDENCE: str = "insufficient_evidence"
 
 
-class Intent(str, Enum):
+class Intent(str, Enum):  # noqa: UP042 — keep (str, Enum) str() semantics, not StrEnum
     TEMPORAL = "temporal"
     MULTI_SESSION = "multi_session"
     PREFERENCE = "preference"

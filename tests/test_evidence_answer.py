@@ -9,7 +9,18 @@ from parallax.retrieval.contracts import INSUFFICIENT_EVIDENCE, RetrievalEvidenc
 
 def _evidence(hits: list[dict] | None = None) -> RetrievalEvidence:
     return RetrievalEvidence(
-        hits=tuple(hits or [{"id": "c1", "text": "Chris prefers dark mode.", "created_at": "2026-04-01", "source_id": "s1", "kind": "claim"}]),
+        hits=tuple(
+            hits
+            or [
+                {
+                    "id": "c1",
+                    "text": "Chris prefers dark mode.",
+                    "created_at": "2026-04-01",
+                    "source_id": "s1",
+                    "kind": "claim",
+                }
+            ]
+        ),
         stages=("mmr_embedding",),
         diversity_mode="mmr_embedding",
     )

@@ -191,7 +191,7 @@ def _call_gemini(
     try:
         from google import genai  # type: ignore[import-not-found]
         from google.genai import types as gtypes  # type: ignore[import-not-found]
-    except Exception as exc:  # pragma: no cover — SDK missing
+    except Exception as exc:
         raise LLMCallError(f"google-genai SDK not importable: {exc}") from exc
 
     api_key = _next_gemini_key()

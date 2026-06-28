@@ -37,11 +37,18 @@ dev = [
     "httpx>=0.27",
     "pyyaml>=6",
 ]
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+]
 extract = [
     "httpx>=0.27",
 ]
 cloud = [
     "boto3>=1.34",
+]
+llm = [
+    "google-genai>=1.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -83,3 +90,9 @@ select = ["E", "F", "I", "UP", "B"]
 # (backup.py, introspection.py, telemetry.py, validators.py, restore.py,
 # plus several test files). Plan to turn it on in a dedicated repo-wide
 # cleanup pass so reviewers can audit each site in isolation.
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom requires ``Depends(...)`` in argument
+# defaults; B008 flags it as a function call in defaults. Treat it as an
+# immutable call so the documented FastAPI pattern stays lint-clean.
+extend-immutable-calls = ["fastapi.Depends"]

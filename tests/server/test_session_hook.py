@@ -43,7 +43,10 @@ def hook_mod() -> Any:
 class _Handler(BaseHTTPRequestHandler):
     """Test server with pluggable response behaviour via class attrs."""
 
-    response_body: bytes = b'{"reminder": "<system-reminder>\\nhello\\n</system-reminder>", "length": 40}'
+    response_body: bytes = (
+        b'{"reminder": "<system-reminder>\\nhello\\n</system-reminder>", '
+        b'"length": 40}'
+    )
     response_status: int = 200
     require_auth: bool = False
     expected_token: str = "t0ken"

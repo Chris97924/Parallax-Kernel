@@ -83,7 +83,9 @@ def _fake_response(payload: dict):
 # ---------------------------------------------------------------------------
 
 class TestDryRunWritesPreviewOnly:
-    def test_preview_written_live_untouched(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_preview_written_live_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()
         # Put a live MEMORY.md in place — must NOT be modified
@@ -114,7 +116,8 @@ class TestDryRunWritesPreviewOnly:
         assert code == 0
         # Preview files written
         assert (memory_dir / "MEMORY.md.preview").exists()
-        assert (memory_dir / "MEMORY.md.preview").read_text(encoding="utf-8") == "# New Memory\nsome content"
+        preview_text = (memory_dir / "MEMORY.md.preview").read_text(encoding="utf-8")
+        assert preview_text == "# New Memory\nsome content"
         assert (memory_dir / "companion.md.preview").exists()
         # Live MEMORY.md untouched
         assert live.read_text(encoding="utf-8") == "original content"
@@ -192,7 +195,9 @@ class TestTimeoutUsesOldFile:
 
 
 class TestMissingTokenFileSilent:
-    def test_nonexistent_token_returns_0(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_nonexistent_token_returns_0(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("PARALLAX_REGEN_DRY_RUN", "1")
         code = regen.main(
             memory_dir=tmp_path / "memory",
@@ -241,7 +246,9 @@ class TestDiffLogRotation:
 
         assert os.path.getsize(log_path) == original_size
 
-    def test_rotation_then_append_works(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_rotation_then_append_works(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """After rotation, a subsequent run can still append to diff.log."""
         memory_dir = tmp_path / "memory"
         memory_dir.mkdir()

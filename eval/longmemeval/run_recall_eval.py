@@ -23,10 +23,33 @@ Read-only on source data: each question ingests into a per-question
 ``TemporaryDirectory`` SQLite DB (INSERT-only), torn down immediately. The
 oracle corpus JSON is never mutated.
 
+.. warning::
+
+   **The ``oracle`` split saturates recall@k at 1.0 by construction.** The
+   oracle corpus lists ONLY each question's answer sessions, so every ingested
+   turn is oracle-positive (positive fraction = 1.0). With nothing but
+   positives to retrieve, *any* top-k slice is a hit and recall@k = 1.0 for
+   every k — it cannot measure ranking quality. For a DISCRIMINATING number:
+
+   * Prefer a non-oracle split that carries distractor sessions
+     (``--split s`` / ``--split m``); positive fraction drops far below 1.0
+     and recall@k becomes sensitive to k.
+   * If only the oracle split is present, pass ``--distractors N`` to inject
+     ``N`` non-answer sessions (borrowed from other questions) into every
+     question, which likewise breaks saturation.
+
+   The harness always emits a ``recall_curve`` (recall@1 .. recall@top_k), the
+   ``positive_fraction``, and a ``discriminating`` flag (true when
+   recall@1 < recall@top_k) so saturation is visible in the results JSON.
+
 Usage::
 
+    # Discriminating run on the real distractor-laden split (preferred):
     LONGMEMEVAL_DATA_DIR=E:/Workspace/longmemeval/data \\
-        python -m eval.longmemeval.run_recall_eval --limit 100 --stratified
+        python -m eval.longmemeval.run_recall_eval --split s --top-k 50
+
+    # Oracle-only fallback: inject distractors to break 1.0 saturation:
+    python -m eval.longmemeval.run_recall_eval --distractors 8 --top-k 50
 """
 
 from __future__ import annotations
@@ -34,13 +57,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from eval.longmemeval.dataset import Question, iter_questions, load_dataset
+from eval.longmemeval.dataset import Question, Session, iter_questions, load_dataset
 from eval.longmemeval.store import (
     _select_rows_hybrid,
     _select_rows_lexical,
@@ -58,6 +82,59 @@ SPLIT_FILES = {
     "s": DATA_DIR / "longmemeval_s_cleaned.json",
     "m": DATA_DIR / "longmemeval_m_cleaned.json",
 }
+
+# Session-id prefix for injected distractor sessions. Chosen so it can never
+# collide with a real ``answer_session_ids`` entry, which keeps the injected
+# sessions strictly oracle-NEGATIVE in ``oracle_positive_paths``.
+DISTRACTOR_PREFIX = "distractor::"
+
+
+def augment_with_distractors(
+    questions: list[Question], n_distractors: int, *, seed: int = 0
+) -> list[Question]:
+    """Inject non-answer sessions into each question to break oracle saturation.
+
+    The oracle split lists ONLY answer sessions, so every turn is
+    oracle-positive (positive fraction = 1.0) and recall@k saturates at 1.0 for
+    every k. This rebuilds each question with up to ``n_distractors`` extra
+    sessions borrowed from OTHER questions in the slice and re-labelled as
+    non-answer:
+
+    * a unique session id prefixed with :data:`DISTRACTOR_PREFIX` (never in
+      ``answer_session_ids``), and
+    * every borrowed turn forced to ``has_answer=False``.
+
+    So the injected sessions are guaranteed oracle-negative — they enlarge the
+    haystack (and the recall denominator's positive *fraction*) without ever
+    counting as a recallable answer. The original answer sessions keep their
+    leading indices, so their oracle-positive ``vault_path`` set is unchanged.
+
+    ``n_distractors <= 0`` is a no-op (returns the input questions unchanged).
+    The borrowed-session pool is shuffled with a fixed ``seed`` so the result
+    is deterministic and reproducible across runs and machines.
+    """
+    if n_distractors <= 0:
+        return list(questions)
+    n = len(questions)
+    out: list[Question] = []
+    for i, q in enumerate(questions):
+        # Deterministic candidate pool: every session from every OTHER question,
+        # walked in rotated order so each question draws a different mix.
+        pool: list[Session] = []
+        for offset in range(1, n):
+            other = questions[(i + offset) % n]
+            pool.extend(other.sessions)
+        random.Random(seed + i).shuffle(pool)
+        distractors = tuple(
+            Session(
+                session_id=f"{DISTRACTOR_PREFIX}{q.question_id}:{d_idx}",
+                date=sess.date,
+                turns=tuple(t._replace(has_answer=False) for t in sess.turns),
+            )
+            for d_idx, sess in enumerate(pool[:n_distractors])
+        )
+        out.append(q._replace(sessions=q.sessions + distractors))
+    return out
 
 
 def oracle_positive_paths(q: Question) -> set[str]:
@@ -93,20 +170,47 @@ class RecallResult:
     skipped: int
 
 
-def recall_at_k(
-    questions: list[Question], top_k: int, *, use_hybrid: bool
-) -> RecallResult:
-    """Compute recall@k for ``questions`` using the chosen selector.
+@dataclass(frozen=True)
+class RecallCurve:
+    """Recall@k at several ``k`` from a SINGLE ingest pass per question.
+
+    ``results`` maps each requested ``k`` to its :class:`RecallResult`.
+    ``positive_fraction`` is the mean (over *scored* questions) of
+    ``len(oracle_positive_paths) / total_turns`` — it reads 1.0 on the oracle
+    split (saturated) and well below 1.0 once distractors are present, so it is
+    the headline signal that the recall number is actually discriminating.
+    """
+
+    results: dict[int, RecallResult]
+    positive_fraction: float
+    scored: int
+    skipped: int
+
+
+def recall_curve(
+    questions: list[Question], k_values: list[int], *, use_hybrid: bool
+) -> RecallCurve:
+    """Compute recall at every ``k`` in ``k_values`` with one ingest per question.
+
+    The selector is asked for the top ``max(k_values)`` rows once; recall at
+    each smaller ``k`` is read off the same ranked prefix (``kept_paths[:k]``),
+    which is byte-identical to calling the selector with that ``k`` because both
+    selectors rank-then-truncate. This keeps the heavy SQLite ingest off the
+    hot loop so a full recall curve costs the same as a single ``recall_at_k``.
 
     ``use_hybrid=True`` routes through ``_select_rows_hybrid`` (which itself
     degrades to lexical when no live embedding provider is configured), so
-    hybrid recall is always >= lexical recall in the offline gate by
-    construction — never worse.
+    hybrid recall is always >= lexical recall in the offline gate.
     """
     select_fn = _select_rows_hybrid if use_hybrid else _select_rows_lexical
-    hits = 0
+    ks = sorted({k for k in k_values if k > 0})
+    if not ks:
+        raise ValueError("k_values must contain at least one positive k")
+    max_k = ks[-1]
+    hits = dict.fromkeys(ks, 0)
     scored = 0
     skipped = 0
+    pos_fraction_sum = 0.0
     for q in questions:
         positives = oracle_positive_paths(q)
         if not positives:
@@ -115,15 +219,44 @@ def recall_at_k(
             skipped += 1
             continue
         scored += 1
+        total_turns = sum(len(s.turns) for s in q.sessions)
+        if total_turns:
+            pos_fraction_sum += len(positives) / total_turns
         with ephemeral_store() as conn:
             ingest_question(conn, q)
             rows = memories_by_user(conn, q.question_id)
-            kept = select_fn(q.question, rows, top_k)
-        kept_paths = {r.get("vault_path") for r in kept}
-        if kept_paths & positives:
-            hits += 1
-    recall = hits / scored if scored else 0.0
-    return RecallResult(recall=recall, hits=hits, scored=scored, skipped=skipped)
+            kept = select_fn(q.question, rows, max_k)
+        kept_paths = [r.get("vault_path") for r in kept]
+        for k in ks:
+            if set(kept_paths[:k]) & positives:
+                hits[k] += 1
+    results = {
+        k: RecallResult(
+            recall=hits[k] / scored if scored else 0.0,
+            hits=hits[k],
+            scored=scored,
+            skipped=skipped,
+        )
+        for k in ks
+    }
+    positive_fraction = pos_fraction_sum / scored if scored else 0.0
+    return RecallCurve(
+        results=results,
+        positive_fraction=positive_fraction,
+        scored=scored,
+        skipped=skipped,
+    )
+
+
+def recall_at_k(
+    questions: list[Question], top_k: int, *, use_hybrid: bool
+) -> RecallResult:
+    """Compute recall@k for ``questions`` using the chosen selector.
+
+    Thin wrapper over :func:`recall_curve` for the single-``k`` case; kept as
+    the stable entry point used by callers that only need one cut-off.
+    """
+    return recall_curve(questions, [top_k], use_hybrid=use_hybrid).results[top_k]
 
 
 def stratified_slice(questions: list[Question], limit: int) -> list[Question]:
@@ -152,6 +285,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--top-k", type=int, default=10)
     p.add_argument(
+        "--distractors",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "inject N non-answer sessions per question to break oracle "
+            "saturation (recommended only when no s/m split is available)"
+        ),
+    )
+    p.add_argument(
         "--stratified",
         action="store_true",
         help="sample evenly across question_type instead of first-N",
@@ -178,37 +321,71 @@ def main(argv: list[str] | None = None) -> int:
     else:
         questions = list(iter_questions(split_path, limit=args.limit))
 
+    if args.distractors > 0:
+        questions = augment_with_distractors(questions, args.distractors)
+
+    if args.split == "oracle" and args.distractors <= 0:
+        print(
+            "[recall] WARNING: the oracle split lists ONLY answer sessions, so "
+            "recall@k saturates at 1.0 (positive_fraction=1.0) and does NOT "
+            "measure ranking. Use --split s/m or --distractors N for a "
+            "discriminating number.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # Always evaluate at k=1 (ranking is load-bearing) up to the requested
+    # top_k so the curve exposes whether recall actually responds to k.
+    k_values = sorted({1, args.top_k})
+
     hybrid_enabled = has_live_embedding_provider()
     print(
         f"[recall] split={args.split} slice={len(questions)}Q top_k={args.top_k} "
-        f"stratified={args.stratified} hybrid_enabled={hybrid_enabled} "
+        f"distractors={args.distractors} stratified={args.stratified} "
+        f"hybrid_enabled={hybrid_enabled} "
         f"embed={os.environ.get('PARALLAX_EMBEDDING_BASE_URL')}",
         flush=True,
     )
 
     t0 = time.time()
-    lex = recall_at_k(questions, args.top_k, use_hybrid=False)
-    hyb = (
-        recall_at_k(questions, args.top_k, use_hybrid=True) if hybrid_enabled else None
-    )
+    lex = recall_curve(questions, k_values, use_hybrid=False)
+    hyb = recall_curve(questions, k_values, use_hybrid=True) if hybrid_enabled else None
+
+    top_k = args.top_k
+    recall_at_1 = lex.results[1].recall
+    recall_at_top = lex.results[top_k].recall
+    discriminating = recall_at_1 < recall_at_top
 
     summary: dict[str, object] = {
         "split": args.split,
+        "distractors": args.distractors,
         "slice_n": len(questions),
         "scored_n": lex.scored,
         "skipped_n": lex.skipped,
-        "top_k": args.top_k,
+        "top_k": top_k,
         "stratified": args.stratified,
         "type_mix": dict(Counter(q.question_type for q in questions)),
-        "lexical_recall_at_k": round(lex.recall, 4),
-        "lexical_hits": lex.hits,
+        "positive_fraction": round(lex.positive_fraction, 4),
+        "lexical_recall_curve": {
+            str(k): round(lex.results[k].recall, 4) for k in k_values
+        },
+        "lexical_recall_at_1": round(recall_at_1, 4),
+        "lexical_recall_at_k": round(recall_at_top, 4),
+        "lexical_hits": lex.results[top_k].hits,
+        "discriminating": discriminating,
         "hybrid_enabled": hybrid_enabled,
-        "hybrid_recall_at_k": round(hyb.recall, 4) if hyb else None,
-        "hybrid_hits": hyb.hits if hyb else None,
+        "hybrid_recall_curve": (
+            {str(k): round(hyb.results[k].recall, 4) for k in k_values}
+            if hyb
+            else None
+        ),
+        "hybrid_recall_at_k": round(hyb.results[top_k].recall, 4) if hyb else None,
+        "hybrid_hits": hyb.results[top_k].hits if hyb else None,
         "elapsed_sec": round(time.time() - t0, 1),
     }
 
-    out = args.out or (REPO_ROOT / "eval" / "results" / f"recall_{args.split}.json")
+    tag = args.split + (f"_d{args.distractors}" if args.distractors > 0 else "")
+    out = args.out or (REPO_ROOT / "eval" / "results" / f"recall_{tag}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"

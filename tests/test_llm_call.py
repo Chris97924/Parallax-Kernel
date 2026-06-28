@@ -7,8 +7,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import sys
+
 import parallax.llm.call as call_module
-from parallax.llm.call import RateLimitError, call
+from parallax.llm.call import LLMCallError, RateLimitError, _call_gemini, call
 
 
 @pytest.fixture
@@ -187,6 +189,28 @@ def test_fallback_not_cached_under_primary_key(isolated_cache, monkeypatch):
         "primary-model call was served from fallback-model cache — pollution bug"
     )
     assert second.get("_cached") is False
+
+
+def test_call_gemini_missing_sdk_message(monkeypatch):
+    """Absent google-genai SDK must surface the contract LLMCallError message.
+
+    The ``google-genai`` SDK is an *optional* extra (``parallax-kernel[llm]``),
+    so the default test gate must not require it. We force ``from google import
+    genai`` to fail deterministically — regardless of whether the SDK happens to
+    be installed — by poisoning ``sys.modules['google']`` with ``None``, then
+    assert the error message that callers depend on stays intact.
+    """
+    monkeypatch.setitem(sys.modules, "google", None)
+
+    with pytest.raises(LLMCallError) as exc_info:
+        _call_gemini(
+            "gemini-2.5-flash",
+            [{"role": "user", "content": "x"}],
+            temperature=0.0,
+            max_output_tokens=8,
+        )
+
+    assert str(exc_info.value).startswith("google-genai SDK not importable:")
 
 
 def test_ratelimit_retry_before_fallback(isolated_cache, monkeypatch):

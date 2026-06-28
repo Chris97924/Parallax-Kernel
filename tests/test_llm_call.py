@@ -9,7 +9,76 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 import parallax.llm.call as call_module
-from parallax.llm.call import LLMCallError, RateLimitError, _call_gemini, call
+from parallax.llm.call import (
+    LLMCallError,
+    RateLimitError,
+    _call_gemini,
+    _gemini_keys,
+    _next_gemini_key,
+    call,
+)
+
+
+@pytest.fixture
+def clean_gemini_env(monkeypatch):
+    """Unset every Gemini/Google key env var so each test starts from an empty
+    pool and only sees the keys it explicitly sets."""
+    for env in call_module._GEMINI_KEY_ENVS:
+        monkeypatch.delenv(env, raising=False)
+    yield monkeypatch
+
+
+def test_gemini_keys_dedupes_and_preserves_first_seen_order(clean_gemini_env):
+    mp = clean_gemini_env
+    # GOOGLE_API_KEY duplicates GEMINI_API_KEY; GEMINI_API_KEY_2 duplicates it
+    # again at a later position; GEMINI_API_KEY_3 is empty and must be skipped.
+    mp.setenv("GEMINI_API_KEY", "key-a")
+    mp.setenv("GOOGLE_API_KEY", "key-b")
+    mp.setenv("GEMINI_API_KEY_2", "key-a")  # dup of first -> dropped
+    mp.setenv("GEMINI_API_KEY_3", "")  # empty -> skipped
+
+    keys = _gemini_keys()
+
+    # First-seen order preserved, the later duplicate of "key-a" is dropped,
+    # and the empty value never enters the pool.
+    assert keys == ["key-a", "key-b"]
+
+
+def test_gemini_keys_skips_unset(clean_gemini_env):
+    mp = clean_gemini_env
+    # Only the third slot is set; the other three are unset.
+    mp.setenv("GEMINI_API_KEY_2", "only-key")
+
+    assert _gemini_keys() == ["only-key"]
+
+
+def test_gemini_keys_empty_when_nothing_configured(clean_gemini_env):
+    assert _gemini_keys() == []
+
+
+def test_next_gemini_key_round_robins(clean_gemini_env):
+    mp = clean_gemini_env
+    mp.setenv("GEMINI_API_KEY", "k0")
+    mp.setenv("GOOGLE_API_KEY", "k1")
+    # Reset the module-global rotation cursor for a deterministic sequence.
+    mp.setattr(call_module, "_key_idx", 0)
+
+    pool = _gemini_keys()
+    assert pool == ["k0", "k1"]
+
+    # Two keys -> successive calls cycle k0, k1, k0, k1, ...
+    seq = [_next_gemini_key() for _ in range(5)]
+    assert seq == ["k0", "k1", "k0", "k1", "k0"]
+
+
+def test_next_gemini_key_raises_when_pool_empty(clean_gemini_env):
+    mp = clean_gemini_env
+    # Pool is empty (clean_gemini_env unset everything); cursor reset so the
+    # failure is the guard, not an arithmetic accident.
+    mp.setattr(call_module, "_key_idx", 0)
+
+    with pytest.raises(LLMCallError, match="no Gemini API key configured"):
+        _next_gemini_key()
 
 
 @pytest.fixture

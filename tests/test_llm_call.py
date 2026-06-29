@@ -365,6 +365,7 @@ def clean_ollama_env(monkeypatch):
     monkeypatch.delenv("PARALLAX_OLLAMA_BASE_URL", raising=False)
     monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
     monkeypatch.delenv("PARALLAX_OLLAMA_TIMEOUT", raising=False)
+    monkeypatch.delenv("PARALLAX_OLLAMA_THINK", raising=False)
     yield monkeypatch
 
 
@@ -443,6 +444,36 @@ def test_call_ollama_respects_base_url_override(monkeypatch):
     )
     # Trailing slash trimmed; override wins over the default.
     assert captured["url"] == "http://gb10.local:11434/api/chat"
+
+
+def test_call_ollama_think_env_controls_payload(clean_ollama_env):
+    import httpx
+
+    captured: dict = {}
+
+    def fake_post(url, *, json, timeout):
+        captured["json"] = json
+        return _FakeOllamaResp(
+            200, {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+        )
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    msgs = [{"role": "user", "content": "q"}]
+
+    # Unset -> no think key (model default preserved).
+    _call_ollama("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    assert "think" not in captured["json"]
+
+    # Falsey -> think=false (reasoning suppressed).
+    clean_ollama_env.setenv("PARALLAX_OLLAMA_THINK", "0")
+    _call_ollama("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    assert captured["json"]["think"] is False
+
+    # Truthy -> think=true.
+    clean_ollama_env.setenv("PARALLAX_OLLAMA_THINK", "true")
+    _call_ollama("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    assert captured["json"]["think"] is True
 
 
 def test_call_ollama_429_raises_ratelimit(clean_ollama_env):

@@ -288,6 +288,8 @@ _DEFAULT_OLLAMA_BASE_URL = "http://192.168.1.134:11434"
 #: cache keys and run reports stay stable.
 _OLLAMA_PREFIXES: tuple[str, ...] = ("ollama:", "local:")
 _DEFAULT_OLLAMA_TIMEOUT = 300.0
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSEY = {"0", "false", "no", "off"}
 
 
 def _ollama_base_url() -> str:
@@ -319,6 +321,12 @@ def _call_ollama(
     untrusted input (SSRF). The ``ollama:`` / ``local:`` routing prefix is
     stripped from the model name before it is sent; the original prefixed name is
     returned in the ``model`` field so cache keys and reports stay stable.
+
+    ``PARALLAX_OLLAMA_THINK`` optionally controls reasoning models: an explicit
+    falsey value sends ``think=false`` (so e.g. qwen3 emits its answer directly
+    instead of spending the token budget on a hidden ``thinking`` field that
+    leaves ``content`` empty); a truthy value sends ``think=true``. When unset
+    the key is omitted and the model's own default applies.
     """
     try:
         import httpx  # type: ignore[import]
@@ -342,6 +350,11 @@ def _call_ollama(
             "num_predict": max_output_tokens,
         },
     }
+    think_env = os.environ.get("PARALLAX_OLLAMA_THINK", "").strip().lower()
+    if think_env in _TRUTHY:
+        payload["think"] = True
+    elif think_env in _FALSEY:
+        payload["think"] = False
     try:
         resp = httpx.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
     except httpx.HTTPError as exc:

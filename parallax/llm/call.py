@@ -11,8 +11,10 @@ Contract rules (ADR-006):
 * Fallback results are stored under a fallback-keyed hash so re-issuing the
   original call (e.g. once the primary model's quota is back) does not return
   the fallback model's answer masquerading as the primary model's.
-* All provider-specific HTTP stays in ``_call_gemini`` / ``_call_anthropic``.
-  Callers see a uniform ``dict`` return shape.
+* All provider-specific HTTP stays in ``_call_gemini`` / ``_call_anthropic`` /
+  ``_call_ollama``. Callers see a uniform ``dict`` return shape.
+* Local models served by Ollama (GB10) route through ``_call_ollama`` when the
+  model name carries an ``ollama:`` / ``local:`` prefix; no API key is required.
 """
 
 from __future__ import annotations
@@ -272,6 +274,107 @@ def _call_anthropic(
     }
 
 
+# ---------- Local (Ollama) provider -----------------------------------------
+
+#: Env vars selecting the Ollama base URL, checked in order. Operator config —
+#: a non-empty value wins. Default points at GB10.
+_OLLAMA_BASE_URL_ENVS: tuple[str, ...] = (
+    "PARALLAX_OLLAMA_BASE_URL",
+    "OLLAMA_BASE_URL",
+)
+_DEFAULT_OLLAMA_BASE_URL = "http://192.168.1.134:11434"
+#: Routing prefixes that select the local Ollama provider. Stripped before the
+#: model name is sent on the wire; the original prefixed name is echoed back so
+#: cache keys and run reports stay stable.
+_OLLAMA_PREFIXES: tuple[str, ...] = ("ollama:", "local:")
+_DEFAULT_OLLAMA_TIMEOUT = 300.0
+
+
+def _ollama_base_url() -> str:
+    for env in _OLLAMA_BASE_URL_ENVS:
+        val = os.environ.get(env, "").strip()
+        if val:
+            return val.rstrip("/")
+    return _DEFAULT_OLLAMA_BASE_URL
+
+
+def _strip_ollama_prefix(model: str) -> str:
+    for prefix in _OLLAMA_PREFIXES:
+        if model.startswith(prefix):
+            return model[len(prefix) :]
+    return model
+
+
+def _call_ollama(
+    model: str,
+    messages: list[dict],
+    *,
+    temperature: float,
+    max_output_tokens: int,
+) -> dict:
+    """Call a local model served by Ollama via ``POST /api/chat``.
+
+    ``base_url`` comes from ``PARALLAX_OLLAMA_BASE_URL`` / ``OLLAMA_BASE_URL``
+    (operator config, default GB10) and is **not validated** — do not wire it to
+    untrusted input (SSRF). The ``ollama:`` / ``local:`` routing prefix is
+    stripped from the model name before it is sent; the original prefixed name is
+    returned in the ``model`` field so cache keys and reports stay stable.
+    """
+    try:
+        import httpx  # type: ignore[import]
+    except Exception as exc:  # pragma: no cover - httpx is a declared dep
+        raise LLMCallError(f"httpx not importable: {exc}") from exc
+
+    base_url = _ollama_base_url()
+    served_model = _strip_ollama_prefix(model)
+    timeout = float(
+        os.environ.get("PARALLAX_OLLAMA_TIMEOUT", str(_DEFAULT_OLLAMA_TIMEOUT))
+    )
+    payload = {
+        "model": served_model,
+        "messages": [
+            {"role": m.get("role", "user"), "content": m.get("content", "")}
+            for m in messages
+        ],
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_output_tokens,
+        },
+    }
+    try:
+        resp = httpx.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
+    except httpx.HTTPError as exc:
+        raise LLMCallError(f"ollama request failed: {exc}") from exc
+
+    if resp.status_code == 429:
+        raise RateLimitError(f"ollama 429: {resp.text[:200]}")
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise LLMCallError(
+            f"ollama HTTP {resp.status_code}: {resp.text[:200]}"
+        ) from exc
+
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise LLMCallError(f"ollama returned non-JSON body: {exc}") from exc
+
+    message = body.get("message") if isinstance(body, dict) else None
+    text = message.get("content", "") if isinstance(message, dict) else ""
+    return {
+        "text": text or "",
+        "raw": {
+            "done_reason": body.get("done_reason"),
+            "served_model": body.get("model"),
+        },
+        "model": model,
+        "prompt_tokens": int(body.get("prompt_eval_count", 0) or 0),
+        "completion_tokens": int(body.get("eval_count", 0) or 0),
+    }
+
+
 def _dispatch(
     model: str,
     messages: list[dict],
@@ -288,6 +391,13 @@ def _dispatch(
         )
     if model.startswith("claude-"):
         return _call_anthropic(
+            model,
+            messages,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+    if model.startswith(_OLLAMA_PREFIXES):
+        return _call_ollama(
             model,
             messages,
             temperature=temperature,

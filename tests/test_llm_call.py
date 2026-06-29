@@ -13,6 +13,7 @@ from parallax.llm.call import (
     LLMCallError,
     RateLimitError,
     _call_gemini,
+    _call_ollama,
     _gemini_keys,
     _next_gemini_key,
     call,
@@ -331,3 +332,170 @@ def test_ratelimit_retry_before_fallback(isolated_cache, monkeypatch):
     assert result["text"] == "pro-ok"
     assert attempts["n"] == 3
     assert attempts["fallback"] == 0, "fallback fired despite retry success"
+
+
+# ---------- Ollama (local) provider -----------------------------------------
+
+
+class _FakeOllamaResp:
+    """Minimal stand-in for an httpx.Response (no network)."""
+
+    def __init__(self, status_code: int, json_body: dict | None, text: str = ""):
+        self.status_code = status_code
+        self._json = json_body
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        import httpx
+
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}", request=None, response=None
+            )
+
+    def json(self) -> dict:
+        if self._json is None:
+            raise ValueError("no json body")
+        return self._json
+
+
+@pytest.fixture
+def clean_ollama_env(monkeypatch):
+    """Force the default GB10 base URL by clearing both override env vars."""
+    monkeypatch.delenv("PARALLAX_OLLAMA_BASE_URL", raising=False)
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.delenv("PARALLAX_OLLAMA_TIMEOUT", raising=False)
+    yield monkeypatch
+
+
+def test_call_ollama_strips_prefix_and_maps_tokens(clean_ollama_env):
+    import httpx
+
+    captured: dict = {}
+
+    def fake_post(url, *, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return _FakeOllamaResp(
+            200,
+            {
+                "model": "qwen3.6:latest",
+                "message": {"role": "assistant", "content": "hi there"},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 42,
+                "eval_count": 7,
+            },
+        )
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    out = _call_ollama(
+        "ollama:qwen3.6:latest",
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}],
+        temperature=0.0,
+        max_output_tokens=128,
+    )
+
+    # Prefix stripped on the wire; only the trailing model tag is sent — note
+    # the model tag itself contains a colon, so only the routing prefix is cut.
+    assert captured["json"]["model"] == "qwen3.6:latest"
+    # Original prefixed name is preserved in the return for stable cache keys.
+    assert out["model"] == "ollama:qwen3.6:latest"
+    # Endpoint + default GB10 base URL.
+    assert captured["url"] == "http://192.168.1.134:11434/api/chat"
+    # Options + stream mapping.
+    assert captured["json"]["options"]["num_predict"] == 128
+    assert captured["json"]["options"]["temperature"] == 0.0
+    assert captured["json"]["stream"] is False
+    # System/user roles map natively to /api/chat messages.
+    assert captured["json"]["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+    ]
+    # Token mapping: prompt_eval_count -> prompt_tokens, eval_count -> completion.
+    assert out["text"] == "hi there"
+    assert out["prompt_tokens"] == 42
+    assert out["completion_tokens"] == 7
+
+
+def test_call_ollama_respects_base_url_override(monkeypatch):
+    import httpx
+
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.setenv("PARALLAX_OLLAMA_BASE_URL", "http://gb10.local:11434/")
+    captured: dict = {}
+
+    def fake_post(url, *, json, timeout):
+        captured["url"] = url
+        return _FakeOllamaResp(
+            200, {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    _call_ollama(
+        "local:gemma4:31b",
+        [{"role": "user", "content": "q"}],
+        temperature=0.2,
+        max_output_tokens=8,
+    )
+    # Trailing slash trimmed; override wins over the default.
+    assert captured["url"] == "http://gb10.local:11434/api/chat"
+
+
+def test_call_ollama_429_raises_ratelimit(clean_ollama_env):
+    import httpx
+
+    def fake_post(url, *, json, timeout):
+        return _FakeOllamaResp(429, None, text="too many requests")
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(RateLimitError, match="429"):
+        _call_ollama(
+            "ollama:qwen3.6:latest",
+            [{"role": "user", "content": "x"}],
+            temperature=0.0,
+            max_output_tokens=8,
+        )
+
+
+def test_call_ollama_http_error_raises_llmcallerror(clean_ollama_env):
+    import httpx
+
+    def fake_post(url, *, json, timeout):
+        return _FakeOllamaResp(500, None, text="boom")
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(LLMCallError, match="ollama HTTP 500"):
+        _call_ollama(
+            "ollama:qwen3.6:latest",
+            [{"role": "user", "content": "x"}],
+            temperature=0.0,
+            max_output_tokens=8,
+        )
+
+
+def test_dispatch_routes_ollama_and_local_prefixes(monkeypatch):
+    seen: list[str] = []
+
+    def fake_ollama(model, messages, *, temperature, max_output_tokens):
+        seen.append(model)
+        return {
+            "text": "ok",
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    monkeypatch.setattr(call_module, "_call_ollama", fake_ollama)
+
+    msgs = [{"role": "user", "content": "x"}]
+    call_module._dispatch("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    call_module._dispatch("local:gemma4:31b", msgs, temperature=0.0, max_output_tokens=8)
+
+    assert seen == ["ollama:qwen3.6:latest", "local:gemma4:31b"]

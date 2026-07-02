@@ -15,6 +15,17 @@ same substring semantics as ``LIKE '%needle%'`` (case-insensitive, literal ``%``
 ``event_id`` is carried as an ``UNINDEXED`` column so a matched FTS row joins
 back to ``events`` by primary key.
 
+User scope (multi-tenant):
+    A searchable ``user_tag`` column carries ``char(2) || user_id || char(2)``
+    so the retrieval hot paths can restrict the FTS ``MATCH`` to one user's rows
+    (``user_tag:"<tag>" AND payload_json:"<needle>"``) instead of matching a
+    common term (``bug`` / ``fix``) across every tenant and discarding the other
+    users after a primary-key join. The bounding STX (``0x02``) sentinels — a
+    byte that does not occur in Parallax user_ids — serve two jobs: they keep
+    the tag ``>= 3`` chars so short ids like ``'u'`` still yield a trigram, and
+    they stop one id from matching as a substring of another (a phrase query for
+    user ``'u'`` must not leak ``'u2'`` rows, nor ``'abc'`` leak ``'abcd'``).
+
 Sync strategy:
     ``events`` is append-only. m0002 installs ``BEFORE UPDATE`` / ``BEFORE
     DELETE`` triggers that ``RAISE(ABORT)``, and :mod:`parallax.sqlite_store`
@@ -40,18 +51,21 @@ import sqlite3
 
 _CREATE_FTS = (
     "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5("
-    "event_id UNINDEXED, payload_json, tokenize='trigram')"
+    "event_id UNINDEXED, user_tag, payload_json, tokenize='trigram')"
 )
 
+# ``char(2)`` emits the STX sentinel byte; keep this encoding identical to
+# ``parallax.retrieve._fts_user_tag`` so query-side tags match stored tags.
 _BACKFILL = (
-    "INSERT INTO events_fts(event_id, payload_json) "
-    "SELECT event_id, payload_json FROM events"
+    "INSERT INTO events_fts(event_id, user_tag, payload_json) "
+    "SELECT event_id, char(2) || user_id || char(2), payload_json FROM events"
 )
 
 _CREATE_TRIGGER = (
     "CREATE TRIGGER IF NOT EXISTS events_ai_fts AFTER INSERT ON events "
-    "BEGIN INSERT INTO events_fts(event_id, payload_json) "
-    "VALUES (new.event_id, new.payload_json); END"
+    "BEGIN INSERT INTO events_fts(event_id, user_tag, payload_json) "
+    "VALUES (new.event_id, char(2) || new.user_id || char(2), new.payload_json); "
+    "END"
 )
 
 # Representative DDL/DML for the static ``migration_plan`` estimator. The real

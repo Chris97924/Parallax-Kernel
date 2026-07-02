@@ -369,6 +369,39 @@ def _fts_phrase(text: str) -> str:
     return '"' + text.replace('"', '""') + '"'
 
 
+# STX sentinel bounding the user_tag column value; mirrors ``char(2)`` in
+# migration 0014's backfill/trigger. Not a valid character in Parallax user_ids.
+_FTS_USER_SENTINEL = "\x02"
+
+
+def _fts_user_tag(user_id: str) -> str:
+    """Sentinel-bounded encoding of ``user_id`` for the ``events_fts.user_tag``
+    column.
+
+    Must stay byte-identical to migration 0014's ``char(2) || user_id ||
+    char(2)`` so a query-side tag matches the stored tag. The bounds keep the
+    tag ``>= 3`` chars (so a 1-char ``user_id`` still yields a trigram) and stop
+    one id matching as a substring of another under trigram search.
+    """
+    return f"{_FTS_USER_SENTINEL}{user_id}{_FTS_USER_SENTINEL}"
+
+
+def _fts_scoped_match(user_id: str, payload_expr: str) -> str:
+    """Build a user-scoped FTS5 MATCH expression.
+
+    ``payload_expr`` is the already-quoted payload phrase (or parenthesised OR
+    of phrases). Restricting the term to the ``payload_json`` column keeps it
+    from matching against the ``user_tag`` column, and the ``user_tag`` filter
+    confines the whole match to one tenant's rows inside the index — rather than
+    matching a common term across every user and discarding the rest after the
+    primary-key join.
+    """
+    return (
+        f"user_tag:{_fts_phrase(_fts_user_tag(user_id))} "
+        f"AND payload_json:{payload_expr}"
+    )
+
+
 def _parse_iso(ts: str) -> _dt.datetime:
     """Parse ISO-8601; tolerant of trailing 'Z'."""
     if ts.endswith("Z"):
@@ -569,15 +602,15 @@ def by_file(
     placeholders = ",".join("?" * len(FILE_EVENT_TYPES))
     use_fts = len(path) >= _TRIGRAM_MIN_CHARS and _events_fts_available(conn)
     if use_fts:
-        pattern = _fts_phrase(path)
+        pattern = _fts_scoped_match(user_id, _fts_phrase(path))
         sql = (
             f"SELECT e.* FROM events e "
             f"JOIN events_fts f ON f.event_id = e.event_id "
             f"WHERE e.user_id = ? AND e.event_type IN ({placeholders}) "
-            f"AND f.payload_json MATCH ? "
+            f"AND f.events_fts MATCH ? "
             f"ORDER BY e.created_at DESC LIMIT ?"
         )
-        filter_detail = f"payload_json MATCH {pattern!r} (fts trigram)"
+        filter_detail = f"events_fts MATCH {pattern!r} (user-scoped trigram)"
     else:
         pattern = f"%{_like_escape(path)}%"
         sql = (
@@ -734,11 +767,12 @@ def by_bug_fix(
         len(tok) >= _TRIGRAM_MIN_CHARS for tok in _FIX_TOKENS
     )
     if use_fts:
-        match_expr = " OR ".join(_fts_phrase(tok) for tok in _FIX_TOKENS)
+        payload_or = " OR ".join(_fts_phrase(tok) for tok in _FIX_TOKENS)
+        match_expr = _fts_scoped_match(user_id, f"({payload_or})")
         event_sql = (
             "SELECT e.* FROM events e "
             "JOIN events_fts f ON f.event_id = e.event_id "
-            "WHERE e.user_id = ? AND f.payload_json MATCH ? "
+            "WHERE e.user_id = ? AND f.events_fts MATCH ? "
             "ORDER BY e.created_at DESC LIMIT ?"
         )
         erows = query(conn, event_sql, (user_id, match_expr, limit))
@@ -939,14 +973,14 @@ def by_entity(
 
     use_fts = len(subject) >= _TRIGRAM_MIN_CHARS and _events_fts_available(conn)
     if use_fts:
-        event_pattern = _fts_phrase(subject)
+        event_pattern = _fts_scoped_match(user_id, _fts_phrase(subject))
         event_sql = (
             "SELECT e.* FROM events e "
             "JOIN events_fts f ON f.event_id = e.event_id "
-            "WHERE e.user_id = ? AND f.payload_json MATCH ? "
+            "WHERE e.user_id = ? AND f.events_fts MATCH ? "
             "ORDER BY e.created_at DESC LIMIT ?"
         )
-        event_filter_detail = f"events.payload_json MATCH {event_pattern!r} (fts trigram)"
+        event_filter_detail = f"events_fts MATCH {event_pattern!r} (user-scoped trigram)"
     else:
         event_pattern = f"%{_like_escape(subject)}%"
         event_sql = (

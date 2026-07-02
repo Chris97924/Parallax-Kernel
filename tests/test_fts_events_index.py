@@ -25,6 +25,8 @@ from parallax.events import record_event
 from parallax.hooks import ingest_hook
 from parallax.migrations import migrate_to_latest
 from parallax.retrieve import (
+    _fts_phrase,  # type: ignore[attr-defined]
+    _fts_scoped_match,  # type: ignore[attr-defined]
     _TraceBuilder,  # type: ignore[attr-defined]
     by_bug_fix,
     by_entity,
@@ -343,3 +345,71 @@ class TestFtsQueryPlan:
         # Old path walks every event row for the user (via the user_time index)
         # or scans the table outright — either way it touches the events table.
         assert "events" in plan
+
+
+class TestFtsUserScope:
+    """The user scope lives INSIDE the FTS MATCH (via user_tag), not only in the
+    post-join SQL filter — so a common term for a low-volume user does not have
+    to walk + rank every other user's hits (codex round-1 P2)."""
+
+    def _fts_ids(self, conn: sqlite3.Connection, user_id: str, term: str) -> set[str]:
+        """Run the user-scoped FTS MATCH directly against events_fts, with NO
+        SQL ``user_id = ?`` filter, so the result reflects only what the FTS
+        layer itself scoped to."""
+        expr = _fts_scoped_match(user_id, _fts_phrase(term))
+        rows = conn.execute(
+            "SELECT f.event_id FROM events_fts f WHERE f.events_fts MATCH ?",
+            (expr,),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def _seed_user_note(
+        self, conn: sqlite3.Connection, user_id: str, text: str
+    ) -> str:
+        return record_event(
+            conn,
+            user_id=user_id,
+            actor="system",
+            event_type="note",
+            target_kind=None,
+            target_id=None,
+            payload={"text": text},
+        )
+
+    def test_fts_layer_scopes_by_user(self, conn: sqlite3.Connection) -> None:
+        # Two users, identical common term. The FTS layer alone must isolate them.
+        e_u = self._seed_user_note(conn, "u", "the bug is in the widget")
+        e_v = self._seed_user_note(conn, "v", "the bug is in the widget")
+        u_ids = self._fts_ids(conn, "u", "bug")
+        v_ids = self._fts_ids(conn, "v", "bug")
+        assert u_ids == {e_u}
+        assert v_ids == {e_v}
+
+    def test_prefix_user_ids_do_not_leak(self, conn: sqlite3.Connection) -> None:
+        # Prefix-related ids are the classic trigram substring trap: a naive
+        # user_id phrase for 'u' would also match 'u2'. Sentinel bounds prevent it.
+        e_u = self._seed_user_note(conn, "u", "shared TERM here")
+        e_u2 = self._seed_user_note(conn, "u2", "shared TERM here")
+        e_abc = self._seed_user_note(conn, "abc", "shared TERM here")
+        e_abcd = self._seed_user_note(conn, "abcd", "shared TERM here")
+        assert self._fts_ids(conn, "u", "TERM") == {e_u}
+        assert self._fts_ids(conn, "u2", "TERM") == {e_u2}
+        assert self._fts_ids(conn, "abc", "TERM") == {e_abc}
+        assert self._fts_ids(conn, "abcd", "TERM") == {e_abcd}
+
+    def test_short_user_id_scopes(self, conn: sqlite3.Connection) -> None:
+        # 1-char user_id: sentinel bounding keeps the tag >= 3 chars (one trigram).
+        e = self._seed_user_note(conn, "u", "single char user bugfix note")
+        self._seed_user_note(conn, "z", "single char user bugfix note")
+        assert self._fts_ids(conn, "u", "bugfix") == {e}
+
+    def test_by_entity_does_not_leak_across_users(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        # End-to-end: the public retrieval never returns another user's event.
+        self._seed_user_note(conn, "u", "mentions MegaWidget")
+        self._seed_user_note(conn, "u2", "also mentions MegaWidget")
+        hits = by_entity(conn, user_id="u", subject="MegaWidget")
+        for h in hits:
+            if h.entity_kind == "event" and h.full is not None:
+                assert h.full.get("user_id") == "u"

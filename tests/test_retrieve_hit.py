@@ -104,7 +104,7 @@ class TestExplainContract:
             payload={"from": "pending", "to": "confirmed", "note": "bug fix"},
         )
 
-    def test_all_retrievers_populate_reason(self, conn: sqlite3.Connection) -> None:
+    def test_all_query_functions_populate_reason(self, conn: sqlite3.Connection) -> None:
         self._seed(conn)
         results = {
             "recent_context": recent_context(conn, user_id="u"),

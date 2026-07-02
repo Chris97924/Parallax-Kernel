@@ -2,6 +2,13 @@
 
 ## Status
 
+Superseded — 2026-07-02. The Phase-1 `fallback_retrieve` prototype
+(`parallax/retrieval/retrievers.py`) was removed as dead code; semantic
+retrieval is now wired through the M8 semantic path
+(`parallax/retrieval/semantic.py`). Re-wiring an intent-routed retrieval
+pipeline on top of that path is tracked as separate work. The original
+proposal is retained below unchanged for historical context.
+
 Proposed — 2026-04-20, target v0.5.x (xcouncil Phase 1 ships inside the
 v0.5.x LongMemEval retrieval-quality line, window 2026-04-21 to
 2026-04-26 for the Cerebral Valley "Built with Opus 4.7" hackathon).

@@ -37,7 +37,7 @@ INTENT_PRIORITY: tuple[Intent, ...] = (
 
 @dataclass(frozen=True)
 class RetrievalEvidence:
-    """Frozen evidence bundle returned by retrievers.
+    """Frozen evidence bundle returned by a retrieval path.
 
     ``hits`` is a tuple of dicts (``{id, text, created_at, source_id, kind}``).
     We keep it as ``tuple[dict, ...]`` because dicts give callers structural

@@ -333,6 +333,75 @@ def _like_escape(s: str) -> str:
     )
 
 
+# ----- events_fts trigram substring index (migration 0014) ------------------
+
+# The trigram tokenizer indexes 3-character windows, so a MATCH phrase shorter
+# than 3 characters has no trigram to look up. Queries below this length fall
+# back to the (correct, just unindexed) leading-wildcard LIKE scan so 1-2 char
+# paths/subjects keep working.
+_TRIGRAM_MIN_CHARS = 3
+
+
+def _events_fts_available(conn: sqlite3.Connection) -> bool:
+    """True when the ``events_fts`` trigram index (migration 0014) is present.
+
+    DBs migrated to <0014, or ``schema.sql``-bootstrapped stores (stress /
+    canary harnesses), have ``events`` but no ``events_fts``; those transparently
+    fall back to the original LIKE scan.
+    """
+    rows = query(
+        conn,
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'events_fts' LIMIT 1",
+    )
+    return bool(rows)
+
+
+def _fts_phrase(text: str) -> str:
+    """Wrap user text as a single FTS5 phrase.
+
+    Double-quoting makes the whole string a literal phrase, so trigram
+    substring matching mirrors ``LIKE '%text%'`` and FTS5 operator characters
+    inside a path/subject (``-``, ``:``, ``*``, ``(`` …) stay literal. Internal
+    double quotes are doubled per FTS5 string-literal rules. Pair with a
+    ``payload_json MATCH ?`` clause against ``events_fts``.
+    """
+    return '"' + text.replace('"', '""') + '"'
+
+
+# STX sentinel bounding the user_tag column value; mirrors ``char(2)`` in
+# migration 0014's backfill/trigger. Not a valid character in Parallax user_ids.
+_FTS_USER_SENTINEL = "\x02"
+
+
+def _fts_user_tag(user_id: str) -> str:
+    """Sentinel-bounded encoding of ``user_id`` for the ``events_fts.user_tag``
+    column.
+
+    Must stay byte-identical to migration 0014's ``char(2) || user_id ||
+    char(2)`` so a query-side tag matches the stored tag. The bounds keep the
+    tag ``>= 3`` chars (so a 1-char ``user_id`` still yields a trigram) and stop
+    one id matching as a substring of another under trigram search.
+    """
+    return f"{_FTS_USER_SENTINEL}{user_id}{_FTS_USER_SENTINEL}"
+
+
+def _fts_scoped_match(user_id: str, payload_expr: str) -> str:
+    """Build a user-scoped FTS5 MATCH expression.
+
+    ``payload_expr`` is the already-quoted payload phrase (or parenthesised OR
+    of phrases). Restricting the term to the ``payload_json`` column keeps it
+    from matching against the ``user_tag`` column, and the ``user_tag`` filter
+    confines the whole match to one tenant's rows inside the index — rather than
+    matching a common term across every user and discarding the rest after the
+    primary-key join.
+    """
+    return (
+        f"user_tag:{_fts_phrase(_fts_user_tag(user_id))} "
+        f"AND payload_json:{payload_expr}"
+    )
+
+
 def _parse_iso(ts: str) -> _dt.datetime:
     """Parse ISO-8601; tolerant of trailing 'Z'."""
     if ts.endswith("Z"):
@@ -530,13 +599,26 @@ def by_file(
                 detail="path is empty",
             )
         return []
-    like = f"%{_like_escape(path)}%"
     placeholders = ",".join("?" * len(FILE_EVENT_TYPES))
-    sql = (
-        f"SELECT * FROM events WHERE user_id = ? AND event_type IN ({placeholders}) "
-        "AND payload_json LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?"
-    )
-    rows = query(conn, sql, (user_id, *FILE_EVENT_TYPES, like, limit))
+    use_fts = len(path) >= _TRIGRAM_MIN_CHARS and _events_fts_available(conn)
+    if use_fts:
+        pattern = _fts_scoped_match(user_id, _fts_phrase(path))
+        sql = (
+            f"SELECT e.* FROM events e "
+            f"JOIN events_fts f ON f.event_id = e.event_id "
+            f"WHERE e.user_id = ? AND e.event_type IN ({placeholders}) "
+            f"AND f.events_fts MATCH ? "
+            f"ORDER BY e.created_at DESC LIMIT ?"
+        )
+        filter_detail = f"events_fts MATCH {pattern!r} (user-scoped trigram)"
+    else:
+        pattern = f"%{_like_escape(path)}%"
+        sql = (
+            f"SELECT * FROM events WHERE user_id = ? AND event_type IN ({placeholders}) "
+            "AND payload_json LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?"
+        )
+        filter_detail = f"payload_json LIKE {pattern!r}"
+    rows = query(conn, sql, (user_id, *FILE_EVENT_TYPES, pattern, limit))
     hits: list[RetrievalHit] = []
     for r in _to_dicts(rows):
         hits.append(
@@ -564,7 +646,9 @@ def by_file(
             (user_id, *FILE_EVENT_TYPES),
         )
         type_count = int(type_rows[0]["n"]) if type_rows else 0
-        _trace.set_normalized({"like_pattern": like, "event_types": list(FILE_EVENT_TYPES)})
+        _trace.set_normalized(
+            {"payload_pattern": pattern, "event_types": list(FILE_EVENT_TYPES)}
+        )
         _trace.sql(sql)
         _trace.stage(
             "user_scope",
@@ -582,7 +666,7 @@ def by_file(
             "payload_filter",
             candidates_in=type_count,
             candidates_out=len(hits),
-            detail=f"payload_json LIKE {like!r}",
+            detail=filter_detail,
         )
         _trace.stage(
             "final", candidates_in=len(hits), candidates_out=len(hits), detail=""
@@ -676,13 +760,30 @@ def by_bug_fix(
     """Events + claims whose text matches fix/bug tokens."""
     hits: list[RetrievalHit] = []
 
-    like_clauses = " OR ".join(["payload_json LIKE ?"] * len(_FIX_TOKENS))
-    like_params = tuple(f"%{tok}%" for tok in _FIX_TOKENS)
-    event_sql = (
-        f"SELECT * FROM events WHERE user_id = ? AND ({like_clauses}) "
-        "ORDER BY created_at DESC LIMIT ?"
+    # Every fix-token is a fixed >=3-char constant, so the trigram index can
+    # serve the whole OR. If the index is missing, or a future token drops
+    # below the trigram floor, fall back to the leading-wildcard LIKE OR.
+    use_fts = _events_fts_available(conn) and all(
+        len(tok) >= _TRIGRAM_MIN_CHARS for tok in _FIX_TOKENS
     )
-    erows = query(conn, event_sql, (user_id, *like_params, limit))
+    if use_fts:
+        payload_or = " OR ".join(_fts_phrase(tok) for tok in _FIX_TOKENS)
+        match_expr = _fts_scoped_match(user_id, f"({payload_or})")
+        event_sql = (
+            "SELECT e.* FROM events e "
+            "JOIN events_fts f ON f.event_id = e.event_id "
+            "WHERE e.user_id = ? AND f.events_fts MATCH ? "
+            "ORDER BY e.created_at DESC LIMIT ?"
+        )
+        erows = query(conn, event_sql, (user_id, match_expr, limit))
+    else:
+        like_clauses = " OR ".join(["payload_json LIKE ?"] * len(_FIX_TOKENS))
+        like_params = tuple(f"%{tok}%" for tok in _FIX_TOKENS)
+        event_sql = (
+            f"SELECT * FROM events WHERE user_id = ? AND ({like_clauses}) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        erows = query(conn, event_sql, (user_id, *like_params, limit))
     for r in _to_dicts(erows):
         hits.append(
             _event_to_hit(
@@ -870,12 +971,24 @@ def by_entity(
             )
         )
 
-    event_sql = (
-        "SELECT * FROM events WHERE user_id = ? AND payload_json LIKE ? ESCAPE '\\' "
-        "ORDER BY created_at DESC LIMIT ?"
-    )
-    event_like = f"%{_like_escape(subject)}%"
-    event_rows = query(conn, event_sql, (user_id, event_like, limit))
+    use_fts = len(subject) >= _TRIGRAM_MIN_CHARS and _events_fts_available(conn)
+    if use_fts:
+        event_pattern = _fts_scoped_match(user_id, _fts_phrase(subject))
+        event_sql = (
+            "SELECT e.* FROM events e "
+            "JOIN events_fts f ON f.event_id = e.event_id "
+            "WHERE e.user_id = ? AND f.events_fts MATCH ? "
+            "ORDER BY e.created_at DESC LIMIT ?"
+        )
+        event_filter_detail = f"events_fts MATCH {event_pattern!r} (user-scoped trigram)"
+    else:
+        event_pattern = f"%{_like_escape(subject)}%"
+        event_sql = (
+            "SELECT * FROM events WHERE user_id = ? AND payload_json LIKE ? ESCAPE '\\' "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        event_filter_detail = f"events.payload_json LIKE {event_pattern!r}"
+    event_rows = query(conn, event_sql, (user_id, event_pattern, limit))
     for r in _to_dicts(event_rows):
         hits.append(
             _event_to_hit(
@@ -923,7 +1036,7 @@ def by_entity(
             "payload_filter",
             candidates_in=events_total,
             candidates_out=event_matches,
-            detail=f"events.payload_json LIKE {event_like!r}",
+            detail=event_filter_detail,
         )
         _trace.stage(
             "final",

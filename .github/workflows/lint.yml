@@ -1,0 +1,21 @@
+name: lint
+
+on:
+  push:
+    branches: [main, main-next]
+  pull_request:
+
+jobs:
+  ruff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        # Pinned to the version validated when this gate was introduced so a
+        # future ruff release adding rules can't turn the gate red on its own.
+        run: python -m pip install --upgrade pip "ruff==0.15.20"
+      - name: Ruff lint (parallax)
+        run: ruff check parallax

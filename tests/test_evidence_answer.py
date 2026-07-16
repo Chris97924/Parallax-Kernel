@@ -82,7 +82,7 @@ def test_prompt_is_semantic_not_exact_quotes(monkeypatch):
 def test_cache_key_includes_evidence_content(monkeypatch):
     """Same question_id but different evidence hits must produce different cache keys.
 
-    Without this, a caller that re-runs a question after swapping retrievers
+    Without this, a caller that re-runs a question after swapping retrieval backends
     would hit the cached answer computed from the *previous* retriever's
     evidence — a silent correctness bug.
     """

@@ -15,7 +15,7 @@ accuracy while cutting answer-prompt tokens >= 10x.
 
 CAVEAT (reported, load-bearing): this is the EVAL path — ephemeral SQLite store +
 ephemeral re-embed via parallax.retrieval.semantic. It is NOT the production
-retrieval stack (fallback_retrieve / pgvector). A result here may not transfer.
+retrieval stack (pgvector). A result here may not transfer.
 
 The eval itself is read-only on source data: each question ingests into a
 throwaway TemporaryDirectory SQLite DB (INSERT-only), torn down per question.

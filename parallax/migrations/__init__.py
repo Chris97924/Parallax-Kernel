@@ -46,6 +46,7 @@ from parallax.migrations import (
     m0011_crosswalk,
     m0012_crosswalk_aphelion_doc_id,
     m0013_events_event_type_correlation_id_index,
+    m0014_events_fts_trigram,
 )
 from parallax.sqlite_store import now_iso
 
@@ -149,6 +150,12 @@ MIGRATIONS: list[Migration] = [
         name="events_event_type_correlation_id_index",
         up=m0013_events_event_type_correlation_id_index.up,
         down=m0013_events_event_type_correlation_id_index.down,
+    ),
+    Migration(
+        version=14,
+        name="events_fts_trigram",
+        up=m0014_events_fts_trigram.up,
+        down=m0014_events_fts_trigram.down,
     ),
 ]
 
@@ -256,6 +263,7 @@ _MIGRATION_MODULES: dict[int, object] = {
     11: m0011_crosswalk,
     12: m0012_crosswalk_aphelion_doc_id,
     13: m0013_events_event_type_correlation_id_index,
+    14: m0014_events_fts_trigram,
 }
 
 # Matches table identifiers following the DDL/DML keywords we care about.

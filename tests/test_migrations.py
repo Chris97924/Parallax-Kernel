@@ -30,7 +30,7 @@ class TestMigrationRegistry:
     def test_migrations_in_order(self) -> None:
         versions = [m.version for m in MIGRATIONS]
         names = [m.name for m in MIGRATIONS]
-        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         assert names == [
             "initial_schema",
             "events_append_only",
@@ -45,6 +45,7 @@ class TestMigrationRegistry:
             "crosswalk",
             "crosswalk_aphelion_doc_id",
             "events_event_type_correlation_id_index",
+            "events_fts_trigram",
         ]
 
     def test_migration_is_frozen_dataclass(self) -> None:
@@ -59,7 +60,7 @@ class TestMigrationRegistry:
 class TestMigrateToLatest:
     def test_fresh_db_applies_all(self, empty_conn: sqlite3.Connection) -> None:
         applied = migrate_to_latest(empty_conn)
-        assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         assert applied_versions(empty_conn) == {
             1,
             2,
@@ -74,6 +75,7 @@ class TestMigrateToLatest:
             11,
             12,
             13,
+            14,
         }
         assert pending(empty_conn) == []
 
@@ -102,7 +104,7 @@ class TestMigrateToLatest:
         rows = empty_conn.execute(
             "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [r[0] for r in rows] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert [r[0] for r in rows] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         for _, _, applied_at in rows:
             assert applied_at  # non-empty ISO timestamp
 
@@ -121,7 +123,7 @@ class TestMigrateDownTo:
         migrate_to_latest(empty_conn)
         migrate_down_to(empty_conn, 0)
         applied = migrate_to_latest(empty_conn)
-        assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert applied == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
 
     def test_down_to_one_keeps_initial_schema(self, empty_conn: sqlite3.Connection) -> None:
         migrate_to_latest(empty_conn)

@@ -12,9 +12,7 @@ Two backends speak the :class:`EmbeddingProvider` protocol:
 unless ``PARALLAX_EMBEDDING_BASE_URL`` selects the live Ollama provider.
 
 ``httpx`` is imported lazily inside :class:`OllamaEmbeddingProvider` so the
-stub path (and module import) carries no dependency on it being installed —
-mirroring how ``sentence-transformers`` is optional in
-``parallax.retrieval.retrievers``.
+stub path (and module import) carries no dependency on it being installed.
 """
 
 from __future__ import annotations

@@ -5,9 +5,11 @@ Contract rules (ADR-006):
 * Every LLM call in Parallax goes through :func:`call`.
 * Cache key is deterministic over ``(model, messages, response_schema)`` —
   or the caller-supplied ``cache_key`` when they want to pin a run. For
-  ``ollama:`` / ``local:`` models the normalized provider identity (base URL +
-  ``PARALLAX_OLLAMA_THINK`` state) also joins the key, since those ambient knobs
-  change the response for the same tag (see ``_ollama_provider_identity``).
+  ``ollama:`` / ``local:`` models the normalized provider identity (base URL,
+  ``PARALLAX_OLLAMA_THINK`` state, and generation options temperature /
+  ``num_predict``) also joins the key, since those knobs change the response for
+  the same tag (see ``_ollama_provider_identity``). The same gap for
+  gemini/claude keys is a known follow-up, not addressed here.
 * 429 / rate-limit raises :class:`RateLimitError`; tenacity retries it a few
   times with a 5s..60s exponential backoff. Only when retries are exhausted
   do we fall through to the ``fallback_model`` branch.
@@ -127,21 +129,28 @@ def _hash_prompt(
     messages: list[dict],
     response_schema: dict | None,
     cache_key: str | None,
+    temperature: float = 0.0,
+    max_output_tokens: int = 2048,
 ) -> str:
+    # ``temperature`` / ``max_output_tokens`` default to call()'s defaults so
+    # existing 4-arg callers keep working; call() always passes them explicitly
+    # so the key matches the dispatch config.
     if cache_key is not None:
         raw = f"{model}::{cache_key}"
     else:
         msg_blob = json.dumps(messages, sort_keys=True, ensure_ascii=False)
         schema_blob = json.dumps(response_schema or {}, sort_keys=True)
         raw = f"{model}::{msg_blob}::{schema_blob}"
-    # Ollama responses depend on ambient endpoint config (base URL, think knob)
-    # that the (model, messages, schema) tuple does not capture, so fold the
-    # normalized provider identity into the key: repointing PARALLAX_OLLAMA_*
-    # must bust the cache rather than replay a stale (wrong-endpoint or
-    # empty-content) entry. Scoped to ollama-prefixed models so gemini/claude
-    # rows keyed before this change stay reachable (they never depended on it).
+    # Ollama responses depend on config the (model, messages, schema) tuple does
+    # not capture — ambient endpoint config (base URL, think knob) AND the
+    # generation options (temperature, num_predict) — so fold the normalized
+    # provider identity into the key: changing PARALLAX_OLLAMA_* or the token
+    # budget / temperature must bust the cache rather than replay a stale
+    # (wrong-endpoint, empty-content, or truncated) entry. Scoped to
+    # ollama-prefixed models so gemini/claude rows keyed before this change stay
+    # reachable (their key policy is unchanged; see _ollama_provider_identity).
     if model.startswith(_OLLAMA_PREFIXES):
-        raw = f"{raw}::{_ollama_provider_identity()}"
+        raw = f"{raw}::{_ollama_provider_identity(temperature, max_output_tokens)}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -347,11 +356,24 @@ def _ollama_think_state() -> str:
     return "unset"
 
 
-def _ollama_provider_identity() -> str:
+def _ollama_options(temperature: float, max_output_tokens: int) -> dict:
+    """Generation ``options`` sent to Ollama's ``/api/chat``.
+
+    Single source of truth shared by the request payload (``_call_ollama``) and
+    the cache identity (:func:`_ollama_provider_identity`), so the wire call and
+    the cache key can never disagree about the generation knobs. Values are
+    coerced to their canonical numeric type (``float`` temperature, ``int``
+    ``num_predict``) so equivalent inputs (e.g. ``0`` vs ``0.0``) don't
+    spuriously miss the cache.
+    """
+    return {"temperature": float(temperature), "num_predict": int(max_output_tokens)}
+
+
+def _ollama_provider_identity(temperature: float, max_output_tokens: int) -> str:
     """Normalized, response-affecting Ollama config that must join the cache
     identity so a rerun under different config re-dispatches instead of replaying
-    a stale answer. Built from the SAME normalizers ``_call_ollama`` uses for the
-    request, so the wire call and the cache key cannot disagree.
+    a stale answer. Built from the SAME normalizers/builders ``_call_ollama`` uses
+    for the request, so the wire call and the cache key cannot disagree.
 
     Components (each normalized to one canonical form so equivalent configs don't
     spuriously miss):
@@ -361,17 +383,23 @@ def _ollama_provider_identity() -> str:
       same ``ollama:``/``local:`` tag against a different base URL is a different
       answer and must be a different key.
     * ``think`` — the reasoning tri-state (:func:`_ollama_think_state`).
+    * ``opts`` — the generation options (:func:`_ollama_options`): ``temperature``
+      and ``num_predict``. These change the response for identical
+      ``(model, messages, schema)`` — e.g. a small ``num_predict`` caches a
+      truncated answer that must NOT be replayed for a rerun with a larger budget.
 
-    Deliberately EXCLUDED — do not change the content of a successful response
-    for identical ``(model, messages, schema)``:
+    Deliberately EXCLUDED — does not change the content of a successful response:
 
-    * ``PARALLAX_OLLAMA_TIMEOUT`` — transport deadline only; a successful
-      response is byte-identical regardless of the timeout.
-    * ``temperature`` / ``num_predict`` — caller-supplied ``call()`` arguments,
-      not ambient endpoint config; they are handled uniformly across all
-      providers by the shared key policy, not this ollama-only identity.
+    * ``PARALLAX_OLLAMA_TIMEOUT`` — transport deadline only; a successful response
+      is byte-identical regardless of the timeout.
+
+    Scope note: this folds generation options into the OLLAMA identity only. The
+    same pre-existing gap for gemini/claude (whose keys also omit temperature /
+    max_output_tokens) is intentionally left to a follow-up issue and NOT changed
+    here, to avoid invalidating existing gemini/claude cache rows.
     """
-    return f"base={_ollama_base_url()}|think={_ollama_think_state()}"
+    opts_blob = json.dumps(_ollama_options(temperature, max_output_tokens), sort_keys=True)
+    return f"base={_ollama_base_url()}|think={_ollama_think_state()}|opts={opts_blob}"
 
 
 def _call_ollama(
@@ -412,10 +440,7 @@ def _call_ollama(
             for m in messages
         ],
         "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": max_output_tokens,
-        },
+        "options": _ollama_options(temperature, max_output_tokens),
     }
     think = _ollama_think_state()
     if think == "true":
@@ -531,7 +556,9 @@ def call(
     is cheaper than N parallel API calls that would all race to insert the
     same row.
     """
-    prompt_hash = _hash_prompt(model, messages, response_schema, cache_key)
+    prompt_hash = _hash_prompt(
+        model, messages, response_schema, cache_key, temperature, max_output_tokens
+    )
 
     with _db_lock:
         conn = _connect_cache()
@@ -569,7 +596,12 @@ def call(
                 # answer labelled as Pro. This keeps fallback results cheap to
                 # re-serve while preserving primary-model cache correctness.
                 store_hash = _hash_prompt(
-                    fallback_model, messages, response_schema, cache_key
+                    fallback_model,
+                    messages,
+                    response_schema,
+                    cache_key,
+                    temperature,
+                    max_output_tokens,
                 )
                 store_model = fallback_model
 

@@ -682,3 +682,78 @@ def test_hash_prompt_base_url_in_ollama_identity(clean_ollama_env):
     mp.setenv("PARALLAX_OLLAMA_BASE_URL", "http://whatever:11434")
     g2 = _hash_prompt("gemini-2.5-flash", msgs, None, None)
     assert g1 == g2
+
+
+def test_ollama_generation_options_toggle_busts_cache(isolated_cache, clean_ollama_env):
+    """Changing generation options (max_output_tokens / temperature) for the SAME
+    ollama model+messages must NOT replay a stale cached answer — e.g. a truncated
+    answer cached under num_predict=8 must not be served for a rerun at 512.
+
+    Regression for codex PR #87 round-3 finding: _hash_prompt never received
+    temperature / max_output_tokens, so generation-knob sweeps replayed stale
+    (truncated / wrong-temperature) answers.
+    """
+    mp = clean_ollama_env
+    seen: list[tuple] = []
+
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+        seen.append((temperature, max_output_tokens))
+        # Larger budget -> fuller answer; different temperature -> different text.
+        return {
+            "text": f"t={temperature}:n={max_output_tokens}",
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    mp.setattr(call_module, "_dispatch_with_retry", fake_dispatch)
+    msgs = [{"role": "user", "content": "q"}]
+
+    a = call("ollama:qwen3.6:latest", msgs, max_output_tokens=8)
+    assert a["_cached"] is False
+    assert a["text"] == "t=0.0:n=8"
+
+    # Same model/messages, larger token budget -> must re-dispatch, not replay.
+    b = call("ollama:qwen3.6:latest", msgs, max_output_tokens=512)
+    assert b["_cached"] is False, (
+        "max_output_tokens change replayed a stale (truncated) answer"
+    )
+    assert b["text"] == "t=0.0:n=512"
+
+    # Same again but change temperature -> must re-dispatch.
+    c = call("ollama:qwen3.6:latest", msgs, max_output_tokens=512, temperature=0.7)
+    assert c["_cached"] is False, "temperature change replayed a stale answer"
+    assert c["text"] == "t=0.7:n=512"
+
+    # Re-issuing the first exact config is a cache HIT (identity is stable).
+    d = call("ollama:qwen3.6:latest", msgs, max_output_tokens=8)
+    assert d["_cached"] is True
+    assert d["text"] == "t=0.0:n=8"
+
+    assert seen == [(0.0, 8), (0.0, 512), (0.7, 512)]
+
+
+def test_hash_prompt_generation_options_in_ollama_identity(clean_ollama_env):
+    """Generation options join the ollama cache identity; equivalent numeric
+    inputs (0 == 0.0) collapse; non-ollama keys are deliberately unchanged across
+    options (the same gap for gemini/claude is a deferred follow-up).
+    """
+    mp = clean_ollama_env
+    msgs = [{"role": "user", "content": "q"}]
+    m = "ollama:qwen3.6:latest"
+
+    base = _hash_prompt(m, msgs, None, None, 0.0, 8)
+    diff_n = _hash_prompt(m, msgs, None, None, 0.0, 512)
+    diff_t = _hash_prompt(m, msgs, None, None, 0.7, 8)
+    assert len({base, diff_n, diff_t}) == 3
+
+    # Numeric normalization: int 0 == float 0.0, so equivalent configs collapse.
+    assert _hash_prompt(m, msgs, None, None, 0, 8) == base
+
+    # Non-ollama models: generation options are NOT folded into the key here
+    # (pre-existing gap deferred to a follow-up issue), so the hash is unchanged
+    # across different options — existing gemini/claude rows stay reachable.
+    g1 = _hash_prompt("gemini-2.5-flash", msgs, None, None, 0.0, 8)
+    g2 = _hash_prompt("gemini-2.5-flash", msgs, None, None, 0.9, 512)
+    assert g1 == g2

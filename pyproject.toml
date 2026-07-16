@@ -17,7 +17,7 @@ dependencies = [
     "tenacity>=8",
     "pydantic>=2",
     "prometheus_client>=0.20",
-    "aphelion @ git+https://github.com/Chris97924/Aphelion-Graph.git@0a0e0905a7d3e765f0aa7273628fea62317d7ee8",
+    "aphelion>=0.6",  # PyPI (Trusted Publisher) since v0.6.0; exact version pinned by uv.lock
 ]
 
 [project.scripts]

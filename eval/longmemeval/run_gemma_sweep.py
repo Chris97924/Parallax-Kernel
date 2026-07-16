@@ -37,7 +37,8 @@ os.environ.setdefault("PARALLAX_OLLAMA_THINK", "false")
 # the only thing this changes; main()'s later call becomes a no-op).
 load_dotenv("E:/Workspace/Parallax/.env")
 
-from eval.longmemeval.run_retrieval_vs_dump import ORACLE, main as run_cell  # noqa: E402
+from eval.longmemeval.run_retrieval_vs_dump import ORACLE  # noqa: E402
+from eval.longmemeval.run_retrieval_vs_dump import main as run_cell  # noqa: E402
 
 RESULTS_DIR = Path(__file__).parent.parent / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)

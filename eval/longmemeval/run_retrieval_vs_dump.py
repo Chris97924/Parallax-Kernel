@@ -161,7 +161,12 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     load_dotenv("E:/Workspace/Parallax/.env")
-    if not os.environ.get("GEMINI_API_KEY"):
+    # Only Gemini answer/judge models need a Gemini key. Local (ollama:/local:)
+    # or Claude runs must not be blocked by an absent GEMINI_API_KEY.
+    needs_gemini = args.answer_model.startswith("gemini-") or args.judge_model.startswith(
+        "gemini-"
+    )
+    if needs_gemini and not os.environ.get("GEMINI_API_KEY"):
         print("ERROR: GEMINI_API_KEY not loaded", file=sys.stderr)
         return 2
 

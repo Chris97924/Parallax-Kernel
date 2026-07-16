@@ -49,6 +49,7 @@ cloud = [
 ]
 llm = [
     "google-genai>=1.0",
+    "httpx>=0.27",
 ]
 
 [tool.setuptools.packages.find]

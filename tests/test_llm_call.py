@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +14,9 @@ from parallax.llm.call import (
     LLMCallError,
     RateLimitError,
     _call_gemini,
+    _call_ollama,
     _gemini_keys,
+    _hash_prompt,
     _next_gemini_key,
     call,
 )
@@ -331,3 +334,426 @@ def test_ratelimit_retry_before_fallback(isolated_cache, monkeypatch):
     assert result["text"] == "pro-ok"
     assert attempts["n"] == 3
     assert attempts["fallback"] == 0, "fallback fired despite retry success"
+
+
+# ---------- Ollama (local) provider -----------------------------------------
+
+
+class _FakeOllamaResp:
+    """Minimal stand-in for an httpx.Response (no network)."""
+
+    def __init__(self, status_code: int, json_body: dict | None, text: str = ""):
+        self.status_code = status_code
+        self._json = json_body
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        import httpx
+
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}", request=None, response=None
+            )
+
+    def json(self) -> dict:
+        if self._json is None:
+            raise ValueError("no json body")
+        return self._json
+
+
+@pytest.fixture
+def clean_ollama_env(monkeypatch):
+    """Force the default GB10 base URL by clearing both override env vars."""
+    monkeypatch.delenv("PARALLAX_OLLAMA_BASE_URL", raising=False)
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.delenv("PARALLAX_OLLAMA_TIMEOUT", raising=False)
+    monkeypatch.delenv("PARALLAX_OLLAMA_THINK", raising=False)
+    yield monkeypatch
+
+
+def test_call_ollama_strips_prefix_and_maps_tokens(clean_ollama_env):
+    import httpx
+
+    captured: dict = {}
+
+    def fake_post(url, *, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return _FakeOllamaResp(
+            200,
+            {
+                "model": "qwen3.6:latest",
+                "message": {"role": "assistant", "content": "hi there"},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 42,
+                "eval_count": 7,
+            },
+        )
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    out = _call_ollama(
+        "ollama:qwen3.6:latest",
+        [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}],
+        temperature=0.0,
+        max_output_tokens=128,
+    )
+
+    # Prefix stripped on the wire; only the trailing model tag is sent — note
+    # the model tag itself contains a colon, so only the routing prefix is cut.
+    assert captured["json"]["model"] == "qwen3.6:latest"
+    # Original prefixed name is preserved in the return for stable cache keys.
+    assert out["model"] == "ollama:qwen3.6:latest"
+    # Endpoint + default GB10 base URL.
+    assert captured["url"] == "http://192.168.1.134:11434/api/chat"
+    # Options + stream mapping.
+    assert captured["json"]["options"]["num_predict"] == 128
+    assert captured["json"]["options"]["temperature"] == 0.0
+    assert captured["json"]["stream"] is False
+    # System/user roles map natively to /api/chat messages.
+    assert captured["json"]["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q"},
+    ]
+    # Token mapping: prompt_eval_count -> prompt_tokens, eval_count -> completion.
+    assert out["text"] == "hi there"
+    assert out["prompt_tokens"] == 42
+    assert out["completion_tokens"] == 7
+
+
+def test_call_ollama_respects_base_url_override(monkeypatch):
+    import httpx
+
+    monkeypatch.delenv("OLLAMA_BASE_URL", raising=False)
+    monkeypatch.setenv("PARALLAX_OLLAMA_BASE_URL", "http://gb10.local:11434/")
+    captured: dict = {}
+
+    def fake_post(url, *, json, timeout):
+        captured["url"] = url
+        return _FakeOllamaResp(
+            200, {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+        )
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+
+    _call_ollama(
+        "local:gemma4:31b",
+        [{"role": "user", "content": "q"}],
+        temperature=0.2,
+        max_output_tokens=8,
+    )
+    # Trailing slash trimmed; override wins over the default.
+    assert captured["url"] == "http://gb10.local:11434/api/chat"
+
+
+def test_call_ollama_think_env_controls_payload(clean_ollama_env):
+    import httpx
+
+    captured: dict = {}
+
+    def fake_post(url, *, json, timeout):
+        captured["json"] = json
+        return _FakeOllamaResp(
+            200, {"message": {"content": "ok"}, "prompt_eval_count": 1, "eval_count": 1}
+        )
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    msgs = [{"role": "user", "content": "q"}]
+
+    # Unset -> no think key (model default preserved).
+    _call_ollama("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    assert "think" not in captured["json"]
+
+    # Falsey -> think=false (reasoning suppressed).
+    clean_ollama_env.setenv("PARALLAX_OLLAMA_THINK", "0")
+    _call_ollama("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    assert captured["json"]["think"] is False
+
+    # Truthy -> think=true.
+    clean_ollama_env.setenv("PARALLAX_OLLAMA_THINK", "true")
+    _call_ollama("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    assert captured["json"]["think"] is True
+
+
+def test_call_ollama_429_raises_ratelimit(clean_ollama_env):
+    import httpx
+
+    def fake_post(url, *, json, timeout):
+        return _FakeOllamaResp(429, None, text="too many requests")
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(RateLimitError, match="429"):
+        _call_ollama(
+            "ollama:qwen3.6:latest",
+            [{"role": "user", "content": "x"}],
+            temperature=0.0,
+            max_output_tokens=8,
+        )
+
+
+def test_call_ollama_http_error_raises_llmcallerror(clean_ollama_env):
+    import httpx
+
+    def fake_post(url, *, json, timeout):
+        return _FakeOllamaResp(500, None, text="boom")
+
+    clean_ollama_env.setattr(httpx, "post", fake_post)
+
+    with pytest.raises(LLMCallError, match="ollama HTTP 500"):
+        _call_ollama(
+            "ollama:qwen3.6:latest",
+            [{"role": "user", "content": "x"}],
+            temperature=0.0,
+            max_output_tokens=8,
+        )
+
+
+def test_dispatch_routes_ollama_and_local_prefixes(monkeypatch):
+    seen: list[str] = []
+
+    def fake_ollama(model, messages, *, temperature, max_output_tokens):
+        seen.append(model)
+        return {
+            "text": "ok",
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    monkeypatch.setattr(call_module, "_call_ollama", fake_ollama)
+
+    msgs = [{"role": "user", "content": "x"}]
+    call_module._dispatch("ollama:qwen3.6:latest", msgs, temperature=0.0, max_output_tokens=8)
+    call_module._dispatch("local:gemma4:31b", msgs, temperature=0.0, max_output_tokens=8)
+
+    assert seen == ["ollama:qwen3.6:latest", "local:gemma4:31b"]
+
+
+def test_ollama_think_toggle_busts_cache(isolated_cache, clean_ollama_env):
+    """Toggling PARALLAX_OLLAMA_THINK for the same model/messages must NOT
+    replay a stale cache entry — the knob changes the response, so it must be
+    part of the cache identity.
+
+    Regression for codex PR #87 finding: a think-unset run can cache an
+    empty-content answer (reasoning ate the whole num_predict budget); rerunning
+    with PARALLAX_OLLAMA_THINK=0 previously returned that stale empty answer
+    because the cache key ignored the think setting.
+    """
+    mp = clean_ollama_env
+    dispatched: list[str] = []
+
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+        think = os.environ.get("PARALLAX_OLLAMA_THINK", "").strip().lower()
+        dispatched.append(think)
+        # Mirror the real think-dependent behaviour: with think unset the hidden
+        # reasoning phase consumes the budget and content comes back empty; with
+        # think=0 the model answers directly.
+        text = "42" if think in call_module._FALSEY else ""
+        return {
+            "text": text,
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    mp.setattr(call_module, "_dispatch_with_retry", fake_dispatch)
+
+    msgs = [{"role": "user", "content": "what is 6*7?"}]
+
+    # First run: think unset -> empty content, cached under the think-unset key.
+    first = call("ollama:qwen3.6:latest", msgs)
+    assert first["_cached"] is False
+    assert first["text"] == ""
+
+    # Operator sets PARALLAX_OLLAMA_THINK=0 and reruns the SAME model/messages.
+    mp.setenv("PARALLAX_OLLAMA_THINK", "0")
+    second = call("ollama:qwen3.6:latest", msgs)
+    assert second["_cached"] is False, (
+        "think toggle did not bust the cache — stale empty answer replayed"
+    )
+    assert second["text"] == "42"
+    assert dispatched == ["", "0"], "expected a fresh dispatch after the think toggle"
+
+
+def test_hash_prompt_think_only_affects_ollama(clean_ollama_env):
+    """The think setting joins the cache identity for ollama models only; the
+    tri-state is normalized (``1`` == ``true``) and non-ollama models are
+    unaffected so their pre-existing cache rows stay reachable (backward compat).
+    """
+    mp = clean_ollama_env
+    msgs = [{"role": "user", "content": "q"}]
+
+    # Ollama: each distinct think state yields a distinct cache identity.
+    mp.delenv("PARALLAX_OLLAMA_THINK", raising=False)
+    h_unset = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_THINK", "true")
+    h_true = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_THINK", "0")
+    h_false = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    assert len({h_unset, h_true, h_false}) == 3
+
+    # Truthy variants normalize to the same identity (``1`` == ``true``).
+    mp.setenv("PARALLAX_OLLAMA_THINK", "1")
+    assert _hash_prompt("ollama:qwen3.6:latest", msgs, None, None) == h_true
+
+    # Backward compat: for non-ollama models the think env is irrelevant, so the
+    # hash is identical whether or not PARALLAX_OLLAMA_THINK is set — existing
+    # gemini/claude cache rows keyed before this change stay reachable.
+    mp.delenv("PARALLAX_OLLAMA_THINK", raising=False)
+    g_unset = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_THINK", "true")
+    g_think = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    assert g_unset == g_think
+
+
+def test_ollama_base_url_toggle_busts_cache(isolated_cache, clean_ollama_env):
+    """Changing the Ollama endpoint for the SAME model tag must NOT replay the
+    previous endpoint's cached answer — local tags are endpoint-local (a
+    different host can serve different weights/revisions), so the base URL is
+    part of the cache identity.
+
+    Regression for codex PR #87 round-2 finding.
+    """
+    mp = clean_ollama_env
+    seen_urls: list[str] = []
+
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+        url = call_module._ollama_base_url()
+        seen_urls.append(url)
+        # Different endpoints can serve different weights -> different answers.
+        text = "from-gb10" if "192.168.1.134" in url else "from-other"
+        return {
+            "text": text,
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    mp.setattr(call_module, "_dispatch_with_retry", fake_dispatch)
+    msgs = [{"role": "user", "content": "q"}]
+
+    # Default endpoint (GB10) -> cached under the default-endpoint identity.
+    first = call("ollama:qwen3.6:latest", msgs)
+    assert first["_cached"] is False
+    assert first["text"] == "from-gb10"
+
+    # Repoint at a different host and rerun the same tag: must re-dispatch.
+    mp.setenv("PARALLAX_OLLAMA_BASE_URL", "http://other-host:11434")
+    second = call("ollama:qwen3.6:latest", msgs)
+    assert second["_cached"] is False, (
+        "base-URL change did not bust the cache — stale endpoint answer replayed"
+    )
+    assert second["text"] == "from-other"
+    assert seen_urls == ["http://192.168.1.134:11434", "http://other-host:11434"]
+
+
+def test_hash_prompt_base_url_in_ollama_identity(clean_ollama_env):
+    """Base URL joins the ollama cache identity; equivalent configs (trailing
+    slash, host case, which env var supplies it) collapse to one identity so
+    they don't spuriously miss; non-ollama models are unaffected.
+    """
+    mp = clean_ollama_env
+    msgs = [{"role": "user", "content": "q"}]
+
+    mp.delenv("PARALLAX_OLLAMA_BASE_URL", raising=False)
+    mp.delenv("OLLAMA_BASE_URL", raising=False)
+    h_default = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+
+    mp.setenv("PARALLAX_OLLAMA_BASE_URL", "http://other-host:11434")
+    h_other = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    assert h_other != h_default, "distinct endpoint must yield a distinct identity"
+
+    # Equivalent configs collapse to the SAME identity: trailing slash trimmed,
+    # host case-folded, and the alternate env var (same value) is equivalent.
+    mp.delenv("PARALLAX_OLLAMA_BASE_URL", raising=False)
+    mp.setenv("OLLAMA_BASE_URL", "http://OTHER-HOST:11434/")
+    assert _hash_prompt("ollama:qwen3.6:latest", msgs, None, None) == h_other
+
+    # Non-ollama models: the base-URL env is irrelevant; identity unchanged.
+    mp.delenv("OLLAMA_BASE_URL", raising=False)
+    g1 = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_BASE_URL", "http://whatever:11434")
+    g2 = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    assert g1 == g2
+
+
+def test_ollama_generation_options_toggle_busts_cache(isolated_cache, clean_ollama_env):
+    """Changing generation options (max_output_tokens / temperature) for the SAME
+    ollama model+messages must NOT replay a stale cached answer — e.g. a truncated
+    answer cached under num_predict=8 must not be served for a rerun at 512.
+
+    Regression for codex PR #87 round-3 finding: _hash_prompt never received
+    temperature / max_output_tokens, so generation-knob sweeps replayed stale
+    (truncated / wrong-temperature) answers.
+    """
+    mp = clean_ollama_env
+    seen: list[tuple] = []
+
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+        seen.append((temperature, max_output_tokens))
+        # Larger budget -> fuller answer; different temperature -> different text.
+        return {
+            "text": f"t={temperature}:n={max_output_tokens}",
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    mp.setattr(call_module, "_dispatch_with_retry", fake_dispatch)
+    msgs = [{"role": "user", "content": "q"}]
+
+    a = call("ollama:qwen3.6:latest", msgs, max_output_tokens=8)
+    assert a["_cached"] is False
+    assert a["text"] == "t=0.0:n=8"
+
+    # Same model/messages, larger token budget -> must re-dispatch, not replay.
+    b = call("ollama:qwen3.6:latest", msgs, max_output_tokens=512)
+    assert b["_cached"] is False, (
+        "max_output_tokens change replayed a stale (truncated) answer"
+    )
+    assert b["text"] == "t=0.0:n=512"
+
+    # Same again but change temperature -> must re-dispatch.
+    c = call("ollama:qwen3.6:latest", msgs, max_output_tokens=512, temperature=0.7)
+    assert c["_cached"] is False, "temperature change replayed a stale answer"
+    assert c["text"] == "t=0.7:n=512"
+
+    # Re-issuing the first exact config is a cache HIT (identity is stable).
+    d = call("ollama:qwen3.6:latest", msgs, max_output_tokens=8)
+    assert d["_cached"] is True
+    assert d["text"] == "t=0.0:n=8"
+
+    assert seen == [(0.0, 8), (0.0, 512), (0.7, 512)]
+
+
+def test_hash_prompt_generation_options_in_ollama_identity(clean_ollama_env):
+    """Generation options join the ollama cache identity; equivalent numeric
+    inputs (0 == 0.0) collapse; non-ollama keys are deliberately unchanged across
+    options (the same gap for gemini/claude is a deferred follow-up).
+    """
+    mp = clean_ollama_env
+    msgs = [{"role": "user", "content": "q"}]
+    m = "ollama:qwen3.6:latest"
+
+    base = _hash_prompt(m, msgs, None, None, 0.0, 8)
+    diff_n = _hash_prompt(m, msgs, None, None, 0.0, 512)
+    diff_t = _hash_prompt(m, msgs, None, None, 0.7, 8)
+    assert len({base, diff_n, diff_t}) == 3
+
+    # Numeric normalization: int 0 == float 0.0, so equivalent configs collapse.
+    assert _hash_prompt(m, msgs, None, None, 0, 8) == base
+
+    # Non-ollama models: generation options are NOT folded into the key here
+    # (pre-existing gap deferred to a follow-up issue), so the hash is unchanged
+    # across different options — existing gemini/claude rows stay reachable.
+    g1 = _hash_prompt("gemini-2.5-flash", msgs, None, None, 0.0, 8)
+    g2 = _hash_prompt("gemini-2.5-flash", msgs, None, None, 0.9, 512)
+    assert g1 == g2

@@ -65,6 +65,17 @@ def _summary_complete(summary: dict) -> bool:
     return True
 
 
+def _load_summary(path: Path) -> dict | None:
+    """Parsed summary, or None when the cell must (re)run: covers a missing
+    file, crash-truncated JSON (process killed mid-write), and a summary
+    whose per-arm counts show a partial run."""
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return summary if _summary_complete(summary) else None
+
+
 def run_all() -> None:
     summaries: list[dict] = []
     t_total = time.time()
@@ -75,12 +86,12 @@ def run_all() -> None:
         summary_path = RESULTS_DIR / f"{tag}.summary.json"
 
         if summary_path.exists():
-            cached = json.loads(summary_path.read_text(encoding="utf-8"))
-            if _summary_complete(cached):
+            cached = _load_summary(summary_path)
+            if cached is not None:
                 print(f"[SKIP] {tag} — complete summary cached")
                 summaries.append(cached)
                 continue
-            print(f"[REDO] {tag} — cached summary incomplete (crashed run), re-running")
+            print(f"[REDO] {tag} — cached summary incomplete/unreadable, re-running")
 
         print(f"\n{'='*60}")
         print(f"[CELL] {tag}  ({LIMIT}Q, concurrency={CONCURRENCY})")
@@ -101,8 +112,14 @@ def run_all() -> None:
         elapsed = time.time() - t0
         print(f"[CELL] {tag} done in {elapsed:.0f}s  rc={rc}")
 
-        if summary_path.exists():
-            summaries.append(json.loads(summary_path.read_text()))
+        fresh = _load_summary(summary_path)
+        if fresh is None:
+            print(
+                f"[WARN] {tag} — no complete summary after run (rc={rc});"
+                " EXCLUDED from aggregate, rerun the sweep to repair"
+            )
+        else:
+            summaries.append(fresh)
 
     # ---- aggregate table -----------------------------------------------
     print(f"\n{'='*60}")

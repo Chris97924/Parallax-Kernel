@@ -57,6 +57,10 @@ def _env_identity() -> dict:
         "model": MODEL,
         "semantic_retrieval": os.environ.get("PARALLAX_SEMANTIC_RETRIEVAL", ""),
         "embedding_base_url": os.environ.get("PARALLAX_EMBEDDING_BASE_URL", ""),
+        # mirror embeddings.get_embedding_provider defaults so unset and an
+        # explicit "bge-m3" hash identically (no spurious cell re-runs)
+        "embedding_model": os.environ.get("PARALLAX_EMBEDDING_MODEL", "bge-m3").strip()
+        or "bge-m3",
         "ollama_base_url": os.environ.get("PARALLAX_OLLAMA_BASE_URL")
         or os.environ.get("OLLAMA_BASE_URL", ""),
         "ollama_think": os.environ.get("PARALLAX_OLLAMA_THINK", ""),

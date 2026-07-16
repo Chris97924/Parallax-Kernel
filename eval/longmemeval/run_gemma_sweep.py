@@ -19,6 +19,10 @@ from pathlib import Path
 
 # Bootstrap env before any Parallax import
 os.environ.setdefault("PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434")
+# Mirror the embedding host for the answer/judge LLM calls unless the caller
+# split them on purpose - parallax.llm.call reads PARALLAX_OLLAMA_BASE_URL,
+# not the embedding URL, and the two must not silently diverge.
+os.environ.setdefault("PARALLAX_OLLAMA_BASE_URL", os.environ["PARALLAX_EMBEDDING_BASE_URL"])
 os.environ.setdefault("PARALLAX_SEMANTIC_RETRIEVAL", "1")
 os.environ.setdefault("PARALLAX_OLLAMA_THINK", "false")
 

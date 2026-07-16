@@ -35,8 +35,12 @@ wheels = [
 
 [[package]]
 name = "aphelion"
-version = "0.5.0"
-source = { git = "https://github.com/Chris97924/Aphelion-Graph.git?rev=0a0e0905a7d3e765f0aa7273628fea62317d7ee8#0a0e0905a7d3e765f0aa7273628fea62317d7ee8" }
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/9a/90978cbc0eecb011d5a6f2bf2a0af340e7816dee0f9047e3094999278d70/aphelion-0.6.0.tar.gz", hash = "sha256:9a8df9ad2becc14bae7adb8d511901696769de45ba3bb4b3ac9d2958aba25837", size = 135880, upload-time = "2026-07-04T17:15:19.085Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/c7/b99f63887b74afcac21e18a96575e0fca85c1b7ddd02cfde3bc40b281753/aphelion-0.6.0-py3-none-any.whl", hash = "sha256:da644a387dbe46548024080697933f9419cb7dbf1213bb47462d09c611133a2d", size = 76767, upload-time = "2026-07-04T17:15:17.512Z" },
+]
 
 [[package]]
 name = "black"
@@ -809,7 +813,7 @@ server = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aphelion", git = "https://github.com/Chris97924/Aphelion-Graph.git?rev=0a0e0905a7d3e765f0aa7273628fea62317d7ee8" },
+    { name = "aphelion", specifier = ">=0.6" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=24" },
     { name = "boto3", marker = "extra == 'cloud'", specifier = ">=1.34" },
     { name = "boto3", marker = "extra == 'dev'", specifier = ">=1.34" },

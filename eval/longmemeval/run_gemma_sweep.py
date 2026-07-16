@@ -12,6 +12,7 @@ Usage (from repo root, with uv):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -47,8 +48,33 @@ GRID = [
 ]
 
 
+def _env_identity() -> dict:
+    """Everything OUTSIDE the summary schema that still changes results:
+    retrieval mode, embedding host, effective Ollama host (same precedence
+    parallax.llm.call uses) and think state, plus this driver's limit/model."""
+    return {
+        "limit": LIMIT,
+        "model": MODEL,
+        "semantic_retrieval": os.environ.get("PARALLAX_SEMANTIC_RETRIEVAL", ""),
+        "embedding_base_url": os.environ.get("PARALLAX_EMBEDDING_BASE_URL", ""),
+        "ollama_base_url": os.environ.get("PARALLAX_OLLAMA_BASE_URL")
+        or os.environ.get("OLLAMA_BASE_URL", ""),
+        "ollama_think": os.environ.get("PARALLAX_OLLAMA_THINK", ""),
+    }
+
+
+def _env_tag() -> str:
+    blob = json.dumps(_env_identity(), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:8]
+
+
+ENV_TAG = _env_tag()
+
+
 def cell_tag(top_k: int, max_chars: int) -> str:
-    return f"m8_gemma_tk{top_k}_mc{max_chars}"
+    # env hash in the tag = ANY env change switches result filenames, so a
+    # cache file can never be reused across a different runtime environment.
+    return f"m8_gemma_tk{top_k}_mc{max_chars}_env{ENV_TAG}"
 
 
 def _summary_complete(summary: dict, expected: dict) -> bool:
@@ -81,6 +107,7 @@ def _load_summary(path: Path, expected: dict) -> dict | None:
 def run_all() -> None:
     summaries: list[dict] = []
     t_total = time.time()
+    print(f"env identity {ENV_TAG}: {json.dumps(_env_identity(), sort_keys=True)}")
 
     for top_k, max_chars in GRID:
         tag = cell_tag(top_k, max_chars)

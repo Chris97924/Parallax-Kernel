@@ -51,29 +51,31 @@ def cell_tag(top_k: int, max_chars: int) -> str:
     return f"m8_gemma_tk{top_k}_mc{max_chars}"
 
 
-def _summary_complete(summary: dict) -> bool:
-    """A cached cell counts as done only if every question got a verdict in
-    BOTH arms - run_retrieval_vs_dump still writes a summary when workers
-    crash mid-run (slice_n intact, per-arm records missing)."""
-    expected = summary.get("slice_n")
-    if not isinstance(expected, int) or expected <= 0:
+def _summary_complete(summary: dict, expected: dict) -> bool:
+    """A cached cell counts as done only if it belongs to THIS sweep's cell
+    (limit/models/knobs all match - an old smoke run under the same tag must
+    not stand in) AND every question got a verdict in BOTH arms -
+    run_retrieval_vs_dump still writes a summary when workers crash mid-run
+    (slice_n intact, per-arm records missing)."""
+    if any(summary.get(k) != v for k, v in expected.items()):
         return False
+    n = expected["slice_n"]
     for arm in ("dump", "retrieval"):
         verdicts = summary.get(arm, {}).get("verdicts")
-        if not isinstance(verdicts, dict) or sum(verdicts.values()) != expected:
+        if not isinstance(verdicts, dict) or sum(verdicts.values()) != n:
             return False
     return True
 
 
-def _load_summary(path: Path) -> dict | None:
+def _load_summary(path: Path, expected: dict) -> dict | None:
     """Parsed summary, or None when the cell must (re)run: covers a missing
-    file, crash-truncated JSON (process killed mid-write), and a summary
-    whose per-arm counts show a partial run."""
+    file, crash-truncated JSON (process killed mid-write), a partial run,
+    and a summary from a different limit/model/knob combination."""
     try:
         summary = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return summary if _summary_complete(summary) else None
+    return summary if _summary_complete(summary, expected) else None
 
 
 def run_all() -> None:
@@ -84,14 +86,21 @@ def run_all() -> None:
         tag = cell_tag(top_k, max_chars)
         out = RESULTS_DIR / f"{tag}.jsonl"
         summary_path = RESULTS_DIR / f"{tag}.summary.json"
+        expected = {
+            "slice_n": LIMIT,
+            "answer_model": MODEL,
+            "judge_model": MODEL,
+            "top_k": top_k,
+            "max_chars": max_chars,
+        }
 
         if summary_path.exists():
-            cached = _load_summary(summary_path)
+            cached = _load_summary(summary_path, expected)
             if cached is not None:
                 print(f"[SKIP] {tag} — complete summary cached")
                 summaries.append(cached)
                 continue
-            print(f"[REDO] {tag} — cached summary incomplete/unreadable, re-running")
+            print(f"[REDO] {tag} — cached summary incomplete/unreadable/mismatched, re-running")
 
         print(f"\n{'='*60}")
         print(f"[CELL] {tag}  ({LIMIT}Q, concurrency={CONCURRENCY})")
@@ -112,7 +121,7 @@ def run_all() -> None:
         elapsed = time.time() - t0
         print(f"[CELL] {tag} done in {elapsed:.0f}s  rc={rc}")
 
-        fresh = _load_summary(summary_path)
+        fresh = _load_summary(summary_path, expected)
         if fresh is None:
             print(
                 f"[WARN] {tag} — no complete summary after run (rc={rc});"

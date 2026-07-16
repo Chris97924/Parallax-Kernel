@@ -18,6 +18,8 @@ import os
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 # Bootstrap env before any Parallax import
 os.environ.setdefault("PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434")
 # Mirror the embedding host for the answer/judge LLM calls unless the caller
@@ -28,8 +30,14 @@ if "PARALLAX_OLLAMA_BASE_URL" not in os.environ and "OLLAMA_BASE_URL" not in os.
     os.environ["PARALLAX_OLLAMA_BASE_URL"] = os.environ["PARALLAX_EMBEDDING_BASE_URL"]
 os.environ.setdefault("PARALLAX_SEMANTIC_RETRIEVAL", "1")
 os.environ.setdefault("PARALLAX_OLLAMA_THINK", "false")
+# Load the same .env run_retrieval_vs_dump.main() loads, BEFORE the env
+# identity is hashed below - otherwise a value set only in .env would be
+# hashed as its default while the actual run used the .env value
+# (load_dotenv never overrides vars that are already set, so ordering is
+# the only thing this changes; main()'s later call becomes a no-op).
+load_dotenv("E:/Workspace/Parallax/.env")
 
-from eval.longmemeval.run_retrieval_vs_dump import main as run_cell  # noqa: E402
+from eval.longmemeval.run_retrieval_vs_dump import ORACLE, main as run_cell  # noqa: E402
 
 RESULTS_DIR = Path(__file__).parent.parent / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -61,6 +69,15 @@ def _env_identity() -> dict:
         # explicit "bge-m3" hash identically (no spurious cell re-runs)
         "embedding_model": os.environ.get("PARALLAX_EMBEDDING_MODEL", "bge-m3").strip()
         or "bge-m3",
+        # dataset identity: ORACLE is run_retrieval_vs_dump's own resolved
+        # path (LONGMEMEVAL_DATA_DIR honored at its import) - a different
+        # oracle copy or a refreshed file must not reuse cached cells
+        "oracle_path": str(ORACLE),
+        "oracle_stat": (
+            f"{ORACLE.stat().st_size}:{ORACLE.stat().st_mtime_ns}"
+            if ORACLE.exists()
+            else "missing"
+        ),
         "ollama_base_url": os.environ.get("PARALLAX_OLLAMA_BASE_URL")
         or os.environ.get("OLLAMA_BASE_URL", ""),
         "ollama_think": os.environ.get("PARALLAX_OLLAMA_THINK", ""),

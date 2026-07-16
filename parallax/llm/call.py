@@ -4,7 +4,9 @@ Contract rules (ADR-006):
 
 * Every LLM call in Parallax goes through :func:`call`.
 * Cache key is deterministic over ``(model, messages, response_schema)`` —
-  or the caller-supplied ``cache_key`` when they want to pin a run.
+  or the caller-supplied ``cache_key`` when they want to pin a run. For
+  ``ollama:`` / ``local:`` models the normalized ``PARALLAX_OLLAMA_THINK`` state
+  also joins the key, since that knob changes the response.
 * 429 / rate-limit raises :class:`RateLimitError`; tenacity retries it a few
   times with a 5s..60s exponential backoff. Only when retries are exhausted
   do we fall through to the ``fallback_model`` branch.
@@ -131,6 +133,13 @@ def _hash_prompt(
         msg_blob = json.dumps(messages, sort_keys=True, ensure_ascii=False)
         schema_blob = json.dumps(response_schema or {}, sort_keys=True)
         raw = f"{model}::{msg_blob}::{schema_blob}"
+    # The Ollama think knob changes the response for the same model/messages, so
+    # fold its normalized state into the identity: toggling PARALLAX_OLLAMA_THINK
+    # must bust the cache rather than replay a stale (e.g. empty-content) entry.
+    # Scoped to ollama-prefixed models so gemini/claude rows keyed before this
+    # change stay reachable (they never depended on think).
+    if model.startswith(_OLLAMA_PREFIXES):
+        raw = f"{raw}::think={_ollama_think_state()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -307,6 +316,24 @@ def _strip_ollama_prefix(model: str) -> str:
     return model
 
 
+def _ollama_think_state() -> str:
+    """Normalize ``PARALLAX_OLLAMA_THINK`` to its canonical wire state.
+
+    Single source of truth for the tri-state that both ``_call_ollama`` (which
+    sends ``think=true`` / ``think=false`` or omits the key) and the cache
+    identity (:func:`_hash_prompt`) depend on: a truthy value -> ``"true"``, a
+    falsey value -> ``"false"``, anything else including unset -> ``"unset"``
+    (model default). Keeping the two sites on one normalizer stops the wire
+    payload and the cache key from disagreeing.
+    """
+    think_env = os.environ.get("PARALLAX_OLLAMA_THINK", "").strip().lower()
+    if think_env in _TRUTHY:
+        return "true"
+    if think_env in _FALSEY:
+        return "false"
+    return "unset"
+
+
 def _call_ollama(
     model: str,
     messages: list[dict],
@@ -350,10 +377,10 @@ def _call_ollama(
             "num_predict": max_output_tokens,
         },
     }
-    think_env = os.environ.get("PARALLAX_OLLAMA_THINK", "").strip().lower()
-    if think_env in _TRUTHY:
+    think = _ollama_think_state()
+    if think == "true":
         payload["think"] = True
-    elif think_env in _FALSEY:
+    elif think == "false":
         payload["think"] = False
     try:
         resp = httpx.post(f"{base_url}/api/chat", json=payload, timeout=timeout)

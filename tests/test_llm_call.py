@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,7 @@ from parallax.llm.call import (
     _call_gemini,
     _call_ollama,
     _gemini_keys,
+    _hash_prompt,
     _next_gemini_key,
     call,
 )
@@ -530,3 +532,81 @@ def test_dispatch_routes_ollama_and_local_prefixes(monkeypatch):
     call_module._dispatch("local:gemma4:31b", msgs, temperature=0.0, max_output_tokens=8)
 
     assert seen == ["ollama:qwen3.6:latest", "local:gemma4:31b"]
+
+
+def test_ollama_think_toggle_busts_cache(isolated_cache, clean_ollama_env):
+    """Toggling PARALLAX_OLLAMA_THINK for the same model/messages must NOT
+    replay a stale cache entry — the knob changes the response, so it must be
+    part of the cache identity.
+
+    Regression for codex PR #87 finding: a think-unset run can cache an
+    empty-content answer (reasoning ate the whole num_predict budget); rerunning
+    with PARALLAX_OLLAMA_THINK=0 previously returned that stale empty answer
+    because the cache key ignored the think setting.
+    """
+    mp = clean_ollama_env
+    dispatched: list[str] = []
+
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+        think = os.environ.get("PARALLAX_OLLAMA_THINK", "").strip().lower()
+        dispatched.append(think)
+        # Mirror the real think-dependent behaviour: with think unset the hidden
+        # reasoning phase consumes the budget and content comes back empty; with
+        # think=0 the model answers directly.
+        text = "42" if think in call_module._FALSEY else ""
+        return {
+            "text": text,
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    mp.setattr(call_module, "_dispatch_with_retry", fake_dispatch)
+
+    msgs = [{"role": "user", "content": "what is 6*7?"}]
+
+    # First run: think unset -> empty content, cached under the think-unset key.
+    first = call("ollama:qwen3.6:latest", msgs)
+    assert first["_cached"] is False
+    assert first["text"] == ""
+
+    # Operator sets PARALLAX_OLLAMA_THINK=0 and reruns the SAME model/messages.
+    mp.setenv("PARALLAX_OLLAMA_THINK", "0")
+    second = call("ollama:qwen3.6:latest", msgs)
+    assert second["_cached"] is False, (
+        "think toggle did not bust the cache — stale empty answer replayed"
+    )
+    assert second["text"] == "42"
+    assert dispatched == ["", "0"], "expected a fresh dispatch after the think toggle"
+
+
+def test_hash_prompt_think_only_affects_ollama(clean_ollama_env):
+    """The think setting joins the cache identity for ollama models only; the
+    tri-state is normalized (``1`` == ``true``) and non-ollama models are
+    unaffected so their pre-existing cache rows stay reachable (backward compat).
+    """
+    mp = clean_ollama_env
+    msgs = [{"role": "user", "content": "q"}]
+
+    # Ollama: each distinct think state yields a distinct cache identity.
+    mp.delenv("PARALLAX_OLLAMA_THINK", raising=False)
+    h_unset = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_THINK", "true")
+    h_true = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_THINK", "0")
+    h_false = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    assert len({h_unset, h_true, h_false}) == 3
+
+    # Truthy variants normalize to the same identity (``1`` == ``true``).
+    mp.setenv("PARALLAX_OLLAMA_THINK", "1")
+    assert _hash_prompt("ollama:qwen3.6:latest", msgs, None, None) == h_true
+
+    # Backward compat: for non-ollama models the think env is irrelevant, so the
+    # hash is identical whether or not PARALLAX_OLLAMA_THINK is set — existing
+    # gemini/claude cache rows keyed before this change stay reachable.
+    mp.delenv("PARALLAX_OLLAMA_THINK", raising=False)
+    g_unset = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_THINK", "true")
+    g_think = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    assert g_unset == g_think

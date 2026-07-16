@@ -20,6 +20,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Operator config layers BEFORE driver defaults: real shell env always wins
+# (load_dotenv never overrides existing vars), .env comes next, and the
+# setdefault seeds below only fill what neither supplied. Same file that
+# run_retrieval_vs_dump.main() loads - its later call becomes a no-op. This
+# must also precede the ENV_TAG hash so .env-only values are hashed as the
+# values the run actually uses.
+load_dotenv("E:/Workspace/Parallax/.env")
+
 # Bootstrap env before any Parallax import
 os.environ.setdefault("PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434")
 # Mirror the embedding host for the answer/judge LLM calls unless the caller
@@ -30,12 +38,6 @@ if "PARALLAX_OLLAMA_BASE_URL" not in os.environ and "OLLAMA_BASE_URL" not in os.
     os.environ["PARALLAX_OLLAMA_BASE_URL"] = os.environ["PARALLAX_EMBEDDING_BASE_URL"]
 os.environ.setdefault("PARALLAX_SEMANTIC_RETRIEVAL", "1")
 os.environ.setdefault("PARALLAX_OLLAMA_THINK", "false")
-# Load the same .env run_retrieval_vs_dump.main() loads, BEFORE the env
-# identity is hashed below - otherwise a value set only in .env would be
-# hashed as its default while the actual run used the .env value
-# (load_dotenv never overrides vars that are already set, so ordering is
-# the only thing this changes; main()'s later call becomes a no-op).
-load_dotenv("E:/Workspace/Parallax/.env")
 
 from eval.longmemeval.run_retrieval_vs_dump import ORACLE  # noqa: E402
 from eval.longmemeval.run_retrieval_vs_dump import main as run_cell  # noqa: E402

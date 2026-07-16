@@ -20,9 +20,11 @@ from pathlib import Path
 # Bootstrap env before any Parallax import
 os.environ.setdefault("PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434")
 # Mirror the embedding host for the answer/judge LLM calls unless the caller
-# split them on purpose - parallax.llm.call reads PARALLAX_OLLAMA_BASE_URL,
-# not the embedding URL, and the two must not silently diverge.
-os.environ.setdefault("PARALLAX_OLLAMA_BASE_URL", os.environ["PARALLAX_EMBEDDING_BASE_URL"])
+# routed them explicitly - parallax.llm.call checks PARALLAX_OLLAMA_BASE_URL
+# then OLLAMA_BASE_URL, so mirroring over either would hijack a deliberate
+# split; only fill the gap when NEITHER is set.
+if "PARALLAX_OLLAMA_BASE_URL" not in os.environ and "OLLAMA_BASE_URL" not in os.environ:
+    os.environ["PARALLAX_OLLAMA_BASE_URL"] = os.environ["PARALLAX_EMBEDDING_BASE_URL"]
 os.environ.setdefault("PARALLAX_SEMANTIC_RETRIEVAL", "1")
 os.environ.setdefault("PARALLAX_OLLAMA_THINK", "false")
 
@@ -49,6 +51,20 @@ def cell_tag(top_k: int, max_chars: int) -> str:
     return f"m8_gemma_tk{top_k}_mc{max_chars}"
 
 
+def _summary_complete(summary: dict) -> bool:
+    """A cached cell counts as done only if every question got a verdict in
+    BOTH arms - run_retrieval_vs_dump still writes a summary when workers
+    crash mid-run (slice_n intact, per-arm records missing)."""
+    expected = summary.get("slice_n")
+    if not isinstance(expected, int) or expected <= 0:
+        return False
+    for arm in ("dump", "retrieval"):
+        verdicts = summary.get(arm, {}).get("verdicts")
+        if not isinstance(verdicts, dict) or sum(verdicts.values()) != expected:
+            return False
+    return True
+
+
 def run_all() -> None:
     summaries: list[dict] = []
     t_total = time.time()
@@ -59,9 +75,12 @@ def run_all() -> None:
         summary_path = RESULTS_DIR / f"{tag}.summary.json"
 
         if summary_path.exists():
-            print(f"[SKIP] {tag} — summary already exists, loading from cache")
-            summaries.append(json.loads(summary_path.read_text()))
-            continue
+            cached = json.loads(summary_path.read_text(encoding="utf-8"))
+            if _summary_complete(cached):
+                print(f"[SKIP] {tag} — complete summary cached")
+                summaries.append(cached)
+                continue
+            print(f"[REDO] {tag} — cached summary incomplete (crashed run), re-running")
 
         print(f"\n{'='*60}")
         print(f"[CELL] {tag}  ({LIMIT}Q, concurrency={CONCURRENCY})")

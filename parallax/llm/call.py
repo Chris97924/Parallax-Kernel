@@ -5,8 +5,9 @@ Contract rules (ADR-006):
 * Every LLM call in Parallax goes through :func:`call`.
 * Cache key is deterministic over ``(model, messages, response_schema)`` —
   or the caller-supplied ``cache_key`` when they want to pin a run. For
-  ``ollama:`` / ``local:`` models the normalized ``PARALLAX_OLLAMA_THINK`` state
-  also joins the key, since that knob changes the response.
+  ``ollama:`` / ``local:`` models the normalized provider identity (base URL +
+  ``PARALLAX_OLLAMA_THINK`` state) also joins the key, since those ambient knobs
+  change the response for the same tag (see ``_ollama_provider_identity``).
 * 429 / rate-limit raises :class:`RateLimitError`; tenacity retries it a few
   times with a 5s..60s exponential backoff. Only when retries are exhausted
   do we fall through to the ``fallback_model`` branch.
@@ -133,13 +134,14 @@ def _hash_prompt(
         msg_blob = json.dumps(messages, sort_keys=True, ensure_ascii=False)
         schema_blob = json.dumps(response_schema or {}, sort_keys=True)
         raw = f"{model}::{msg_blob}::{schema_blob}"
-    # The Ollama think knob changes the response for the same model/messages, so
-    # fold its normalized state into the identity: toggling PARALLAX_OLLAMA_THINK
-    # must bust the cache rather than replay a stale (e.g. empty-content) entry.
-    # Scoped to ollama-prefixed models so gemini/claude rows keyed before this
-    # change stay reachable (they never depended on think).
+    # Ollama responses depend on ambient endpoint config (base URL, think knob)
+    # that the (model, messages, schema) tuple does not capture, so fold the
+    # normalized provider identity into the key: repointing PARALLAX_OLLAMA_*
+    # must bust the cache rather than replay a stale (wrong-endpoint or
+    # empty-content) entry. Scoped to ollama-prefixed models so gemini/claude
+    # rows keyed before this change stay reachable (they never depended on it).
     if model.startswith(_OLLAMA_PREFIXES):
-        raw = f"{raw}::think={_ollama_think_state()}"
+        raw = f"{raw}::{_ollama_provider_identity()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -302,10 +304,21 @@ _FALSEY = {"0", "false", "no", "off"}
 
 
 def _ollama_base_url() -> str:
+    """Return the normalized Ollama base URL used for BOTH the request path and
+    the cache identity, so the two can never disagree about the endpoint.
+
+    Env vars in :data:`_OLLAMA_BASE_URL_ENVS` are checked in order — the first
+    non-empty value wins — else the GB10 default. Normalization is deliberate so
+    equivalent configs don't spuriously miss the cache: surrounding whitespace is
+    stripped, trailing slashes removed, and the value lower-cased. Ollama base
+    URLs are ``scheme://host:port`` (scheme + host + port are case-insensitive)
+    with no case-sensitive path in normal use, so lower-casing only collapses
+    equivalent endpoints and never merges distinct ones.
+    """
     for env in _OLLAMA_BASE_URL_ENVS:
         val = os.environ.get(env, "").strip()
         if val:
-            return val.rstrip("/")
+            return val.rstrip("/").lower()
     return _DEFAULT_OLLAMA_BASE_URL
 
 
@@ -332,6 +345,33 @@ def _ollama_think_state() -> str:
     if think_env in _FALSEY:
         return "false"
     return "unset"
+
+
+def _ollama_provider_identity() -> str:
+    """Normalized, response-affecting Ollama config that must join the cache
+    identity so a rerun under different config re-dispatches instead of replaying
+    a stale answer. Built from the SAME normalizers ``_call_ollama`` uses for the
+    request, so the wire call and the cache key cannot disagree.
+
+    Components (each normalized to one canonical form so equivalent configs don't
+    spuriously miss):
+
+    * ``base`` — the endpoint (:func:`_ollama_base_url`). Endpoint-local: GB10 vs
+      another host can serve different weights/revisions for the SAME tag, so the
+      same ``ollama:``/``local:`` tag against a different base URL is a different
+      answer and must be a different key.
+    * ``think`` — the reasoning tri-state (:func:`_ollama_think_state`).
+
+    Deliberately EXCLUDED — do not change the content of a successful response
+    for identical ``(model, messages, schema)``:
+
+    * ``PARALLAX_OLLAMA_TIMEOUT`` — transport deadline only; a successful
+      response is byte-identical regardless of the timeout.
+    * ``temperature`` / ``num_predict`` — caller-supplied ``call()`` arguments,
+      not ambient endpoint config; they are handled uniformly across all
+      providers by the shared key policy, not this ollama-only identity.
+    """
+    return f"base={_ollama_base_url()}|think={_ollama_think_state()}"
 
 
 def _call_ollama(

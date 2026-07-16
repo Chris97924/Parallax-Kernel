@@ -610,3 +610,75 @@ def test_hash_prompt_think_only_affects_ollama(clean_ollama_env):
     mp.setenv("PARALLAX_OLLAMA_THINK", "true")
     g_think = _hash_prompt("gemini-2.5-flash", msgs, None, None)
     assert g_unset == g_think
+
+
+def test_ollama_base_url_toggle_busts_cache(isolated_cache, clean_ollama_env):
+    """Changing the Ollama endpoint for the SAME model tag must NOT replay the
+    previous endpoint's cached answer — local tags are endpoint-local (a
+    different host can serve different weights/revisions), so the base URL is
+    part of the cache identity.
+
+    Regression for codex PR #87 round-2 finding.
+    """
+    mp = clean_ollama_env
+    seen_urls: list[str] = []
+
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+        url = call_module._ollama_base_url()
+        seen_urls.append(url)
+        # Different endpoints can serve different weights -> different answers.
+        text = "from-gb10" if "192.168.1.134" in url else "from-other"
+        return {
+            "text": text,
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+        }
+
+    mp.setattr(call_module, "_dispatch_with_retry", fake_dispatch)
+    msgs = [{"role": "user", "content": "q"}]
+
+    # Default endpoint (GB10) -> cached under the default-endpoint identity.
+    first = call("ollama:qwen3.6:latest", msgs)
+    assert first["_cached"] is False
+    assert first["text"] == "from-gb10"
+
+    # Repoint at a different host and rerun the same tag: must re-dispatch.
+    mp.setenv("PARALLAX_OLLAMA_BASE_URL", "http://other-host:11434")
+    second = call("ollama:qwen3.6:latest", msgs)
+    assert second["_cached"] is False, (
+        "base-URL change did not bust the cache — stale endpoint answer replayed"
+    )
+    assert second["text"] == "from-other"
+    assert seen_urls == ["http://192.168.1.134:11434", "http://other-host:11434"]
+
+
+def test_hash_prompt_base_url_in_ollama_identity(clean_ollama_env):
+    """Base URL joins the ollama cache identity; equivalent configs (trailing
+    slash, host case, which env var supplies it) collapse to one identity so
+    they don't spuriously miss; non-ollama models are unaffected.
+    """
+    mp = clean_ollama_env
+    msgs = [{"role": "user", "content": "q"}]
+
+    mp.delenv("PARALLAX_OLLAMA_BASE_URL", raising=False)
+    mp.delenv("OLLAMA_BASE_URL", raising=False)
+    h_default = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+
+    mp.setenv("PARALLAX_OLLAMA_BASE_URL", "http://other-host:11434")
+    h_other = _hash_prompt("ollama:qwen3.6:latest", msgs, None, None)
+    assert h_other != h_default, "distinct endpoint must yield a distinct identity"
+
+    # Equivalent configs collapse to the SAME identity: trailing slash trimmed,
+    # host case-folded, and the alternate env var (same value) is equivalent.
+    mp.delenv("PARALLAX_OLLAMA_BASE_URL", raising=False)
+    mp.setenv("OLLAMA_BASE_URL", "http://OTHER-HOST:11434/")
+    assert _hash_prompt("ollama:qwen3.6:latest", msgs, None, None) == h_other
+
+    # Non-ollama models: the base-URL env is irrelevant; identity unchanged.
+    mp.delenv("OLLAMA_BASE_URL", raising=False)
+    g1 = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    mp.setenv("PARALLAX_OLLAMA_BASE_URL", "http://whatever:11434")
+    g2 = _hash_prompt("gemini-2.5-flash", msgs, None, None)
+    assert g1 == g2

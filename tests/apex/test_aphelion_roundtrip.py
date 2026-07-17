@@ -63,7 +63,12 @@ from aphelion.sig_pack import write_signatures_jsonl
 from aphelion.signer import HMACSigner, compute_package_canonical_hash
 from aphelion.verifier import VerifyResult, verify_package
 
-from parallax.apex.aphelion_export import ExportClaim, build_claim_markdown, export_claims
+from parallax.apex.aphelion_export import (
+    AphelionExportError,
+    ExportClaim,
+    build_claim_markdown,
+    export_claims,
+)
 from parallax.apex.aphelion_ingest import IngestReport, ingest_package
 from parallax.apex.audit_db import open_audit_db
 from parallax.apex.router import ApexPublicReadRouter
@@ -520,3 +525,66 @@ def test_frontmatter_omits_absent_and_empty_fields() -> None:
     assert "polarity: \"negate\"" in full
     assert "supersedes:" in full
     assert "target_claim_id:" in full
+
+
+# ---------------------------------------------------------------------------
+# Path-traversal guard (W6 cross-review Tier-A): an unsafe claim_id must never
+# become a filesystem write primitive (aphelion_export.py claims/<id>.md write).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../evil",
+        "../../evil",
+        "a/b",
+        "..",
+        "",
+        "x" * 100,
+        "claims/../../evil",
+        "0190ab63-5f8a-7a61-9b14-ffaa20c1d00d\n",  # valid uuid + trailing newline
+        "0190ab63-5f8a-7a61-9b14-ffaa20c1d00d\n../evil",  # newline injection
+        "0190AB63-5F8A-7A61-9B14-FFAA20C1D00D",  # uppercase -> not the lowercase v7 form
+    ],
+)
+def test_export_rejects_unsafe_claim_id(bad_id: str, tmp_path: Path) -> None:
+    """An unsafe/invalid claim_id raises AphelionExportError and writes nothing.
+
+    The guard runs before any dir creation / file write, so a traversal id can
+    never materialize a file inside OR outside source_dir.
+    """
+    src = tmp_path / "pkg_src"
+    tar = tmp_path / "out.aphelion.tar"
+    claim = ExportClaim(
+        claim_id=bad_id,
+        claim_instance_id=_uuid7(random.Random(1)),
+        body="body\n",
+        subject="s",
+    )
+    with pytest.raises(AphelionExportError):
+        export_claims(
+            [claim], source_dir=src, tar_path=tar, package_id=_uuid7(random.Random(2))
+        )
+    assert not list(tmp_path.rglob("*.md")), "no claim file may be written"
+    assert not list(tmp_path.rglob("*evil*")), "no traversal escapee may be written"
+    assert not tar.exists()
+
+
+def test_export_accepts_valid_claim_id(tmp_path: Path) -> None:
+    """A well-formed lowercase UUID v7 exports normally (guard is not over-broad)."""
+    pkg = export_claims(
+        [
+            ExportClaim(
+                claim_id=_uuid7(random.Random(7)),
+                claim_instance_id=_uuid7(random.Random(8)),
+                body="ok\n",
+                subject="s",
+            )
+        ],
+        source_dir=tmp_path / "ok_src",
+        tar_path=tmp_path / "ok.aphelion.tar",
+        package_id=_uuid7(random.Random(9)),
+    )
+    assert pkg.tar_path.exists()
+    assert len(pkg.claim_ids) == 1

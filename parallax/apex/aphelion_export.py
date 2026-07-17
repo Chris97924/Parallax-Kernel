@@ -48,6 +48,7 @@ feeds in — including a deterministic UUID-v7 derivation for provenance
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,7 @@ from aphelion.packer import pack as aphelion_pack
 from aphelion.yaml_canonical import emit_frontmatter
 
 __all__ = [
+    "AphelionExportError",
     "ExportClaim",
     "ExportedPackage",
     "build_claim_markdown",
@@ -75,6 +77,36 @@ _DEFAULT_CREATED_AT = "2026-01-01T00:00:00Z"
 _DEFAULT_PRODUCER = "parallax-apex-export"
 _DEFAULT_LICENSE = "Apache-2.0"
 _DEFAULT_ACTOR = "parallax-apex-export"
+
+# A claim_id becomes a filesystem path component (``claims/<claim_id>.md``), so
+# it MUST be validated before any path is built from it. The strictest bar
+# consistent with the read side is a UUID v7: the aphelion manifest validator
+# rejects a non-v7 ``claim_id`` and a ``claims/<id>.md`` path whose id is not v7
+# (``aphelion.validator`` UUID_V7_RE / CLAIM_PATH_RE), so this both closes the
+# path-traversal vector and matches what the ingest reader will accept. A UUID
+# v7 admits no path separators, ``..``, empty, or over-long input.
+_CLAIM_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+
+
+class AphelionExportError(ValueError):
+    """Raised when a claim cannot be safely exported (e.g. an unsafe claim_id)."""
+
+
+def _validate_claim_id(claim_id: object) -> None:
+    """Reject any ``claim_id`` that is not a bare lowercase UUID v7.
+
+    ``claim_id`` is interpolated into ``claims/<claim_id>.md`` and would
+    otherwise be a filesystem write primitive — a value like ``../../evil`` or
+    ``a/b`` escapes ``source_dir``. The UUID-v7 allowlist admits no path
+    separators, ``..``, or empty / over-long input, and matches what the
+    aphelion ingest reader requires, so a legitimate export is never blocked.
+    """
+    if not isinstance(claim_id, str) or not _CLAIM_ID_RE.fullmatch(claim_id):
+        raise AphelionExportError(
+            f"claim_id must be a lowercase UUID v7 string, got {claim_id!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -195,9 +227,20 @@ def export_claims(
     Returns:
         :class:`ExportedPackage` with the tar path, source dir, package id, and
         the ordered claim ids.
+
+    Raises:
+        AphelionExportError: if any ``claim_id`` is not a bare UUID v7 (it would
+            otherwise be interpolated into the claim's on-disk write path).
     """
     source = Path(source_dir)
-    (source / "claims").mkdir(parents=True, exist_ok=True)
+    # Validate every claim_id BEFORE creating dirs or writing any file: a
+    # claim_id is interpolated into a write path and must not be able to escape
+    # source_dir (path-traversal guard).
+    for claim in claims:
+        _validate_claim_id(claim.claim_id)
+    claims_dir = source / "claims"
+    claims_dir.mkdir(parents=True, exist_ok=True)
+    claims_root = claims_dir.resolve()
 
     manifest_claims: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
@@ -207,7 +250,16 @@ def export_claims(
         )
         md_bytes = build_claim_markdown(claim)
         rel_path = f"claims/{claim.claim_id}.md"
-        (source / rel_path).write_bytes(md_bytes)
+        target = (source / rel_path).resolve()
+        # Defense-in-depth behind the validated allowlist: confirm the resolved
+        # target stays inside the claims dir before writing.
+        try:
+            target.relative_to(claims_root)
+        except ValueError as exc:  # pragma: no cover - unreachable behind _validate_claim_id
+            raise AphelionExportError(
+                f"refusing to write claim file outside {claims_root}: {target}"
+            ) from exc
+        target.write_bytes(md_bytes)
 
         manifest_claims.append(
             {

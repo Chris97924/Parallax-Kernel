@@ -63,6 +63,7 @@ from aphelion.sig_pack import write_signatures_jsonl
 from aphelion.signer import HMACSigner, compute_package_canonical_hash
 from aphelion.verifier import VerifyResult, verify_package
 
+from parallax.apex import subject_index
 from parallax.apex.aphelion_export import (
     AphelionExportError,
     ExportClaim,
@@ -330,6 +331,8 @@ class RoundTrip:
     audit_rows_on_disk: int
     round1_tar: Path
     tmp_path: Path
+    audit_db_path: Path
+    package_dir: Path
 
 
 @pytest.fixture
@@ -396,6 +399,8 @@ def roundtrip(tmp_path: Path) -> RoundTrip:
         audit_rows_on_disk=audit_rows,
         round1_tar=exported.tar_path,
         tmp_path=tmp_path,
+        audit_db_path=audit_db_path,
+        package_dir=package_dir,
     )
 
 
@@ -588,3 +593,92 @@ def test_export_accepts_valid_claim_id(tmp_path: Path) -> None:
     )
     assert pkg.tar_path.exists()
     assert len(pkg.claim_ids) == 1
+
+
+# ---------------------------------------------------------------------------
+# Ingest is inside the proof chain (codex P2-B): store B is read by re-scanning
+# the package, so L1/L2 alone could pass even if ingest_package persisted audit
+# rows with the wrong claim_ids. Assert on ingest's OWN artifacts.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_artifacts_match_corpus(roundtrip: RoundTrip) -> None:
+    """The audit rows + subject index ingest wrote reflect the exact corpus."""
+    corpus_ids = {c.claim_id for c in roundtrip.source_claims}
+    corpus_subjects = {c.subject for c in roundtrip.source_claims if c.subject}
+    assert len(corpus_ids) == _CORPUS_SIZE
+
+    conn = sqlite3.connect(roundtrip.audit_db_path)
+    try:
+        rows = conn.execute(
+            "SELECT claim_id, outcome, source FROM audit_row"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Exact set + count over ingest's committed audit rows (not the re-scan).
+    assert len(rows) == _CORPUS_SIZE
+    assert {r[0] for r in rows} == corpus_ids
+    assert {r[1] for r in rows} == {"hit"}
+    assert {r[2] for r in rows} == {"aphelion"}
+
+    # The M6 ingest path also maintains the free-text subject index. Every corpus
+    # claim carries a subject, so it indexes exactly the corpus claim_ids +
+    # subjects.
+    index = subject_index.load_index(roundtrip.package_dir)
+    assert index is not None, "ingest_package must have written the subject index"
+    assert {entry.claim_id for entry in index.entries} == corpus_ids
+    assert {entry.subject for entry in index.entries} == corpus_subjects
+
+
+# ---------------------------------------------------------------------------
+# Source-dir reuse hygiene (codex P2-A): a re-export into a reused source_dir
+# must leave the exporter-owned claims/ subtree equal to exactly the new set —
+# no stale claim files carried over.
+# ---------------------------------------------------------------------------
+
+
+def test_export_reuse_dir_drops_stale_claims(tmp_path: Path) -> None:
+    """Re-exporting a smaller set into the same dir carries no stale claim file."""
+    shared_src = tmp_path / "shared_src"
+    rng = random.Random(4242)
+    big = [
+        ExportClaim(
+            claim_id=_uuid7(rng),
+            claim_instance_id=_uuid7(rng),
+            body=f"claim {i}\n",
+            subject=f"subject-{i}",
+        )
+        for i in range(3)
+    ]
+    export_claims(
+        big,
+        source_dir=shared_src,
+        tar_path=tmp_path / "big.aphelion.tar",
+        package_id=_uuid7(rng),
+    )
+    assert len(list((shared_src / "claims").glob("*.md"))) == 3
+
+    # Re-export ONLY the first claim into the SAME source dir.
+    small = [big[0]]
+    pkg2 = export_claims(
+        small,
+        source_dir=shared_src,
+        tar_path=tmp_path / "small.aphelion.tar",
+        package_id=_uuid7(rng),
+    )
+
+    expected = {f"claims/{big[0].claim_id}.md"}
+    # On-disk owned subtree == exactly the new set (this is what the fix repairs).
+    on_disk = {f"claims/{p.name}" for p in (shared_src / "claims").glob("*.md")}
+    assert on_disk == expected, f"stale claim files left behind: {on_disk - expected}"
+
+    # And the packed archive fileset matches its manifest (verify_package passes),
+    # containing exactly the smaller set.
+    verify_package(pkg2.tar_path, require_signed=False, require_notary=False)
+    packed = {
+        m.path
+        for m in read_members(pkg2.tar_path.read_bytes())
+        if m.path.startswith("claims/")
+    }
+    assert packed == expected

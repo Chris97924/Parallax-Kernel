@@ -242,6 +242,19 @@ def export_claims(
     claims_dir.mkdir(parents=True, exist_ok=True)
     claims_root = claims_dir.resolve()
 
+    # Idempotent dir reuse: this function owns ``claims/<uuid>.md``, so remove any
+    # claim files a prior export left behind before writing the new set. Scoped to
+    # ``*.md`` directly under the claims dir — the exact files this function
+    # writes — never other content elsewhere in source_dir; manifest.json and
+    # provenance.jsonl are overwritten below. Re-exporting a different/smaller set
+    # into the same dir would otherwise leave stale claim files on disk. (The
+    # aphelion packer is manifest-driven, so a stale file would not enter the
+    # archive today; this keeps the exporter's owned subtree consistent with the
+    # manifest it writes and defends the archive-fileset invariant for any
+    # directory-scanning consumer.)
+    for stale in claims_dir.glob("*.md"):
+        stale.unlink()
+
     manifest_claims: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     for claim in claims:

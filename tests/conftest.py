@@ -21,6 +21,10 @@ from parallax.sqlite_store import connect
 _ISOLATION_COV_RELAXED = (
     "test_regenerate",
     "test_hybrid_vs_lexical_quality",
+    # Focused single-feature harness: the Parallax<->Aphelion round-trip proves
+    # the export/ingest/read-back loop; its value is the L1/L2 assertions, not
+    # package-wide breadth, so run-alone would always miss the 80% gate.
+    "test_aphelion_roundtrip",
 )
 
 

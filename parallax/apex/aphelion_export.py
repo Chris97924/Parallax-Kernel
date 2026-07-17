@@ -239,20 +239,42 @@ def export_claims(
     for claim in claims:
         _validate_claim_id(claim.claim_id)
     claims_dir = source / "claims"
+    # The exporter OWNS claims/: it deletes stale ``*.md`` there and writes new
+    # claim files. If claims/ pre-exists as a symlink, following it would point
+    # the stale-file cleanup at an external directory (deleting files there) and
+    # let claim writes escape source_dir despite the UUID allowlist. Refuse a
+    # symlinked or non-directory owned subtree — it must be a real directory
+    # (``is_symlink()`` uses lstat, so it does not follow the link).
+    if claims_dir.is_symlink():
+        raise AphelionExportError(
+            f"exporter-owned claims/ must be a real directory, not a symlink: {claims_dir}"
+        )
+    if claims_dir.exists() and not claims_dir.is_dir():
+        raise AphelionExportError(
+            f"exporter-owned claims/ exists but is not a directory: {claims_dir}"
+        )
     claims_dir.mkdir(parents=True, exist_ok=True)
-    claims_root = claims_dir.resolve()
+    # Containment root is the OWNED path lineage — resolve source_dir, then append
+    # the owned ``claims`` component. NOT ``claims_dir.resolve()``, which a
+    # claims/ symlink could redirect to an external target and thereby satisfy the
+    # per-write containment check trivially (comparing the target against its own
+    # symlink destination).
+    claims_root = source.resolve() / "claims"
 
-    # Idempotent dir reuse: this function owns ``claims/<uuid>.md``, so remove any
-    # claim files a prior export left behind before writing the new set. Scoped to
-    # ``*.md`` directly under the claims dir — the exact files this function
-    # writes — never other content elsewhere in source_dir; manifest.json and
-    # provenance.jsonl are overwritten below. Re-exporting a different/smaller set
-    # into the same dir would otherwise leave stale claim files on disk. (The
-    # aphelion packer is manifest-driven, so a stale file would not enter the
-    # archive today; this keeps the exporter's owned subtree consistent with the
-    # manifest it writes and defends the archive-fileset invariant for any
-    # directory-scanning consumer.)
+    # Idempotent dir reuse: remove any claim files a prior export wrote before
+    # writing the new set. Scoped to ``*.md`` directly under the owned claims dir
+    # — the exact files this function writes — never other content in source_dir;
+    # manifest.json / provenance.jsonl are overwritten below. A stale ``*.md``
+    # that is itself a symlink is an artifact the exporter never creates, so it is
+    # refused rather than unlinked/followed. (The aphelion packer is
+    # manifest-driven, so a stale file would not enter the archive today; this
+    # keeps the owned subtree consistent with the manifest and defends the
+    # archive-fileset invariant for any directory-scanning consumer.)
     for stale in claims_dir.glob("*.md"):
+        if stale.is_symlink():
+            raise AphelionExportError(
+                f"exporter-owned claim file must not be a symlink: {stale}"
+            )
         stale.unlink()
 
     manifest_claims: list[dict[str, Any]] = []

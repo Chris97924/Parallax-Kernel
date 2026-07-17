@@ -682,3 +682,99 @@ def test_export_reuse_dir_drops_stale_claims(tmp_path: Path) -> None:
         if m.path.startswith("claims/")
     }
     assert packed == expected
+
+
+# ---------------------------------------------------------------------------
+# Symlinked owned-subtree safety (codex r2 P2): the P2-A stale-file cleanup must
+# never follow a symlinked claims/ (which would unlink files in an external
+# target and let writes escape source_dir). Refuse a symlinked / non-directory
+# owned subtree before any delete or write.
+# ---------------------------------------------------------------------------
+
+
+def test_export_rejects_symlinked_claims_dir(tmp_path: Path) -> None:
+    """A pre-existing symlinked claims/ is refused; its external target is untouched."""
+    external = tmp_path / "external_target"
+    external.mkdir()
+    decoy = external / "decoy.md"
+    decoy.write_bytes(b"external file - must not be touched\n")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    try:
+        (src / "claims").symlink_to(external, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not supported/permitted on this host")
+
+    with pytest.raises(AphelionExportError):
+        export_claims(
+            [
+                ExportClaim(
+                    claim_id=_uuid7(random.Random(1)),
+                    claim_instance_id=_uuid7(random.Random(2)),
+                    body="x\n",
+                    subject="s",
+                )
+            ],
+            source_dir=src,
+            tar_path=tmp_path / "o.aphelion.tar",
+            package_id=_uuid7(random.Random(3)),
+        )
+    # The external decoy must survive untouched — no cleanup unlink escaped.
+    assert decoy.exists()
+    assert decoy.read_bytes() == b"external file - must not be touched\n"
+    assert not (tmp_path / "o.aphelion.tar").exists()
+
+
+def test_export_rejects_claims_path_that_is_a_file(tmp_path: Path) -> None:
+    """claims/ pre-existing as a regular file (not a dir) is refused (always runs)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "claims").write_bytes(b"i am a file, not a directory\n")
+
+    with pytest.raises(AphelionExportError):
+        export_claims(
+            [
+                ExportClaim(
+                    claim_id=_uuid7(random.Random(1)),
+                    claim_instance_id=_uuid7(random.Random(2)),
+                    body="x\n",
+                    subject="s",
+                )
+            ],
+            source_dir=src,
+            tar_path=tmp_path / "o.aphelion.tar",
+            package_id=_uuid7(random.Random(3)),
+        )
+
+
+def test_export_rejects_symlinked_claim_file(tmp_path: Path) -> None:
+    """A stale claims/<id>.md that is itself a symlink is refused, not followed."""
+    external = tmp_path / "external_target"
+    external.mkdir()
+    victim = external / "victim.txt"
+    victim.write_bytes(b"external file - must not be touched\n")
+
+    src = tmp_path / "src"
+    (src / "claims").mkdir(parents=True)
+    try:
+        (src / "claims" / "stale.md").symlink_to(victim)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation not supported/permitted on this host")
+
+    with pytest.raises(AphelionExportError):
+        export_claims(
+            [
+                ExportClaim(
+                    claim_id=_uuid7(random.Random(1)),
+                    claim_instance_id=_uuid7(random.Random(2)),
+                    body="x\n",
+                    subject="s",
+                )
+            ],
+            source_dir=src,
+            tar_path=tmp_path / "o.aphelion.tar",
+            package_id=_uuid7(random.Random(3)),
+        )
+    assert victim.exists()
+    assert victim.read_bytes() == b"external file - must not be touched\n"

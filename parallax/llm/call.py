@@ -4,12 +4,13 @@ Contract rules (ADR-006):
 
 * Every LLM call in Parallax goes through :func:`call`.
 * Cache key is deterministic over ``(model, messages, response_schema)`` —
-  or the caller-supplied ``cache_key`` when they want to pin a run. For
-  ``ollama:`` / ``local:`` models the normalized provider identity (base URL,
-  ``PARALLAX_OLLAMA_THINK`` state, and generation options temperature /
-  ``num_predict``) also joins the key, since those knobs change the response for
-  the same tag (see ``_ollama_provider_identity``). The same gap for
-  gemini/claude keys is a known follow-up, not addressed here.
+  or the caller-supplied ``cache_key`` when they want to pin a run. The
+  response-affecting generation options (``temperature`` and the output-token
+  budget) also join the key for EVERY backend, since they change the response for
+  the same ``(model, messages, schema)``. ``ollama:`` / ``local:`` models fold
+  them in via the normalized provider identity (which additionally covers the base
+  URL and ``PARALLAX_OLLAMA_THINK`` state — see ``_ollama_provider_identity``);
+  gemini / claude fold them in via ``_generation_options_identity``.
 * 429 / rate-limit raises :class:`RateLimitError`; tenacity retries it a few
   times with a 5s..60s exponential backoff. Only when retries are exhausted
   do we fall through to the ``fallback_model`` branch.
@@ -124,6 +125,26 @@ def _connect_cache() -> sqlite3.Connection:
     return conn
 
 
+def _generation_options_identity(temperature: float, max_output_tokens: int) -> str:
+    """Normalized, response-affecting generation options folded into the cache key
+    for the API backends (gemini, claude) whose request payload carries them.
+
+    Same invariant #87 established for ollama (cache key == request payload):
+    ``temperature`` and the output-token budget both change the model's response
+    for identical ``(model, messages, schema)``, so a rerun under different values
+    must re-dispatch rather than replay a stale (wrong-temperature or truncated)
+    entry. Values are coerced to their canonical numeric type so equivalent inputs
+    (``0`` vs ``0.0``) collapse to one identity and don't spuriously miss the
+    cache. The ollama path folds these SAME two knobs in via
+    :func:`_ollama_provider_identity`, alongside its endpoint + think dimensions.
+    """
+    opts = {
+        "temperature": float(temperature),
+        "max_output_tokens": int(max_output_tokens),
+    }
+    return f"opts={json.dumps(opts, sort_keys=True)}"
+
+
 def _hash_prompt(
     model: str,
     messages: list[dict],
@@ -141,16 +162,19 @@ def _hash_prompt(
         msg_blob = json.dumps(messages, sort_keys=True, ensure_ascii=False)
         schema_blob = json.dumps(response_schema or {}, sort_keys=True)
         raw = f"{model}::{msg_blob}::{schema_blob}"
-    # Ollama responses depend on config the (model, messages, schema) tuple does
-    # not capture — ambient endpoint config (base URL, think knob) AND the
-    # generation options (temperature, num_predict) — so fold the normalized
-    # provider identity into the key: changing PARALLAX_OLLAMA_* or the token
-    # budget / temperature must bust the cache rather than replay a stale
-    # (wrong-endpoint, empty-content, or truncated) entry. Scoped to
-    # ollama-prefixed models so gemini/claude rows keyed before this change stay
-    # reachable (their key policy is unchanged; see _ollama_provider_identity).
+    # Fold response-affecting config the (model, messages, schema) tuple does not
+    # capture into the key, so a rerun under different knobs re-dispatches instead
+    # of replaying a stale entry (invariant: cache key == request payload). Every
+    # backend's request carries the generation options (temperature + output-token
+    # budget); ollama additionally carries ambient endpoint config (base URL, think
+    # knob). The ollama identity bundles the generation options together with those
+    # extra dimensions — its exact byte form is kept intact so #87's existing cache
+    # rows stay reachable — so it stays a single self-contained component; every
+    # other backend (gemini, claude) folds in the generation options here.
     if model.startswith(_OLLAMA_PREFIXES):
         raw = f"{raw}::{_ollama_provider_identity(temperature, max_output_tokens)}"
+    else:
+        raw = f"{raw}::{_generation_options_identity(temperature, max_output_tokens)}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -393,10 +417,10 @@ def _ollama_provider_identity(temperature: float, max_output_tokens: int) -> str
     * ``PARALLAX_OLLAMA_TIMEOUT`` — transport deadline only; a successful response
       is byte-identical regardless of the timeout.
 
-    Scope note: this folds generation options into the OLLAMA identity only. The
-    same pre-existing gap for gemini/claude (whose keys also omit temperature /
-    max_output_tokens) is intentionally left to a follow-up issue and NOT changed
-    here, to avoid invalidating existing gemini/claude cache rows.
+    Scope note: this folds generation options into the OLLAMA identity alongside
+    the endpoint + think dimensions. Gemini / claude fold the SAME generation
+    options into their key via :func:`_generation_options_identity`; this helper
+    keeps its exact byte form so #87's existing ollama cache rows stay reachable.
     """
     opts_blob = json.dumps(_ollama_options(temperature, max_output_tokens), sort_keys=True)
     return f"base={_ollama_base_url()}|think={_ollama_think_state()}|opts={opts_blob}"

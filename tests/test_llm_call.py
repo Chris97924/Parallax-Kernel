@@ -736,10 +736,9 @@ def test_ollama_generation_options_toggle_busts_cache(isolated_cache, clean_olla
 
 def test_hash_prompt_generation_options_in_ollama_identity(clean_ollama_env):
     """Generation options join the ollama cache identity; equivalent numeric
-    inputs (0 == 0.0) collapse; non-ollama keys are deliberately unchanged across
-    options (the same gap for gemini/claude is a deferred follow-up).
+    inputs (0 == 0.0) collapse. (Gemini/claude fold the same options in via a
+    parallel path — see test_hash_prompt_generation_options_in_api_backends.)
     """
-    mp = clean_ollama_env
     msgs = [{"role": "user", "content": "q"}]
     m = "ollama:qwen3.6:latest"
 
@@ -751,9 +750,33 @@ def test_hash_prompt_generation_options_in_ollama_identity(clean_ollama_env):
     # Numeric normalization: int 0 == float 0.0, so equivalent configs collapse.
     assert _hash_prompt(m, msgs, None, None, 0, 8) == base
 
-    # Non-ollama models: generation options are NOT folded into the key here
-    # (pre-existing gap deferred to a follow-up issue), so the hash is unchanged
-    # across different options — existing gemini/claude rows stay reachable.
-    g1 = _hash_prompt("gemini-2.5-flash", msgs, None, None, 0.0, 8)
-    g2 = _hash_prompt("gemini-2.5-flash", msgs, None, None, 0.9, 512)
-    assert g1 == g2
+
+@pytest.mark.parametrize("model", ["gemini-2.5-flash", "claude-sonnet-4-5"])
+def test_hash_prompt_generation_options_in_api_backends(model: str) -> None:
+    """Generation options (temperature, max_output_tokens) join the cache key for
+    the gemini/claude backends too — closing the #87 follow-up gap where API-backend
+    keys ignored the generation knobs their requests actually send.
+
+    Invariant (cache key == request payload): the same ``(model, messages, schema)``
+    under different options must hash differently, so a rerun re-dispatches instead
+    of replaying a stale (wrong-temperature or truncated) answer; identical options
+    stay deterministic so a legitimate cache HIT is reproducible.
+    """
+    msgs = [{"role": "user", "content": "q"}]
+
+    base = _hash_prompt(model, msgs, None, None, 0.0, 8)
+    diff_t = _hash_prompt(model, msgs, None, None, 0.7, 8)
+    diff_n = _hash_prompt(model, msgs, None, None, 0.0, 512)
+    # Distinct temperature and distinct token budget each yield a distinct key.
+    assert len({base, diff_t, diff_n}) == 3
+
+    # Same options -> deterministic, and numeric-normalized (int 0 == float 0.0),
+    # so re-issuing the identical config is a stable cache HIT.
+    assert _hash_prompt(model, msgs, None, None, 0.0, 8) == base
+    assert _hash_prompt(model, msgs, None, None, 0, 8) == base
+
+    # The cache_key-pinned path folds the options in too (the same knobs still
+    # change the response), so pinned runs also re-dispatch on an options change.
+    pinned = _hash_prompt(model, msgs, None, "pin", 0.0, 8)
+    assert _hash_prompt(model, msgs, None, "pin", 0.7, 8) != pinned
+    assert _hash_prompt(model, msgs, None, "pin", 0.0, 8) == pinned

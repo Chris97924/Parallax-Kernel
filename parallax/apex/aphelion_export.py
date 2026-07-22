@@ -109,6 +109,58 @@ def _validate_claim_id(claim_id: object) -> None:
         )
 
 
+def _has_line_break(value: str) -> bool:
+    """True if ``value`` contains any character the read side treats as a line
+    boundary.
+
+    :func:`aphelion.yaml_canonical.parse_frontmatter` reads every frontmatter key
+    from one physical line (it iterates ``text.splitlines()``), so a value that
+    ``splitlines()`` breaks apart is emitted by ``emit_frontmatter`` as a scalar
+    spanning multiple lines that the parser then rejects. Mirroring ``splitlines()``
+    here keeps the export guard and the read-side tokenizer agreed on exactly which
+    characters break a line (``\\n``, ``\\r``, ``\\r\\n`` and the other Unicode
+    boundaries) — including a lone trailing newline, which leaves ``[value]``.
+    """
+    return bool(value) and value.splitlines() != [value]
+
+
+def _reject_multiline_frontmatter(frontmatter: dict[str, Any]) -> None:
+    """Reject any frontmatter string value (or block-list item) with a line break.
+
+    ``emit_frontmatter`` writes every scalar on a single line as a quoted scalar;
+    a value with an embedded newline becomes a quoted scalar spanning multiple
+    physical lines. That still *packs* (``aphelion.packer`` hashes bytes, it does
+    not parse claim frontmatter), but the production ingest reader and the M7
+    router later call :func:`aphelion.yaml_canonical.parse_frontmatter`, which
+    rejects it as an unterminated quoted scalar — so the exporter would otherwise
+    emit a package production ingest refuses (issue #95).
+
+    Policy is to REJECT, not normalize, mirroring the read side (which raises
+    rather than canonicalizing multi-line scalars): ``subject`` / ``polarity`` /
+    ``valid_from`` / ``valid_until`` are identity-bearing in the v0.3 conflict
+    model (R1-R4 group on ``subject``), so silently collapsing a newline would
+    change which claims conflict. Turning the downstream parse failure into an
+    upstream, actionable :class:`AphelionExportError` is the faithful mirror and
+    matches the exporter's existing fail-fast guards (claim_id, symlinks).
+    """
+    for key, value in frontmatter.items():
+        if isinstance(value, str):
+            if _has_line_break(value):
+                raise AphelionExportError(
+                    f"frontmatter field {key!r} must not contain a line break — "
+                    f"emit would produce a multi-line scalar the ingest parser "
+                    f"rejects: {value!r}"
+                )
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and _has_line_break(item):
+                    raise AphelionExportError(
+                        f"frontmatter field {key!r} has a list item with a line "
+                        f"break — emit would produce a multi-line scalar the "
+                        f"ingest parser rejects: {item!r}"
+                    )
+
+
 @dataclass(frozen=True)
 class ExportClaim:
     """One Parallax claim to serialize into an Aphelion package.
@@ -173,6 +225,11 @@ def build_claim_markdown(claim: ExportClaim) -> bytes:
     of :func:`aphelion.yaml_canonical.split_frontmatter` +
     :func:`~aphelion.yaml_canonical.parse_frontmatter`, so a round-trip through
     a package + the M7 read path re-serializes byte-for-byte.
+
+    Raises:
+        AphelionExportError: if a frontmatter string value (or block-list item)
+            contains a line break — it would emit as a multi-line scalar the
+            production parser rejects, breaking that round-trip contract.
     """
     frontmatter: dict[str, Any] = {"claim_id": claim.claim_id}
     if claim.subject is not None:
@@ -191,6 +248,11 @@ def build_claim_markdown(claim: ExportClaim) -> bytes:
         frontmatter["target_claim_id"] = claim.target_claim_id
 
     ordered = dict(sorted(frontmatter.items()))
+    # Refuse to emit a frontmatter string with an embedded line break: it would
+    # serialize as a multi-line quoted scalar the production parser rejects. This
+    # makes the serialization primitive self-protecting for any direct caller, and
+    # is the natural home of the "emitted claim re-parses" round-trip contract.
+    _reject_multiline_frontmatter(ordered)
     yaml_block = emit_frontmatter(ordered)
     document = f"---\n{yaml_block}---\n{claim.body}"
     return document.encode("utf-8")
@@ -230,14 +292,23 @@ def export_claims(
 
     Raises:
         AphelionExportError: if any ``claim_id`` is not a bare UUID v7 (it would
-            otherwise be interpolated into the claim's on-disk write path).
+            otherwise be interpolated into the claim's on-disk write path), or any
+            frontmatter string carries a line break (it would emit as a multi-line
+            scalar the production ingest parser rejects — issue #95). Validation is
+            all-or-nothing: on failure nothing is written and no stale file removed.
     """
     source = Path(source_dir)
-    # Validate every claim_id BEFORE creating dirs or writing any file: a
-    # claim_id is interpolated into a write path and must not be able to escape
-    # source_dir (path-traversal guard).
+    # Validate every claim_id AND pre-build every claim's markdown BEFORE creating
+    # dirs, writing any file, or deleting a stale claim. A claim_id is interpolated
+    # into a write path and must not escape source_dir (path-traversal guard); and
+    # build_claim_markdown rejects a frontmatter string containing a line break
+    # (which would emit as a multi-line scalar the production ingest parser refuses
+    # — issue #95). Doing both up front keeps export all-or-nothing: one bad claim
+    # aborts with nothing written and no stale file removed.
+    prepared: list[tuple[ExportClaim, bytes]] = []
     for claim in claims:
         _validate_claim_id(claim.claim_id)
+        prepared.append((claim, build_claim_markdown(claim)))
     claims_dir = source / "claims"
     # The exporter OWNS claims/: it deletes stale ``*.md`` there and writes new
     # claim files. If claims/ pre-exists as a symlink, following it would point
@@ -279,11 +350,10 @@ def export_claims(
 
     manifest_claims: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
-    for claim in claims:
+    for claim, md_bytes in prepared:
         instance_id = claim.claim_instance_id or _derive_uuid7(
             package_id, claim.claim_id, "instance"
         )
-        md_bytes = build_claim_markdown(claim)
         rel_path = f"claims/{claim.claim_id}.md"
         target = (source / rel_path).resolve()
         # Defense-in-depth behind the validated allowlist: confirm the resolved

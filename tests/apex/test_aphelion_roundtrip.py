@@ -62,6 +62,7 @@ from aphelion.canonical_tar import pack as tar_pack
 from aphelion.sig_pack import write_signatures_jsonl
 from aphelion.signer import HMACSigner, compute_package_canonical_hash
 from aphelion.verifier import VerifyResult, verify_package
+from aphelion.yaml_canonical import parse_frontmatter, split_frontmatter
 
 from parallax.apex import subject_index
 from parallax.apex.aphelion_export import (
@@ -530,6 +531,167 @@ def test_frontmatter_omits_absent_and_empty_fields() -> None:
     assert "polarity: \"negate\"" in full
     assert "supersedes:" in full
     assert "target_claim_id:" in full
+
+
+# ---------------------------------------------------------------------------
+# Multi-line frontmatter guard (issue #95): a frontmatter string with an embedded
+# line break emits as a multi-line quoted scalar that packs fine but the
+# production ingest parser (parse_frontmatter) rejects as an unterminated scalar,
+# so the exporter would emit a package production ingest refuses. The exporter
+# must REJECT it up front (mirroring the read side, which raises rather than
+# normalizes) with a typed AphelionExportError.
+# ---------------------------------------------------------------------------
+
+_VALID_CID = "0190ab63-5f8a-7a61-9b14-ffaa20c1d00d"
+_VALID_IID = "0190ab63-5f8a-7a61-9b14-ffaa20c1d00e"
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "line one\nline two",  # embedded LF -> multi-line scalar
+        "trailing\n",  # lone trailing newline (still splits)
+        "carriage\rreturn",  # bare CR is a splitlines() boundary too
+        "windows\r\nbreak",  # CRLF
+    ],
+)
+def test_build_claim_markdown_rejects_multiline_subject(bad_value: str) -> None:
+    """build_claim_markdown refuses a frontmatter string containing a line break."""
+    with pytest.raises(AphelionExportError, match="line break"):
+        build_claim_markdown(
+            ExportClaim(
+                claim_id=_VALID_CID,
+                claim_instance_id=_VALID_IID,
+                body="Body.\n",
+                subject=bad_value,
+            )
+        )
+
+
+def test_build_claim_markdown_allows_empty_and_single_line() -> None:
+    """The guard is not over-broad: empty and ordinary single-line strings pass."""
+    md = build_claim_markdown(
+        ExportClaim(
+            claim_id=_VALID_CID,
+            claim_instance_id=_VALID_IID,
+            body="Body.\n",
+            subject="",  # empty string is single-line-safe, must not be rejected
+            polarity="affirm",
+        )
+    ).decode("utf-8")
+    assert 'subject: ""' in md
+    # And it round-trips through the real parser.
+    yaml_part, _ = split_frontmatter(md)
+    data, _ = parse_frontmatter(yaml_part)
+    assert data["subject"] == ""
+    assert data["polarity"] == "affirm"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["subject", "polarity", "valid_from", "valid_until", "target_claim_id"],
+)
+def test_export_rejects_multiline_string_field(field: str, tmp_path: Path) -> None:
+    """export_claims aborts on ANY multi-line frontmatter string, writing nothing.
+
+    The guard runs before any dir creation / file write / stale cleanup (same
+    all-or-nothing contract as the claim_id path-traversal guard), so a bad claim
+    can never materialize a partial package.
+    """
+    src = tmp_path / "pkg_src"
+    tar = tmp_path / "out.aphelion.tar"
+    fields: dict[str, object] = {
+        "claim_id": _uuid7(random.Random(1)),
+        "claim_instance_id": _uuid7(random.Random(2)),
+        "body": "body\n",
+        "subject": "ok-subject",
+    }
+    fields[field] = "bad\nvalue"  # inject a line break into the field under test
+    claim = ExportClaim(**fields)
+    with pytest.raises(AphelionExportError, match="line break"):
+        export_claims(
+            [claim], source_dir=src, tar_path=tar, package_id=_uuid7(random.Random(3))
+        )
+    assert not list(tmp_path.rglob("*.md")), "no claim file may be written"
+    assert not tar.exists()
+
+
+def test_export_rejects_multiline_supersedes_item(tmp_path: Path) -> None:
+    """A line break inside a block-list item (supersedes) is rejected too."""
+    src = tmp_path / "pkg_src"
+    tar = tmp_path / "out.aphelion.tar"
+    claim = ExportClaim(
+        claim_id=_uuid7(random.Random(1)),
+        claim_instance_id=_uuid7(random.Random(2)),
+        body="body\n",
+        subject="s",
+        supersedes=("0190ab63-5f8a-7a61-9b14-ffaa20c1d0aa", "bad\nitem"),
+    )
+    with pytest.raises(AphelionExportError, match="line break"):
+        export_claims(
+            [claim], source_dir=src, tar_path=tar, package_id=_uuid7(random.Random(3))
+        )
+    assert not list(tmp_path.rglob("*.md"))
+    assert not tar.exists()
+
+
+def test_export_multiline_does_not_delete_stale_claims(tmp_path: Path) -> None:
+    """A bad claim in a re-export must not delete the prior export's claim files.
+
+    Atomicity extends to the destructive stale-cleanup: validation happens before
+    the owned claims/ subtree is touched, so a failed re-export leaves the earlier
+    good package on disk intact.
+    """
+    shared_src = tmp_path / "shared_src"
+    good = ExportClaim(
+        claim_id=_uuid7(random.Random(10)),
+        claim_instance_id=_uuid7(random.Random(11)),
+        body="good\n",
+        subject="good-subject",
+    )
+    export_claims(
+        [good],
+        source_dir=shared_src,
+        tar_path=tmp_path / "good.aphelion.tar",
+        package_id=_uuid7(random.Random(12)),
+    )
+    before = {p.name for p in (shared_src / "claims").glob("*.md")}
+    assert before == {f"{good.claim_id}.md"}
+
+    bad = ExportClaim(
+        claim_id=_uuid7(random.Random(20)),
+        claim_instance_id=_uuid7(random.Random(21)),
+        body="bad\n",
+        subject="bad\nsubject",
+    )
+    with pytest.raises(AphelionExportError, match="line break"):
+        export_claims(
+            [bad],
+            source_dir=shared_src,
+            tar_path=tmp_path / "bad.aphelion.tar",
+            package_id=_uuid7(random.Random(22)),
+        )
+    # The prior good claim file survives — no stale-cleanup unlink escaped.
+    after = {p.name for p in (shared_src / "claims").glob("*.md")}
+    assert after == before
+    assert not (tmp_path / "bad.aphelion.tar").exists()
+
+
+def test_exported_package_frontmatter_reparses(roundtrip: RoundTrip) -> None:
+    """Every claims/*.md the exporter packed re-parses through the production
+    parser (issue #95 invariant): split_frontmatter + parse_frontmatter must
+    accept each emitted claim, proving the exporter never emits frontmatter the
+    ingest reader would refuse.
+    """
+    members = _claim_members(roundtrip.round1_tar)
+    assert len(members) == _CORPUS_SIZE
+    for path, data in members.items():
+        text = data.decode("utf-8")
+        yaml_part, body = split_frontmatter(text)
+        parsed, order = parse_frontmatter(yaml_part)
+        # claim_id is always present and every value is a single line.
+        assert "claim_id" in parsed, f"{path}: missing claim_id after parse"
+        assert order[0] == "claim_id", f"{path}: canonical key order broken"
 
 
 # ---------------------------------------------------------------------------

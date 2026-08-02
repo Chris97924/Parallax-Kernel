@@ -37,6 +37,21 @@ M4 canary = **shadow observer**：`parallax/canary_shadow.py` 對「已完成的
 
 上界 inclusive，讓用整數百分比的人剛好落在預期 stage。
 
+### GATE 5 收官註記（2026-08-02）
+
+Gate-5 於 2026-07-26 判 PASS。**該 PASS 成立，但它是 Phase-1 clock proof，不是語意驗證**——
+量測期間 100% 流量都是 M3 burn-in synthetic loader（`scripts/burn-in-synth-loader.py`），
+natural 流量自始為 0。Gate-5 的 discrepancy / unreachable 皆為 0，是因為兩邊 store 都查不到
+burn-in 的 claim id、兩個空集合 trivially match，不代表 Parallax 與 Aphelion 意見一致。
+
+依 `traffic-gap-resolution.md` §3.3，Phase-2 semantic gate（natural ≥ 100 calls/24h）在此窗內
+**不可能被滿足**，故 Chris 於 2026-08-02 拍板：Phase 2 **移交給後續的 natural-traffic milestone**，
+不再是 M4 的 exit condition；M4 以 Phase-1 clock proof 收官。
+
+配套的量測面同日補上：三個 dual-read DoD gauge 已依 `traffic_source` 分割，
+`{traffic_source="natural"}` 從此是一個會解析的 selector（沒有 natural 流量時回 no-data，
+而非看起來健康的 0.0）。細節見 `.omc/reports/tailsweep-runbook-20260802.md`。
+
 ## 3. Stage 0 — 首次部署（**目前尚未部署**）
 
 > 2026-06-07 實查 ZenBook：`/etc/parallax/canary.env` 不存在、`parallax-server.service.d/` 只有 `hardening.conf` 無 `canary.conf` → observer **尚未上線**。推進任何 stage 前先做本節。前置：M5 burn-in DoD 已於 2026-05-28 accepted（解鎖推進）。

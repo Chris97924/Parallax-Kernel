@@ -15,7 +15,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Fraction of dual-read requests where canonical and Aphelion disagreed. DoD: < 0.001 (0.1%). Green < 0.05%, yellow 0.05-0.1%, red > 0.1%.",
+      "description": "Fraction of dual-read requests where canonical and Aphelion disagreed, split by traffic_source. DoD: < 0.001 (0.1%) on the natural series only — synthetic is the M4 burn-in loader and unknown is the pre-2026-08-02 backlog of records written before the writer recorded traffic_source (closed-ended; drains out of the 72h window). A series that is absent rather than 0 means no records of that kind were observed. Green < 0.05%, yellow 0.05-0.1%, red > 0.1%.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -65,6 +65,13 @@
           "instant": true,
           "legendFormat": "natural",
           "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(parallax_dual_read_discrepancy_rate{traffic_source=\"unknown\"})",
+          "instant": true,
+          "legendFormat": "unknown (pre-2026-08-02 backlog)",
+          "refId": "C"
         }
       ],
       "title": "Dual-read discrepancy rate",

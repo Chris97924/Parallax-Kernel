@@ -120,14 +120,24 @@ _aphelion_counter = _get_or_create_counter(
     ["user_id", "traffic_source"],
 )
 
-_discrepancy_rate_gauge = _get_or_create_gauge(
-    "parallax_dual_read_discrepancy_rate",
-    (
-        "Rolling-window fraction of dual-read outcomes that are 'diverge'"
-        " (excludes aphelion_unreachable from denominator)."
-    ),
-    ["user_id", "traffic_source"],
-)
+# NOTE: this module deliberately does NOT register a
+# ``parallax_dual_read_discrepancy_rate`` gauge. It used to, labelled
+# ``["user_id", "traffic_source"]``, which made two producers of that one
+# metric name: this one, and the 72h DoD gauge built by
+# ``parallax.server.routes.metrics._build_payload``. Only the latter ever
+# reached the wire — ``_build_payload`` serializes a fresh
+# ``CollectorRegistry`` and plucks just three named counters out of the
+# default registry, so this gauge was set on every outcome and read by
+# nobody. Worse, the two carried different label sets, so anything that ever
+# did render the default registry would have produced two contradictory
+# definitions of one metric name.
+#
+# ``metrics.py`` is now the single producer, partitioned by
+# ``traffic_source``. The rolling-window rate this gauge mirrored is still
+# computed and still public — call ``dual_read_discrepancy_rate()``.
+# Re-adding a collector here would also put the high-cardinality ``user_id``
+# label back on the wire; ``parallax_aphelion_total`` already carries it and
+# has ~82k distinct values in the live corpus.
 
 _unreachable_rate_gauge = _get_or_create_gauge(
     "parallax_aphelion_unreachable_rate",
@@ -254,16 +264,16 @@ def record_dual_read_outcome(
 
     1. Increment ``parallax_dual_read_outcomes_total{outcome, user_id, traffic_source}``.
     2. Append to singleton rolling window.
-    3. Recompute and SET both rate gauges for ``user_id``.
+    3. Recompute and SET the unreachable-rate gauge for ``user_id``.
+
+    The discrepancy rate is deliberately not mirrored onto a collector here
+    — see the note above ``_unreachable_rate_gauge``.
     """
     source = _normalize_traffic_source(traffic_source)
     _outcomes_counter.labels(outcome=outcome, user_id=user_id, traffic_source=source).inc()
     if outcome != "skipped":
         _aphelion_counter.labels(user_id=user_id, traffic_source=source).inc()
     _singleton.record(user_id=user_id, outcome=outcome, traffic_source=source)
-    _discrepancy_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
-        _singleton.discrepancy_rate(user_id=user_id, traffic_source=source)
-    )
     _unreachable_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
         _singleton.aphelion_unreachable_rate(user_id=user_id, traffic_source=source)
     )

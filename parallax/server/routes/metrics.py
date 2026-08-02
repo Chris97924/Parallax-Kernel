@@ -30,11 +30,12 @@ re-walk the JSONL files. Tests can reset the cache via
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import threading
 import time
 from contextlib import closing
-from typing import cast
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import PlainTextResponse
@@ -50,13 +51,10 @@ from prometheus_client import (
 from parallax.obs.log import get_logger as _get_logger
 from parallax.obs.metrics import registry as _inhouse_registry
 from parallax.router.dual_read_metrics import (
-    arbitration_conflict_rate as _dual_read_arbitration_conflict_rate,
+    compute_all_rates as _dual_read_compute_all_rates,
 )
 from parallax.router.dual_read_metrics import (
-    discrepancy_rate as _dual_read_discrepancy_rate,
-)
-from parallax.router.dual_read_metrics import (
-    write_error_rate as _dual_read_write_error_rate,
+    load_records as _dual_read_load_records,
 )
 from parallax.router.live_arbitration import POLICY_VERSION_DEFAULT
 from parallax.server.auth import (
@@ -89,6 +87,8 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
         "arbitration_conflict_rate",
         "dual_read_write_error_rate",
         "dual_read_metrics_compute_error",
+        "dual_read_log_records_total",
+        "dual_read_log_dir_missing",
         "arbitration_p99_latency_ms",
         "arbitration_policy_version",
     }
@@ -98,6 +98,84 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
 # numerics from ralplan §6 line 416-426. Kept as a module constant rather
 # than a magic literal so an operator can grep for it.
 _DUAL_READ_WINDOW = "72h"
+
+# Read-side traffic_source partitions for the dual-read decision-log corpus.
+# ``unknown`` is deliberately NOT one of the two values the write side can
+# produce — see ``_record_traffic_source`` for why it exists and why it is
+# emitted rather than folded into ``natural``.
+_TRAFFIC_SOURCE_PARTITIONS: tuple[str, ...] = ("natural", "synthetic", "unknown")
+_TRAFFIC_SOURCE_UNKNOWN = "unknown"
+
+
+def _record_traffic_source(record: dict[str, Any]) -> str:
+    """Partition one decision-log record by its recorded ``traffic_source``.
+
+    Read-side semantics, and they are deliberately NOT the write-side
+    semantics — the asymmetry is the whole point, so do not "fix" it:
+
+    * **Write side** (``DualReadRouter._log_decision`` →
+      ``discrepancy_live._normalize_traffic_source``) resolves an *absent
+      or unrecognized* value to ``"natural"``. That is the fail-safe
+      mandated by ``docs/m4-prep/traffic-gap-resolution.md`` §6: a live
+      request that arrives with no ``X-Parallax-Traffic-Source`` header is
+      real production traffic and must never be discounted. Because that
+      normalization runs unconditionally, **every record written from that
+      code onward carries an explicit ``traffic_source``** of exactly
+      ``"synthetic"`` or ``"natural"``.
+
+    * **Read side** (here) maps a *missing* field to ``"unknown"``. A record
+      with no ``traffic_source`` key was not written by a request whose
+      header was absent — it was written by a build that could not record
+      the field at all, so its provenance is genuinely unknown. As of
+      2026-08-02 roughly 245k such records sit in the live 72h corpus and
+      they are known to be 100% synthetic burn-in traffic. Read-defaulting
+      them to ``"natural"`` would dump that entire backlog into the
+      natural-labelled gauges the moment those gauges exist, pinning
+      ``{traffic_source="natural"}`` at a conflict rate of 1.0 and poisoning
+      the exact Phase-2 gate (§3.3) the label was added to make measurable.
+
+    §6 rejected an ``"unknown"`` class on the grounds that no alert would be
+    wired against it. That objection is answered here: the bucket is
+    closed-ended (no new record can land in it), it drains to zero within
+    ``_DUAL_READ_WINDOW`` of deploy, and it is counted on
+    ``parallax_dual_read_log_records_total{traffic_source="unknown"}`` so an
+    operator can watch it drain rather than infer it.
+    """
+    raw = record.get("traffic_source")
+    if not isinstance(raw, str):
+        return _TRAFFIC_SOURCE_UNKNOWN
+    candidate = raw.strip().lower()
+    if candidate in ("synthetic", "natural"):
+        return candidate
+    # Present but unrecognized: the writer normalizes to one of the two known
+    # values, so this is foreign or hand-edited data. "Unknown" is the honest
+    # answer — folding it into ``natural`` would attribute unaudited records
+    # to the gate-bearing partition.
+    return _TRAFFIC_SOURCE_UNKNOWN
+
+
+@dataclasses.dataclass(frozen=True)
+class _DualReadSnapshot:
+    """One cache-miss worth of dual-read exposition state.
+
+    ``rates`` holds only the partitions that actually have in-window
+    records: a traffic source with no data yields **no series at all**
+    rather than ``0.0``. That is Prometheus-idiomatic for "no data" and,
+    unlike a zero, cannot be misread as "measured and healthy" — which is
+    the failure mode that produced the Gate-5 misdiagnosis.
+
+    ``counts`` is the opposite: it always carries every partition in
+    ``_TRAFFIC_SOURCE_PARTITIONS``, zeros included, because a count of zero
+    is itself a measurement ("we walked the corpus and found none"). Paired
+    with ``dir_missing`` it separates a healthy quiet window from a
+    misconfigured log directory.
+    """
+
+    rates: dict[str, dict[str, float]]
+    counts: dict[str, float]
+    dir_missing: float
+    compute_error: float
+
 
 router = APIRouter(tags=["meta"])
 
@@ -119,10 +197,9 @@ _cache: dict[str, float] | None = None
 _cache_at: float = 0.0
 
 # MED-METRICS-CACHE: separate cache for the dual-read gauges so /metrics
-# scrapes amortize the 3 file walks (discrepancy_rate +
-# arbitration_conflict_rate + write_error_rate) into one.
+# scrapes amortize the decision-log walk across the TTL window.
 _dual_read_cache_lock = threading.Lock()
-_dual_read_cache: dict[str, float] | None = None
+_dual_read_cache: _DualReadSnapshot | None = None
 _dual_read_cache_at: float = 0.0
 
 
@@ -171,67 +248,74 @@ def _collect_shadow_metrics() -> dict[str, float]:
     }
 
 
-def _collect_dual_read_metrics() -> dict[str, float]:
-    """Compute the 3 dual-read gauges from a single load_records walk.
+def _collect_dual_read_metrics() -> _DualReadSnapshot:
+    """Compute every dual-read gauge from **one** ``load_records`` walk.
 
-    MED-METRICS-CACHE — three separate calls to the public rate
-    functions would re-walk the JSONL directory three times per scrape.
-    Collapse to one walk + per-rate compute, then cache the result for
-    ``_CACHE_TTL_SECONDS`` so a 15s Prometheus scrape interval hits disk
-    once every other scrape rather than three times every scrape.
+    MED-METRICS-CACHE — the previous implementation called the three public
+    rate functions, each of which runs its own ``load_records``, so a
+    cache-miss scrape walked the JSONL directory three times (~270 MB of
+    reads every 30s against the live ~90 MB/72h corpus) while this docstring
+    claimed one. Load once here, partition the records by ``traffic_source``,
+    and hand each partition to ``compute_all_rates`` — which is exactly the
+    single-pass helper ``scripts/dual_read_continuity_check.py`` already uses.
 
-    MED-METRICS-EXC-CLASS — wraps each compute in a try/except that
-    logs ``exc_class`` so operators can grep for the failing rate
-    without parsing free-text strings. ``compute_error`` flips to 1.0
-    iff any compute raised so a single gauge surfaces the health of
-    this scrape.
+    MED-METRICS-EXC-CLASS — the whole load-and-compute is one failure domain
+    now that it is one walk, so a single try/except wraps it and logs
+    ``exc_class`` for grep-ability. ``compute_error`` flips to 1.0 iff it
+    raised, so a stuck-at-empty exposition can be told apart from a genuinely
+    empty window.
     """
-    out: dict[str, float] = {
-        "dual_read_discrepancy_rate": 0.0,
-        "arbitration_conflict_rate": 0.0,
-        "dual_read_write_error_rate": 0.0,
-        "compute_error": 0.0,
-    }
+    rates: dict[str, dict[str, float]] = {}
+    counts: dict[str, float] = dict.fromkeys(_TRAFFIC_SOURCE_PARTITIONS, 0.0)
+    dir_missing = 0.0
+    compute_error = 0.0
+
     try:
-        out["dual_read_discrepancy_rate"] = _dual_read_discrepancy_rate(_DUAL_READ_WINDOW)
+        loaded = _dual_read_load_records(since=parse_window(_DUAL_READ_WINDOW))
+        dir_missing = 1.0 if loaded.dir_missing else 0.0
+
+        partitions: dict[str, list[dict[str, Any]]] = {}
+        for record in loaded.records:
+            partitions.setdefault(_record_traffic_source(record), []).append(record)
+
+        for source, source_records in partitions.items():
+            counts[source] = float(len(source_records))
+            computed = _dual_read_compute_all_rates(source_records)
+            rates[source] = {
+                "dual_read_discrepancy_rate": float(computed["discrepancy_rate"]),
+                "arbitration_conflict_rate": float(computed["arbitration_conflict_rate"]),
+                "dual_read_write_error_rate": float(computed["write_error_rate"]),
+            }
     except Exception as exc:  # noqa: BLE001 — observability never crashes scrape
         _log.warning(
-            "metric.dual_read_discrepancy_rate_failed",
+            "metric.dual_read_metrics_failed",
             extra={
-                "event": "metric.dual_read_discrepancy_rate_failed",
+                "event": "metric.dual_read_metrics_failed",
                 "exc_class": type(exc).__name__,
                 "exc_str": str(exc),
             },
         )
-        out["compute_error"] = 1.0
-    try:
-        out["arbitration_conflict_rate"] = _dual_read_arbitration_conflict_rate(_DUAL_READ_WINDOW)
-    except Exception as exc:  # noqa: BLE001
-        _log.warning(
-            "metric.arbitration_conflict_rate_failed",
-            extra={
-                "event": "metric.arbitration_conflict_rate_failed",
-                "exc_class": type(exc).__name__,
-                "exc_str": str(exc),
-            },
+        # Emit nothing rather than a fabricated zero: a partially-built
+        # partition map would understate whichever rate happened to fail.
+        # ``dir_missing`` is kept at whatever the walk established before it
+        # broke — a missing directory is reported by ``load_records`` without
+        # raising, so discarding it here would hide the likeliest root cause.
+        return _DualReadSnapshot(
+            rates={},
+            counts=dict.fromkeys(_TRAFFIC_SOURCE_PARTITIONS, 0.0),
+            dir_missing=dir_missing,
+            compute_error=1.0,
         )
-        out["compute_error"] = 1.0
-    try:
-        out["dual_read_write_error_rate"] = _dual_read_write_error_rate(_DUAL_READ_WINDOW)
-    except Exception as exc:  # noqa: BLE001
-        _log.warning(
-            "metric.dual_read_write_error_rate_failed",
-            extra={
-                "event": "metric.dual_read_write_error_rate_failed",
-                "exc_class": type(exc).__name__,
-                "exc_str": str(exc),
-            },
-        )
-        out["compute_error"] = 1.0
-    return out
+
+    return _DualReadSnapshot(
+        rates=rates,
+        counts=counts,
+        dir_missing=dir_missing,
+        compute_error=compute_error,
+    )
 
 
-def _cached_dual_read_metrics() -> dict[str, float]:
+def _cached_dual_read_metrics() -> _DualReadSnapshot:
     """Read-then-fill cache for the dual-read gauges (mirror of shadow path)."""
     global _dual_read_cache, _dual_read_cache_at
     with _dual_read_cache_lock:
@@ -405,44 +489,87 @@ def _build_payload() -> str:
 
     # ------------------------------------------------------------------
     # M3b dual-read gauges (US-006-M3-T2.3). Best-effort: any failure in
-    # the file-based metric computation is swallowed and surfaced as 0.0
-    # so an empty / missing dual-read log directory does not 500 the
-    # scrape. The DoD CLI surfaces breaches with full detail; /metrics is
-    # the live observability surface and must stay up.
+    # the file-based metric computation is swallowed and surfaced on
+    # ``compute_error`` so an empty / missing dual-read log directory does
+    # not 500 the scrape. The DoD CLI surfaces breaches with full detail;
+    # /metrics is the live observability surface and must stay up.
     #
-    # MED-METRICS-CACHE — collapse 3 file walks into one disk read per
-    # cache-miss; serve cached values from concurrent scrapes for 30s.
+    # MED-METRICS-CACHE — one disk walk per cache-miss; concurrent scrapes
+    # are served from the 30s cache.
+    #
+    # Each rate is partitioned by ``traffic_source`` so PromQL can select
+    # the natural-traffic slice the Phase-2 semantic gate is defined on
+    # (traffic-gap-resolution.md §3.3). A partition with no in-window
+    # records emits NO series — never 0.0 — because "no natural traffic
+    # has ever been observed" and "natural traffic is clean" must not look
+    # identical on the wire.
     # ------------------------------------------------------------------
     dr_metrics = _cached_dual_read_metrics()
-    Gauge(
-        "parallax_dual_read_discrepancy_rate",
-        "Fraction of dual-read outcomes == 'diverge' over the 72h DoD window. "
-        "Denominator excludes aphelion_unreachable.",
+    dual_read_gauges = {
+        "dual_read_discrepancy_rate": Gauge(
+            "parallax_dual_read_discrepancy_rate",
+            "Fraction of dual-read outcomes == 'diverge' over the 72h DoD window, "
+            "by traffic_source. Denominator excludes aphelion_unreachable.",
+            labelnames=["traffic_source"],
+            registry=reg,
+        ),
+        "arbitration_conflict_rate": Gauge(
+            "parallax_arbitration_conflict_rate",
+            "Fraction of dual-read outcomes that produced an arbitration conflict "
+            "(winning_source in {tie, fallback}) over the 72h DoD window, by "
+            "traffic_source.",
+            labelnames=["traffic_source"],
+            registry=reg,
+        ),
+        "dual_read_write_error_rate": Gauge(
+            "parallax_dual_read_write_error_rate",
+            "Fraction of dual-read attempts that reported a write error over the 72h "
+            "DoD window, by traffic_source. Denominator excludes aphelion_unreachable.",
+            labelnames=["traffic_source"],
+            registry=reg,
+        ),
+    }
+    for source, source_rates in sorted(dr_metrics.rates.items()):
+        for metric_key, gauge in dual_read_gauges.items():
+            gauge.labels(traffic_source=source).set(source_rates[metric_key])
+
+    # Denominator + directory-health gauges. The Gate-5 investigation read an
+    # abandoned log directory, measured zero records, and concluded the
+    # exposition was stale — a rate gauge alone cannot distinguish "the
+    # corpus is empty" from "we are pointed at the wrong corpus". These two
+    # do. Counts are emitted for every partition including zeros, mirroring
+    # the shadow path's ``parallax_shadow_log_records_total``.
+    log_records = Gauge(
+        "parallax_dual_read_log_records_total",
+        "Parsed dual-read decision-log record count in the 72h DoD window, by "
+        "traffic_source. Counted before data-quality filtering and before the "
+        "aphelion_unreachable denominator exclusion, so this is corpus volume "
+        "rather than any single rate's denominator.",
+        labelnames=["traffic_source"],
         registry=reg,
-    ).set(dr_metrics["dual_read_discrepancy_rate"])
+    )
+    for source in _TRAFFIC_SOURCE_PARTITIONS:
+        log_records.labels(traffic_source=source).set(dr_metrics.counts[source])
+
     Gauge(
-        "parallax_arbitration_conflict_rate",
-        "Fraction of dual-read outcomes that produced an arbitration conflict "
-        "(winning_source in {tie, fallback}) over the 72h DoD window.",
+        "parallax_dual_read_log_dir_missing",
+        "1.0 iff the resolved dual-read decision-log directory does not exist "
+        "(DUAL_READ_LOG_DIR misconfigured or unmounted); else 0.0. Read with "
+        "parallax_dual_read_log_records_total to tell a misconfigured reader "
+        "apart from a genuinely quiet window.",
         registry=reg,
-    ).set(dr_metrics["arbitration_conflict_rate"])
-    Gauge(
-        "parallax_dual_read_write_error_rate",
-        "Fraction of dual-read attempts that reported a write error over the 72h "
-        "DoD window. Denominator excludes aphelion_unreachable.",
-        registry=reg,
-    ).set(dr_metrics["dual_read_write_error_rate"])
+    ).set(dr_metrics.dir_missing)
 
     # MED-METRICS-EXC-CLASS — surface compute health on a dedicated gauge
-    # so a stuck-at-0 in any of the three rates above can be told apart
-    # from a true zero rate.
+    # so a stuck-at-0 in any of the rates above can be told apart from a
+    # true zero rate.
     Gauge(
         "parallax_dual_read_metrics_compute_error",
-        "1.0 iff any dual-read metric compute call raised this scrape; "
+        "1.0 iff the dual-read metric computation raised this scrape; "
         "else 0.0. Operators alert on this rather than guessing why a "
         "rate gauge sits at 0.0.",
         registry=reg,
-    ).set(dr_metrics["compute_error"])
+    ).set(dr_metrics.compute_error)
 
     # Architect-flagged observability gap: real arbitration p99 latency wiring
     # is deferred to a future T1.4 follow-up. Expose 0.0 as a placeholder so

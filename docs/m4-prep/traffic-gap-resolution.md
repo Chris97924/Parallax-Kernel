@@ -93,6 +93,22 @@ If natural sample never reaches 100/24h within the 14d window:
 
 This double gate (synthetic for clock, natural for semantics) addresses both Sonnet's "synthetic-only could mask bugs" and Codex's "natural-required for production fitness" concerns.
 
+#### 2026-08-02 — WARN_NATURAL_INSUFFICIENT resolved (Chris decision)
+
+The `WARN_NATURAL_INSUFFICIENT` branch above is now settled for M4.
+
+Measured state: natural sample size has been **0 for the entire burn-in**. Every `/query` since the loader started on 2026-06-10 carries `user_id=parallax-burn-in-synth`, and `parallax_aphelion_total{traffic_source="natural"}` has never been non-zero. Phase 2 was therefore not satisfiable at any point in the 14-day window — not "failed", but unmeasurable for want of a denominator.
+
+Decision:
+
+- **Gate-5 (2026-07-26) closes out as a valid Phase-1 clock proof.** The series existed continuously for the required window and the clock ran. That is exactly what Phase 1 asserts, and it stands.
+- Gate-5's items 2–4 (`discrepancy_rate` 0.000000, `aphelion_unreachable_rate` 0.000000, min_hits 82,387) were measured on 100% synthetic traffic that returns zero hits from **both** stores. Two empty result sets match trivially, so those zeros say the burn-in claim ids are absent from both stores — not that Parallax and Aphelion agree. They are not semantic validation and must not be cited as such.
+- **Phase 2 (semantic GREEN, ≥100 natural calls/24h) is re-homed to the natural-traffic milestone.** It is not an M4 exit condition. M4 closes on the Phase-1 clock proof.
+
+This does not weaken the gate — it moves it to the first milestone where it can actually be evaluated. The metrics layer needed to evaluate it landed the same day: the three dual-read DoD gauges are now partitioned by `traffic_source`, so `{traffic_source="natural"}` is a selector that resolves rather than one that silently matches every series. Until natural traffic exists that selector returns no data, which is the honest reading.
+
+See `.omc/reports/tailsweep-runbook-20260802.md` for the measurement that drove this.
+
 ### 3.4 PENDING_IMPLEMENTATION gate (added 2026-05-09 Phase-4 review)
 
 Items 4.7 (`parallax canary --dod` Phase-1/Phase-2 split) and 4.8 (burn-in monitor split) were PENDING at freeze time and shipped via PR #50 on 2026-05-10. The DoD evaluator now has awareness of `traffic_source` and can distinguish synthetic from natural traffic.

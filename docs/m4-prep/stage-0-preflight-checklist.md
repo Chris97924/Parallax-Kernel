@@ -51,6 +51,35 @@ stage-0-preflight-checklist.md  ← 本文件：啟動前 gate check (全綠才 
 - [ ] **crosswalk_miss_rate < 5%**（測量窗口 +48h）
 - [ ] **circuit_open_count_72h < 3**
 
+### ⚠️ 前置：log dir 一律從 service env 解析，不得用 repo default
+
+> **新增 2026-08-02**（Gate-5 誤判的直接成因）
+
+下面三條 `dual_read_continuity_check` 全部讀 dual-read decision log 目錄。
+該目錄由 **`DUAL_READ_LOG_DIR`** 決定（writer `parallax/router/dual_read_decision_log.py`、
+reader `parallax/router/dual_read_metrics.py` 兩邊都是這個規則）；**只有** env 未設時才落回
+repo 內建 default `parallax/logs/`。
+
+驗證前先在**跑 service 的那台機器上、用 service 自己的 env** 取出實際路徑：
+
+```bash
+# ZenBook: 取 systemd 實際注入的值，不要相信 shell 裡的 env
+systemctl show parallax-server.service -p Environment | tr ' ' '\n' | grep DUAL_READ_LOG_DIR
+# 再把取到的值顯式帶進工具
+dual_read_continuity_check --log-dir="<上面取到的路徑>" ...
+```
+
+Gate-5（2026-07-26）跳過了這一步，改讀 repo default，量到 0 筆記錄，據此判定
+`arbitration_conflict_rate` 的 exposition 是 stale。實際上 service 目錄
+（`/home/chris/parallax-data/dual-read-logs`）自 2026-05-15 起未曾中斷，當時窗內有 245,491 筆。
+repo default 那個路徑在 systemd hardening（`ProtectHome=read-only`）下 service 根本寫不進去，
+所以它**不可能**是 production sink。
+
+同一個盲點現在也有機器可讀的訊號：`/metrics` 會輸出
+`parallax_dual_read_log_dir_missing`（目錄不存在時為 1.0）與
+`parallax_dual_read_log_records_total{traffic_source=...}`（窗內筆數，含 0）。
+量到 0 之前先看這兩個 gauge，別再用 rate gauge 反推目錄健康。
+
 ### 驗證命令
 
 ```bash

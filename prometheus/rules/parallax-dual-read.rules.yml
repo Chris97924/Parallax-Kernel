@@ -68,9 +68,28 @@ groups:
             Lifespan drain handler hit the 15-minute timeout — in-flight requests
             were force-cut. Investigate stuck connections or upstream blocks.
 
+      # The three dual-read DoD gauges below are exposed by
+      # parallax/server/routes/metrics.py partitioned by `traffic_source`
+      # (`natural` | `synthetic` | `unknown`). All three alerts select
+      # `natural` only, which is the Phase-2 semantic gate defined in
+      # docs/m4-prep/traffic-gap-resolution.md §3.3 — the M4 burn-in
+      # synthetic loader runs continuously and legitimately produces a 100%
+      # arbitration-conflict rate (it queries claim ids present in neither
+      # store), so an unpartitioned selector alerts on the loader forever.
+      #
+      # `unknown` is the pre-2026-08-02 backlog: decision records written
+      # before the writer recorded traffic_source at all. That bucket is
+      # closed-ended and drains out of the 72h window; it is deliberately
+      # NOT alerted on, because its provenance is unaudited. Watch it via
+      # parallax_dual_read_log_records_total{traffic_source="unknown"}.
+      #
+      # With no natural traffic the `natural` series is ABSENT rather than
+      # 0.0, so these alerts sit in no-data instead of falsely reading
+      # healthy. DualReadDecisionLogSilent below is what catches the case
+      # where the whole corpus goes missing.
       - alert: DualReadDiscrepancyRateHigh
         expr: |
-          max by (user_id, traffic_source) (parallax_dual_read_discrepancy_rate) > 0.001
+          max by (traffic_source) (parallax_dual_read_discrepancy_rate{traffic_source="natural"}) > 0.001
         for: 30m
         labels:
           severity: warning
@@ -86,7 +105,8 @@ groups:
       # — alert is sized to avoid false positives during normal operation;
       # DoD threshold gates corpus exit. Both surface the same gauge.
       - alert: ArbitrationConflictRateHigh
-        expr: parallax_arbitration_conflict_rate > 0.015
+        expr: |
+          max by (traffic_source) (parallax_arbitration_conflict_rate{traffic_source="natural"}) > 0.015
         for: 1m
         labels:
           severity: warning
@@ -101,7 +121,8 @@ groups:
       # Alert threshold (0.05%) intentionally looser than 14-day corpus DoD
       # exit threshold (0.02%) — see ArbitrationConflictRateHigh rationale above.
       - alert: DualReadWriteErrorRateHigh
-        expr: parallax_dual_read_write_error_rate > 0.0005
+        expr: |
+          max by (traffic_source) (parallax_dual_read_write_error_rate{traffic_source="natural"}) > 0.0005
         for: 2m
         labels:
           severity: warning
@@ -112,3 +133,37 @@ groups:
             dual_read_write_error_rate exceeded 0.05% for 2 minutes. Check
             primary write path and Aphelion bridge stub for raised exceptions.
             Runbook: docs/m3-runbooks/observability-cookbook.md §5 場景 A.
+
+      # Selecting {traffic_source="natural"} above means the three DoD alerts
+      # go quiet when there is no natural traffic — correct, but it removes
+      # the only signal that the decision-log corpus is being read at all.
+      # This alert is that signal. It is the direct remediation of the Gate-5
+      # misdiagnosis (2026-07-26), where an investigation pointed at the wrong
+      # log directory, measured zero records, and concluded the exposition was
+      # stale — a rate gauge alone cannot tell "empty corpus" from "wrong
+      # corpus". `dir_missing` catches a misconfigured DUAL_READ_LOG_DIR;
+      # the record-count arm catches a live-but-silent writer. Both are
+      # unconditional on traffic_source: a corpus that vanishes is a fault
+      # whether or not natural traffic exists.
+      - alert: DualReadDecisionLogSilent
+        # `sum without (traffic_source)` collapses only the partition label,
+        # keeping job/instance so a single silent instance is not masked by a
+        # healthy one. Note this cannot fire when the series is absent
+        # entirely (scrape down) — `up == 0` owns that case.
+        expr: |
+          parallax_dual_read_log_dir_missing > 0
+          or sum without (traffic_source) (parallax_dual_read_log_records_total) == 0
+        for: 15m
+        labels:
+          severity: warning
+          component: parallax_dual_read
+        annotations:
+          summary: Dual-read decision log is missing or empty for 15min
+          description: |
+            The /metrics exposition resolved a dual-read decision-log directory
+            that does not exist, or walked it and found zero records in the 72h
+            window. Every dual-read DoD gauge is derived from that corpus, so
+            they are all unmeasured — not healthy — while this fires.
+            Check DUAL_READ_LOG_DIR on the service (systemd env, NOT the repo
+            default) and confirm the writer is still appending.
+            Runbook: docs/m4-prep/stage-0-preflight-checklist.md §2.

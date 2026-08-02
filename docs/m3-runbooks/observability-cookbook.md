@@ -93,8 +93,13 @@ groups:
     interval: 30s
     rules:
       # discrepancy（M3 DoD 主訊號）
+      # 2026-08-02 起 selector 帶 traffic_source：三個 dual-read DoD gauge 都
+      # 依 partition 分 label，門檻只對 natural 判（synthetic = burn-in loader，
+      # unknown = 舊 corpus）。沒有自然流量時該 series **不存在**（no-data），
+      # 不是 0.0——這是刻意的，0 會被誤讀成「量過而且健康」。
       - alert: DualReadDiscrepancyRateHigh
-        expr: parallax_dual_read_discrepancy_rate > 0.001     # 0.1 %
+        expr: |
+          max by (traffic_source) (parallax_dual_read_discrepancy_rate{traffic_source="natural"}) > 0.001
         for: 30m
         labels: { severity: warning, component: parallax_dual_read }
 
@@ -132,14 +137,18 @@ groups:
 
 ```yaml
 - alert: ArbitrationConflictRateHigh
-  expr: parallax_arbitration_conflict_rate > 0.015      # 1.5 % alert / 1 % corpus DoD
+  # 1.5 % alert / 1 % corpus DoD；2026-08-02 起只對 natural partition 判
+  expr: |
+    max by (traffic_source) (parallax_arbitration_conflict_rate{traffic_source="natural"}) > 0.015
   for: 1m
   labels: { severity: warning, component: parallax_dual_read }
   annotations:
     runbook: docs/m3-runbooks/observability-cookbook.md#場景-b-arbitration-conflict
 
 - alert: DualReadWriteErrorRateHigh
-  expr: parallax_dual_read_write_error_rate > 0.0005    # 0.05 % alert / 0.02 % corpus DoD
+  # 0.05 % alert / 0.02 % corpus DoD；2026-08-02 起只對 natural partition 判
+  expr: |
+    max by (traffic_source) (parallax_dual_read_write_error_rate{traffic_source="natural"}) > 0.0005
   for: 2m
   labels: { severity: warning, component: parallax_dual_read }
   annotations:

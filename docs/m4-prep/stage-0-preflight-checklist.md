@@ -51,29 +51,104 @@ stage-0-preflight-checklist.md  ← 本文件：啟動前 gate check (全綠才 
 - [ ] **crosswalk_miss_rate < 5%**（測量窗口 +48h）
 - [ ] **circuit_open_count_72h < 3**
 
+### ⚠️ 前置：log dir 一律從 service env 解析，不得用 repo default
+
+> **新增 2026-08-02**（Gate-5 誤判的直接成因）
+
+下面三條 `dual_read_continuity_check` 全部讀 dual-read decision log 目錄。
+該目錄由 **`DUAL_READ_LOG_DIR`** 決定（writer `parallax/router/dual_read_decision_log.py`、
+reader `parallax/router/dual_read_metrics.py` 兩邊都是這個規則）；**只有** env 未設時才落回
+repo 內建 default `parallax/logs/`。
+
+驗證前先在**跑 service 的那台機器上、用 service 自己的 env** 取出實際路徑：
+
+```bash
+# ZenBook: 取 systemd 實際注入的值，不要相信 shell 裡的 env
+DUAL_READ_LOG_DIR_RESOLVED=$(
+  systemctl show parallax-server.service -p Environment \
+    | sed 's/^Environment=//' \
+    | tr ' ' '\n' \
+    | sed -n 's/^DUAL_READ_LOG_DIR=//p' \
+    | tail -n 1
+)
+echo "resolved: ${DUAL_READ_LOG_DIR_RESOLVED:?DUAL_READ_LOG_DIR not set on the service — STOP}"
+```
+
+> `systemctl show -p Environment` 印的是 **`Environment=K1=v1 K2=v2 ...` 一整行**，property 名也在裡面。
+> 所以要先剝掉 `Environment=` 前綴再拆空白——否則當 `DUAL_READ_LOG_DIR` 剛好是**第一個**變數時，
+> 拆出來的 token 是 `Environment=DUAL_READ_LOG_DIR=/path`，`^DUAL_READ_LOG_DIR=` 比不中，
+> 變數落空、上面的 `:?` 直接把你擋在這一步（比默默量錯目錄好，但別以為是「服務沒設」）。
+> `tail -n 1` 是防同名重複注入時取最後生效的那個（systemd 後蓋前）。
+
+**下一節每一條驗證命令都必須顯式帶 `--log-dir="${DUAL_READ_LOG_DIR_RESOLVED}"`**，
+不能只靠 shell 的環境變數。oncall 的 shell 不會繼承 systemd 注入的 env——這正是 Gate-5
+當時的情境——`--log-dir` 沒帶，工具就落回 shell env 或 repo default
+（`scripts/dual_read_continuity_check.py:66-68`），照著清單做也還是量錯目錄。
+
+Gate-5（2026-07-26）跳過了這一步，改讀 repo default，量到 0 筆記錄，據此判定
+`arbitration_conflict_rate` 的 exposition 是 stale。實際上 service 目錄
+（`/home/chris/parallax-data/dual-read-logs`）自 2026-05-15 起未曾中斷，當時窗內有 245,491 筆。
+repo default 那個路徑在 systemd hardening（`ProtectHome=read-only`）下 service 根本寫不進去，
+所以它**不可能**是 production sink。
+
+同一個盲點現在也有機器可讀的訊號：`/metrics` 會輸出
+`parallax_dual_read_log_dir_missing`（目錄不存在時為 1.0）與
+`parallax_dual_read_log_records_total{traffic_source=...}`（窗內筆數，含 0）。
+量到 0 之前先看這兩個 gauge，別再用 rate gauge 反推目錄健康。
+
+### ⚠️ exit code 是三態，不是二態
+
+> **新增 2026-08-02**
+
+`dual_read_continuity_check` 的判決**只看 `natural` partition**，與 alert rule 的
+`{traffic_source="natural"}` selector 同一個母體（兩個 gate 母體不一致會互相打架：
+burn-in 期 synthetic 的 conflict rate 合理地是 1.0，混在一起算會讓 CLI FAIL 而 alert 靜默）。
+`synthetic` / `unknown` 的數字照樣印出來，只是不參與判決。
+
+| exit | 意義 | 該怎麼辦 |
+|---|---|---|
+| `0` | PASS — natural partition 全數達標 | continue |
+| `1` | FAIL — 門檻被破 / log dir 不存在 / `--min-records` 未達 | **STOP**，記 blocker |
+| `2` | `INSUFFICIENT_NATURAL` — natural 筆數 < `--natural-min-records`（預設 100） | **不是失敗**，是「還不能評」 |
+
+**exit 2 不要當 FAIL 記進 blocker**。它就是 `traffic-gap-resolution.md` §3.3 的
+`WARN_NATURAL_INSUFFICIENT`：自然流量樣本不足、Phase-2 semantic gate 無從評估。
+M4 canary 已於 2026-08-02 由 Chris 拍板以 Phase-1 收官、Phase-2 移交「接真自然流量」
+milestone，所以 M4 stage 推進期間**看到 exit 2 是預期狀態**。
+
+只想看現有資料（不管自然流量夠不夠，例如 smoke run 或重放 synthetic-only corpus）→
+加 `--natural-min-records=0`，行為等同分割前。
+
 ### 驗證命令
 
 ```bash
-# dual_read_discrepancy_rate — 連續 72h < 0.1%
+# 前置：${DUAL_READ_LOG_DIR_RESOLVED} 來自上一節，未設就不要往下跑
+# 三態 exit：0=PASS / 1=FAIL(記 blocker) / 2=INSUFFICIENT_NATURAL(不是失敗)
+
+# dual_read_discrepancy_rate — 連續 72h < 0.1%（natural partition）
 dual_read_continuity_check \
+  --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=discrepancy \
   --format=json
-# 預期 exit 0，JSON 內 "pass": true
+# 預期 exit 0（JSON 內 "status": "pass"）；exit 2 = 自然流量不足，非失敗
 
-# arbitration_conflict_rate — 連續 72h < 1%
+# arbitration_conflict_rate — 連續 72h < 1%（natural partition）
 dual_read_continuity_check \
+  --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=arbitration_conflict \
   --format=json
-# 預期 exit 0
+# 預期 exit 0；exit 2 = 自然流量不足，非失敗
+# ⚠️ 這條在 burn-in 期若 synthetic 顯示 1.0 屬正常——判決只看 natural
 
-# dual_read_write_error_rate — 連續 72h < 0.02%
+# dual_read_write_error_rate — 連續 72h < 0.02%（natural partition）
 dual_read_continuity_check \
+  --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=write_error \
   --format=json
-# 預期 exit 0
+# 預期 exit 0；exit 2 = 自然流量不足，非失敗
 
 # aphelion_unreachable_rate — < 0.5% (PR #27 deploy 後)
 curl -s "http://prometheus:9090/api/v1/query" \

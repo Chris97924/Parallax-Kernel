@@ -28,6 +28,10 @@ def _run(*args: str, env_extra: dict[str, str] | None = None) -> subprocess.Comp
     env = os.environ.copy()
     if env_extra:
         env.update(env_extra)
+    # These tests assert rate/threshold behaviour on small corpora, not the
+    # natural-volume gate, so they opt out of it unless they set it themselves.
+    if not any(a.startswith("--natural-min-records") for a in args):
+        args = (*args, "--natural-min-records=0")
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         capture_output=True,
@@ -54,6 +58,7 @@ def _record(
     crosswalk_status: str = "ok",
     circuit_breaker_tripped: bool = False,
     write_error_observed: bool = False,
+    traffic_source: str = "natural",
 ) -> dict[str, Any]:
     return {
         "outcome": outcome,
@@ -62,6 +67,7 @@ def _record(
         "crosswalk_status": crosswalk_status,
         "circuit_breaker_tripped": circuit_breaker_tripped,
         "write_error_observed": write_error_observed,
+        "traffic_source": traffic_source,
     }
 
 
@@ -357,6 +363,7 @@ def test_main_in_process_pass(tmp_path: Path, capsys) -> None:
     _write(tmp_path, records)
     rc = drc.main(
         [
+            "--natural-min-records=0",
             "--since=72h",
             f"--log-dir={tmp_path}",
             "--min-records=1",
@@ -380,6 +387,7 @@ def test_main_in_process_fail(tmp_path: Path, capsys) -> None:
     _write(tmp_path, records)
     rc = drc.main(
         [
+            "--natural-min-records=0",
             "--since=72h",
             f"--log-dir={tmp_path}",
             "--min-records=1",
@@ -401,6 +409,7 @@ def test_main_in_process_human_format(tmp_path: Path, capsys) -> None:
     _write(tmp_path, records)
     rc = drc.main(
         [
+            "--natural-min-records=0",
             "--since=72h",
             f"--log-dir={tmp_path}",
             "--min-records=1",
@@ -430,6 +439,7 @@ def test_main_in_process_circuit_breach(tmp_path: Path, capsys) -> None:
     _write(tmp_path, records)
     rc = drc.main(
         [
+            "--natural-min-records=0",
             "--since=72h",
             f"--log-dir={tmp_path}",
             "--min-records=1",
@@ -456,6 +466,7 @@ def test_main_in_process_aphelion_breach(tmp_path: Path, capsys) -> None:
     _write(tmp_path, records)
     rc = drc.main(
         [
+            "--natural-min-records=0",
             "--since=72h",
             f"--log-dir={tmp_path}",
             "--min-records=1",
@@ -485,6 +496,7 @@ def test_main_in_process_write_error_breach(tmp_path: Path, capsys) -> None:
     _write(tmp_path, records)
     rc = drc.main(
         [
+            "--natural-min-records=0",
             "--since=72h",
             f"--log-dir={tmp_path}",
             "--min-records=1",
@@ -619,3 +631,173 @@ def test_arbitration_conflict_rate_breach_subprocess(tmp_path: Path) -> None:
     assert result.returncode == 1, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert "arbitration_conflict_rate" in payload["failures"]
+
+
+# ---------------------------------------------------------------------------
+# Traffic-source partitioning + tri-state exit contract (2026-08-02)
+#
+# The gate evaluates the NATURAL partition only, matching the
+# {traffic_source="natural"} selector the alert rules use. Before this the
+# alerts and this CLI evaluated different populations and could contradict
+# each other mid-burn-in.
+# ---------------------------------------------------------------------------
+
+
+def _clean_natural(n: int) -> list[dict[str, Any]]:
+    out = []
+    for _ in range(n):
+        rec = _record(outcome="match", timestamp="2026-04-26T11:30:00.000000+00:00")
+        rec["winning_source"] = "parallax"
+        out.append(rec)
+    return out
+
+
+def _conflicting_synthetic(n: int) -> list[dict[str, Any]]:
+    """The live burn-in shape: every record a fallback, conflict rate 1.0."""
+    out = []
+    for _ in range(n):
+        rec = _record(
+            outcome="match",
+            timestamp="2026-04-26T11:30:00.000000+00:00",
+            traffic_source="synthetic",
+        )
+        rec["winning_source"] = "fallback"
+        out.append(rec)
+    return out
+
+
+def test_synthetic_conflict_does_not_fail_the_natural_gate(tmp_path: Path) -> None:
+    """The exact contradiction this partitioning fixes.
+
+    200 synthetic records at conflict rate 1.0 (the real burn-in shape, which
+    the retargeted alerts correctly ignore) alongside 150 clean natural
+    records. Unpartitioned, the combined conflict rate is ~0.57 and this CLI
+    failed while the alerts stayed quiet — two authoritative gates
+    contradicting each other and blocking a promotion.
+    """
+    _write(tmp_path, _conflicting_synthetic(200) + _clean_natural(150))
+    result = _run(
+        "--since=72h",
+        f"--log-dir={tmp_path}",
+        "--min-records=1",
+        "--format=json",
+        "--natural-min-records=100",
+        "--now=2026-04-26T12:00:00+00:00",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "pass"
+    assert payload["failures"] == []
+    # The synthetic breach is still visible, just not gated on.
+    assert payload["partitions"]["synthetic"]["arbitration_conflict_rate"] == 1.0
+    assert payload["partitions"]["synthetic"]["records"] == 200
+    assert payload["partitions"]["natural"]["arbitration_conflict_rate"] == 0.0
+    assert payload["natural_records"] == 150
+
+
+def test_insufficient_natural_exits_2(tmp_path: Path) -> None:
+    """Synthetic-only corpus → cannot evaluate the gate → exit 2, not 1."""
+    _write(tmp_path, _conflicting_synthetic(300))
+    result = _run(
+        "--since=72h",
+        f"--log-dir={tmp_path}",
+        "--min-records=1",
+        "--format=json",
+        "--natural-min-records=100",
+        "--now=2026-04-26T12:00:00+00:00",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "insufficient_natural"
+    assert payload["natural_records"] == 0
+    assert payload["failures"] == [], "insufficient natural volume is not a breach"
+    assert payload["passed"] is False
+
+
+def test_natural_below_threshold_exits_2(tmp_path: Path) -> None:
+    """Some natural traffic, but not enough to mean anything yet."""
+    _write(tmp_path, _clean_natural(40))
+    result = _run(
+        "--since=72h",
+        f"--log-dir={tmp_path}",
+        "--min-records=1",
+        "--format=json",
+        "--natural-min-records=100",
+        "--now=2026-04-26T12:00:00+00:00",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert json.loads(result.stdout)["natural_records"] == 40
+
+
+def test_hard_failure_outranks_insufficient_natural(tmp_path: Path) -> None:
+    """A missing log dir is a breach (exit 1), never 'cannot evaluate yet'."""
+    result = _run(
+        "--since=72h",
+        f"--log-dir={tmp_path / 'does-not-exist'}",
+        "--min-records=0",
+        "--format=json",
+        "--natural-min-records=100",
+        "--now=2026-04-26T12:00:00+00:00",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "fail"
+    assert "log_dir_missing" in payload["failures"]
+
+
+def test_records_without_traffic_source_are_unknown_not_natural(tmp_path: Path) -> None:
+    """Read-side semantics must match /metrics: absent field → unknown.
+
+    The pre-2026-08-02 backlog is known to be synthetic. Counting it as
+    natural here would let it drive the DoD verdict, which is the same
+    poisoning the exposition partitioning exists to prevent.
+    """
+    legacy = _clean_natural(120)
+    for rec in legacy:
+        del rec["traffic_source"]
+        rec["winning_source"] = "fallback"
+    _write(tmp_path, legacy)
+    result = _run(
+        "--since=72h",
+        f"--log-dir={tmp_path}",
+        "--min-records=1",
+        "--format=json",
+        "--natural-min-records=100",
+        "--now=2026-04-26T12:00:00+00:00",
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["natural_records"] == 0
+    assert payload["partitions"]["unknown"]["records"] == 120
+    assert payload["partitions"]["unknown"]["arbitration_conflict_rate"] == 1.0
+
+
+def test_natural_min_records_zero_restores_legacy_evaluation(tmp_path: Path) -> None:
+    """--natural-min-records=0 evaluates whatever is present, as before."""
+    _write(tmp_path, _clean_natural(3))
+    result = _run(
+        "--since=72h",
+        f"--log-dir={tmp_path}",
+        "--min-records=1",
+        "--format=json",
+        "--natural-min-records=0",
+        "--now=2026-04-26T12:00:00+00:00",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["status"] == "pass"
+
+
+def test_human_output_shows_every_partition(tmp_path: Path) -> None:
+    """Synthetic stays inspectable during burn-in even though only natural gates."""
+    _write(tmp_path, _conflicting_synthetic(5) + _clean_natural(5))
+    result = _run(
+        "--since=72h",
+        f"--log-dir={tmp_path}",
+        "--min-records=1",
+        "--natural-min-records=0",
+        "--now=2026-04-26T12:00:00+00:00",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    for source in ("natural", "synthetic", "unknown"):
+        assert f"[{source}] records=" in result.stdout, result.stdout
+    assert "<- gated" in result.stdout

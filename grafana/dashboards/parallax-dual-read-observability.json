@@ -15,7 +15,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Fraction of dual-read requests where canonical and Aphelion disagreed. DoD: < 0.001 (0.1%). Green < 0.05%, yellow 0.05-0.1%, red > 0.1%.",
+      "description": "Fraction of dual-read requests where canonical and Aphelion disagreed, split by traffic_source. DoD: < 0.001 (0.1%) on the natural series only — synthetic is the M4 burn-in loader and unknown is the pre-2026-08-02 backlog of records written before the writer recorded traffic_source (closed-ended; drains out of the 72h window). A series that is absent rather than 0 means no records of that kind were observed. Green < 0.05%, yellow 0.05-0.1%, red > 0.1%.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -65,6 +65,13 @@
           "instant": true,
           "legendFormat": "natural",
           "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(parallax_dual_read_discrepancy_rate{traffic_source=\"unknown\"})",
+          "instant": true,
+          "legendFormat": "unknown (pre-2026-08-02 backlog)",
+          "refId": "C"
         }
       ],
       "title": "Dual-read discrepancy rate",
@@ -658,7 +665,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "M3b placeholder — arbitration_conflict_rate is wired in M3b T2.3. This panel will show data once M3b ships. Expected to show 0 or 'No data' during M3a.",
+      "description": "Fraction of dual-read outcomes that produced an arbitration conflict (winning_source in {tie, fallback}) over the 72h DoD window, split by traffic_source. The DoD applies to the natural series; synthetic is the M4 burn-in loader, which legitimately runs at 1.0 because it queries claim ids present in neither store. The former 'or vector(0)' fallback was removed on 2026-08-02: an absent series must read as No data, not as a healthy 0.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -694,12 +701,27 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "parallax_arbitration_conflict_rate or vector(0)",
+          "expr": "max(parallax_arbitration_conflict_rate{traffic_source=\"natural\"})",
           "instant": true,
+          "legendFormat": "natural",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(parallax_arbitration_conflict_rate{traffic_source=\"synthetic\"})",
+          "instant": true,
+          "legendFormat": "synthetic",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(parallax_arbitration_conflict_rate{traffic_source=\"unknown\"})",
+          "instant": true,
+          "legendFormat": "unknown (pre-2026-08-02 backlog)",
+          "refId": "C"
         }
       ],
-      "title": "M3b placeholder — arbitration_conflict_rate",
+      "title": "Arbitration conflict rate by traffic_source",
       "type": "stat"
     },
     {

@@ -27,6 +27,7 @@ from parallax.router.discrepancy_live import (
     DUAL_READ_DISCREPANCY_RATE_THRESHOLD,
     DualReadOutcome,
     LiveDiscrepancyCounter,
+    aphelion_unreachable_rate,
     dual_read_discrepancy_rate,
     record_dual_read_outcome,
 )
@@ -223,18 +224,42 @@ def test_prometheus_counter_carries_traffic_source_label() -> None:
 
 
 def test_prometheus_gauge_reflects_rate() -> None:
-    """After recording, gauge value matches dual_read_discrepancy_rate()."""
+    """After recording, gauge value matches aphelion_unreachable_rate()."""
     uid = "prom_gauge_test_user"
-    record_dual_read_outcome(user_id=uid, outcome="diverge")
+    record_dual_read_outcome(user_id=uid, outcome="aphelion_unreachable")
     record_dual_read_outcome(user_id=uid, outcome="match")
     record_dual_read_outcome(user_id=uid, outcome="match")
 
-    expected = dual_read_discrepancy_rate(user_id=uid)
+    expected = aphelion_unreachable_rate(user_id=uid)
     gauge_val = _scrape_gauge_value(
-        "parallax_dual_read_discrepancy_rate",
+        "parallax_aphelion_unreachable_rate",
         {"user_id": uid, "traffic_source": "natural"},
     )
     assert abs(gauge_val - expected) < 1e-9
+
+
+def test_discrepancy_rate_has_a_single_producer() -> None:
+    """This module must NOT register ``parallax_dual_read_discrepancy_rate``.
+
+    It used to, labelled ``["user_id", "traffic_source"]``, while
+    ``parallax.server.routes.metrics`` independently built a gauge of the
+    same name from the 72h decision-log corpus. Only the latter ever reached
+    the wire, so this one was written on every outcome and read by nobody —
+    and the two carried different label sets, so any future change that did
+    render the default registry would have emitted two contradictory
+    definitions of one metric name. metrics.py is the single producer.
+
+    The rate itself is still computed and still public; the assertion below
+    pins that the collector is gone, not the measurement.
+    """
+    uid = "single_producer_test_user"
+    record_dual_read_outcome(user_id=uid, outcome="diverge")
+    record_dual_read_outcome(user_id=uid, outcome="match")
+
+    assert dual_read_discrepancy_rate(user_id=uid) == pytest.approx(0.5)
+
+    registered = {metric.name for metric in prometheus_client.REGISTRY.collect()}
+    assert "parallax_dual_read_discrepancy_rate" not in registered
 
 
 # ---------------------------------------------------------------------------

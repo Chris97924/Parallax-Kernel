@@ -69,6 +69,32 @@ def test_natural_query_uses_sum() -> None:
     )
 
 
+def test_slo_queries_select_traffic_source_explicitly() -> None:
+    """No prom_slo call may pass a bare dual-read gauge name.
+
+    Those gauges are partitioned by ``traffic_source``, so a bare name returns
+    a multi-series vector and ``prom_slo``'s ``result[0]`` would record an
+    arbitrary partition into the daily burn-in row — a synthetic value could
+    be logged as the overall SLO, and the row could switch populations from
+    one day to the next with nothing saying so.
+    """
+    text = SCRIPT.read_text(encoding="utf-8")
+
+    bare = re.findall(
+        r"prom_slo\s+[\"'](?:max\()?parallax_dual_read_\w+(?:_rate)?[\"')]",
+        text,
+    )
+    assert bare == [], (
+        f"prom_slo called with an unpartitioned dual-read gauge: {bare}\n"
+        'Every call must pin a partition, e.g. max(...{traffic_source="natural"}).'
+    )
+
+    for source in ("natural", "synthetic"):
+        for metric in ("discrepancy_rate", "write_error_rate"):
+            needle = f'max(parallax_dual_read_{metric}{{traffic_source="{source}"}})'
+            assert needle in text, f"missing partitioned SLO query: {needle}"
+
+
 def test_no_bare_increase_query_for_traffic_source() -> None:
     """There must be no un-summed increase() call for traffic_source labels.
 

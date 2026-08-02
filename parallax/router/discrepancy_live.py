@@ -46,6 +46,7 @@ __all__ = [
     "DualReadOutcome",
     "LiveDiscrepancyCounter",
     "record_dual_read_outcome",
+    "record_dual_read_request",
     "dual_read_discrepancy_rate",
     "aphelion_unreachable_rate",
 ]
@@ -120,14 +121,48 @@ _aphelion_counter = _get_or_create_counter(
     ["user_id", "traffic_source"],
 )
 
-_discrepancy_rate_gauge = _get_or_create_gauge(
-    "parallax_dual_read_discrepancy_rate",
-    (
-        "Rolling-window fraction of dual-read outcomes that are 'diverge'"
-        " (excludes aphelion_unreachable from denominator)."
-    ),
-    ["user_id", "traffic_source"],
+# Liveness counter for DualReadDecisionLogSilent. Deliberately NOT labelled by
+# ``user_id`` — two or three series total, ever.
+#
+# The alert needs to know "were dual-read requests being served?" so it can
+# tell a broken decision-log writer from a legitimately quiet system. It used
+# to ask ``parallax_aphelion_total`` that question, which is wrong twice over:
+#
+#   1. ``prometheus_client`` retains every label combination for the life of
+#      the process, so a user that queries once leaves a series pinned at 1
+#      forever. ``increase()`` diffs last-minus-first and returns 0 for it,
+#      and there is no "series appeared from nothing" delta because Prometheus
+#      has no earlier sample to diff against. Traffic made of mostly-unique
+#      user ids therefore summed to ~0 and silently SUPPRESSED the alert — in
+#      exactly the sparse natural-traffic regime it exists for.
+#   2. Summing ``increase()`` across ~82k retained user-id series is expensive
+#      for what is a yes/no liveness question.
+_requests_counter = _get_or_create_counter(
+    "parallax_dual_read_requests",
+    "Total dual-read query attempts by traffic source. Counted at request "
+    "entry, before any decision-log write is attempted, so it stays live when "
+    "the writer fails.",
+    ["traffic_source"],
 )
+
+# NOTE: this module deliberately does NOT register a
+# ``parallax_dual_read_discrepancy_rate`` gauge. It used to, labelled
+# ``["user_id", "traffic_source"]``, which made two producers of that one
+# metric name: this one, and the 72h DoD gauge built by
+# ``parallax.server.routes.metrics._build_payload``. Only the latter ever
+# reached the wire — ``_build_payload`` serializes a fresh
+# ``CollectorRegistry`` and plucks just three named counters out of the
+# default registry, so this gauge was set on every outcome and read by
+# nobody. Worse, the two carried different label sets, so anything that ever
+# did render the default registry would have produced two contradictory
+# definitions of one metric name.
+#
+# ``metrics.py`` is now the single producer, partitioned by
+# ``traffic_source``. The rolling-window rate this gauge mirrored is still
+# computed and still public — call ``dual_read_discrepancy_rate()``.
+# Re-adding a collector here would also put the high-cardinality ``user_id``
+# label back on the wire; ``parallax_aphelion_total`` already carries it and
+# has ~82k distinct values in the live corpus.
 
 _unreachable_rate_gauge = _get_or_create_gauge(
     "parallax_aphelion_unreachable_rate",
@@ -254,19 +289,34 @@ def record_dual_read_outcome(
 
     1. Increment ``parallax_dual_read_outcomes_total{outcome, user_id, traffic_source}``.
     2. Append to singleton rolling window.
-    3. Recompute and SET both rate gauges for ``user_id``.
+    3. Recompute and SET the unreachable-rate gauge for ``user_id``.
+
+    The discrepancy rate is deliberately not mirrored onto a collector here
+    — see the note above ``_unreachable_rate_gauge``.
     """
     source = _normalize_traffic_source(traffic_source)
     _outcomes_counter.labels(outcome=outcome, user_id=user_id, traffic_source=source).inc()
     if outcome != "skipped":
         _aphelion_counter.labels(user_id=user_id, traffic_source=source).inc()
     _singleton.record(user_id=user_id, outcome=outcome, traffic_source=source)
-    _discrepancy_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
-        _singleton.discrepancy_rate(user_id=user_id, traffic_source=source)
-    )
     _unreachable_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
         _singleton.aphelion_unreachable_rate(user_id=user_id, traffic_source=source)
     )
+
+
+def record_dual_read_request(*, traffic_source: str | None = None) -> None:
+    """Count one dual-read query ATTEMPT.
+
+    Call this at request entry, before the decision-log write is attempted and
+    outside its exception handling. The distinction is the whole point: this
+    counter measures attempts and the decision log measures successful writes,
+    so their DIVERGENCE is what tells an operator the writer is broken. If
+    this only advanced when a record was written, a failing writer would stop
+    both signals together, ``DualReadDecisionLogSilent``'s traffic guard would
+    read false, and the alert could never fire in the one situation it was
+    built for.
+    """
+    _requests_counter.labels(traffic_source=_normalize_traffic_source(traffic_source)).inc()
 
 
 def dual_read_discrepancy_rate(*, user_id: str, traffic_source: str | None = None) -> float:

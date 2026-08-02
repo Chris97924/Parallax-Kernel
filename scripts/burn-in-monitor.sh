@@ -55,8 +55,10 @@ prom_query() {
 # metric is not yet instrumented, "query_failed" if Prometheus is unreachable.
 # Always exits 0 so `set -e` never aborts on a transient query error.
 prom_slo() {
-  local metric="$1" out
-  out=$(curl -sSfG -m 5 "${PROM_URL}/api/v1/query" --data-urlencode "query=${metric}" 2>/dev/null) \
+  # $1 is a full PromQL expression, not just a metric name — the dual-read
+  # gauges are label-partitioned and a bare name would return several series.
+  local query="$1" out
+  out=$(curl -sSfG -m 5 "${PROM_URL}/api/v1/query" --data-urlencode "query=${query}" 2>/dev/null) \
     || { printf 'query_failed'; return 0; }
   printf '%s' "${out}" | python3 -c "import json, sys
 try:
@@ -88,16 +90,33 @@ fi
 # authoritative DoD verdict (thresholds + Phase-1/Phase-2 split) is item 4.7 in
 # `parallax canary --dod`. Metrics whose series is not yet scraped record
 # "no_series" (honest) rather than the old blanket "no_data" placeholder.
-#   - discrepancy_rate / write_error_rate: live dual-read gauges (name-exact).
+#   - discrepancy_rate / write_error_rate: live dual-read gauges, selected per
+#     traffic_source (see below).
 #   - unreachable_rate / p99_latency / crosswalk_miss / circuit_open_count:
 #     not yet instrumented as standalone scraped series → "no_series".
-discrepancy_rate=$(prom_slo "parallax_dual_read_discrepancy_rate")
-write_error_rate=$(prom_slo "parallax_dual_read_write_error_rate")
+#
+# 2026-08-02: these two gauges are now partitioned by `traffic_source`, so a
+# bare metric name returns a MULTI-SERIES vector and prom_slo's `result[0]`
+# would silently record whichever partition Prometheus happened to return
+# first — the daily row could flip between populations from one day to the
+# next and nothing would say so. Every query below selects its partition
+# explicitly. `max()` keeps the result a single series.
+#   *_natural   — the DoD-relevant population, matching what the retargeted
+#                 alert rules evaluate. Reads "no_series" while natural
+#                 traffic is 0, which is the honest answer, not a healthy 0.
+#   *_synthetic — keeps the row non-vacuous during burn-in, which is what
+#                 this block was added for.
+discrepancy_rate=$(prom_slo 'max(parallax_dual_read_discrepancy_rate{traffic_source="natural"})')
+write_error_rate=$(prom_slo 'max(parallax_dual_read_write_error_rate{traffic_source="natural"})')
+discrepancy_rate_synthetic=$(prom_slo 'max(parallax_dual_read_discrepancy_rate{traffic_source="synthetic"})')
+write_error_rate_synthetic=$(prom_slo 'max(parallax_dual_read_write_error_rate{traffic_source="synthetic"})')
 metrics_json=$(python3 <<PY
 import json
 print(json.dumps({
     "discrepancy_rate": "${discrepancy_rate}",
     "write_error_rate": "${write_error_rate}",
+    "discrepancy_rate_synthetic": "${discrepancy_rate_synthetic}",
+    "write_error_rate_synthetic": "${write_error_rate_synthetic}",
     "unreachable_rate": "no_series",
     "p99_latency": "no_series",
     "crosswalk_miss": "no_series",

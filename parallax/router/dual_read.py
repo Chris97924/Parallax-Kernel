@@ -35,8 +35,9 @@ from parallax.router.discrepancy_live import (
     DualReadOutcome,
     _normalize_traffic_source,
     record_dual_read_outcome,
+    record_dual_read_request,
 )
-from parallax.router.dual_read_decision_log import append_decision
+from parallax.router.dual_read_decision_log import append_decision, is_log_enabled
 from parallax.router.live_arbitration import arbitrate
 from parallax.router.ports import QueryPort
 
@@ -178,6 +179,30 @@ class DualReadRouter:
         # Fast-path: flag off → skipped (zero overhead beyond 2 bool checks)
         # ------------------------------------------------------------------
         enabled = dual_read_override if dual_read_override is not None else is_dual_read_enabled()
+
+        # Count the ATTEMPT — but only when a decision record is actually
+        # expected of this request, i.e. dual-read is on AND the decision log
+        # is on. Two separate constraints, both load-bearing:
+        #
+        #   * Gated on configuration. DualReadRouter still serves ordinary
+        #     queries with DUAL_READ=false, and the log defaults to mirroring
+        #     that flag, so counting unconditionally made normal traffic look
+        #     like "requests arriving, nothing being written" and fired
+        #     DualReadDecisionLogSilent on a healthy disabled system — worst
+        #     of all right after a rollback.
+        #   * NOT gated on the write succeeding, and evaluated here rather
+        #     than inside `_log_decision`. Attempts and successful writes are
+        #     separate signals and their DIVERGENCE is the alarm; a counter
+        #     that only advanced on a successful write would go silent
+        #     together with the writer it exists to watch.
+        #
+        # Deliberate under-count: with dual-read off but the log explicitly
+        # forced on, the skipped path still writes records that are not
+        # counted here. Those records carry no DoD value, and an under-count
+        # can only make the alert quieter, never noisier.
+        if enabled and is_log_enabled():
+            record_dual_read_request(traffic_source=traffic_source)
+
         if not enabled:
             primary_start = time.perf_counter()
             primary_result = self._primary.query(request)

@@ -64,10 +64,17 @@ repo 內建 default `parallax/logs/`。
 
 ```bash
 # ZenBook: 取 systemd 實際注入的值，不要相信 shell 裡的 env
-systemctl show parallax-server.service -p Environment | tr ' ' '\n' | grep DUAL_READ_LOG_DIR
-# 再把取到的值顯式帶進工具
-dual_read_continuity_check --log-dir="<上面取到的路徑>" ...
+DUAL_READ_LOG_DIR_RESOLVED=$(
+  systemctl show parallax-server.service -p Environment \
+    | tr ' ' '\n' | sed -n 's/^DUAL_READ_LOG_DIR=//p'
+)
+echo "resolved: ${DUAL_READ_LOG_DIR_RESOLVED:?DUAL_READ_LOG_DIR not set on the service — STOP}"
 ```
+
+**下一節每一條驗證命令都必須顯式帶 `--log-dir="${DUAL_READ_LOG_DIR_RESOLVED}"`**，
+不能只靠 shell 的環境變數。oncall 的 shell 不會繼承 systemd 注入的 env——這正是 Gate-5
+當時的情境——`--log-dir` 沒帶，工具就落回 shell env 或 repo default
+（`scripts/dual_read_continuity_check.py:66-68`），照著清單做也還是量錯目錄。
 
 Gate-5（2026-07-26）跳過了這一步，改讀 repo default，量到 0 筆記錄，據此判定
 `arbitration_conflict_rate` 的 exposition 是 stale。實際上 service 目錄
@@ -83,8 +90,11 @@ repo default 那個路徑在 systemd hardening（`ProtectHome=read-only`）下 s
 ### 驗證命令
 
 ```bash
+# 前置：${DUAL_READ_LOG_DIR_RESOLVED} 來自上一節，未設就不要往下跑
+
 # dual_read_discrepancy_rate — 連續 72h < 0.1%
 dual_read_continuity_check \
+  --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=discrepancy \
   --format=json
@@ -92,6 +102,7 @@ dual_read_continuity_check \
 
 # arbitration_conflict_rate — 連續 72h < 1%
 dual_read_continuity_check \
+  --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=arbitration_conflict \
   --format=json
@@ -99,6 +110,7 @@ dual_read_continuity_check \
 
 # dual_read_write_error_rate — 連續 72h < 0.02%
 dual_read_continuity_check \
+  --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=write_error \
   --format=json

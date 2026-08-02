@@ -33,6 +33,7 @@ from parallax.router.config import is_dual_read_enabled
 from parallax.router.contracts import DualReadResult, QueryRequest
 from parallax.router.discrepancy_live import (
     DualReadOutcome,
+    _normalize_traffic_source,
     record_dual_read_outcome,
 )
 from parallax.router.dual_read_decision_log import append_decision
@@ -199,6 +200,7 @@ class DualReadRouter:
                 policy_version="",
                 conflict_event_id=None,
                 write_error_observed=False,
+                traffic_source=traffic_source,
             )
             return result
 
@@ -231,6 +233,7 @@ class DualReadRouter:
                 policy_version="",
                 conflict_event_id=None,
                 write_error_observed=False,
+                traffic_source=traffic_source,
             )
             return result
 
@@ -376,6 +379,7 @@ class DualReadRouter:
             policy_version=arbitration.policy_version,
             conflict_event_id=arbitration.conflict_event_id,
             write_error_observed=write_error_observed,
+            traffic_source=traffic_source,
         )
         return result
 
@@ -393,11 +397,18 @@ class DualReadRouter:
         policy_version: str,
         conflict_event_id: str | None,
         write_error_observed: bool,
+        traffic_source: str | None = None,
     ) -> None:
         """Best-effort append to the dual-read decision JSONL log.
 
         Best-effort: any failure inside the producer is swallowed; the
         canonical query path must never raise from observability code.
+
+        ``traffic_source`` mirrors the middleware snapshot so the rates
+        derived from this log can exclude the synthetic burn-in loader
+        (traffic-gap-resolution.md §6). Unlabelled callers resolve to
+        ``"natural"``, matching ``TrafficSourceMiddleware``'s fail-safe —
+        real traffic must never be silently discounted.
         """
         try:
             append_decision(
@@ -410,6 +421,7 @@ class DualReadRouter:
                     "write_error_observed": write_error_observed,
                     "conflict_event_id": conflict_event_id,
                     "data_quality_flag": "normal",
+                    "traffic_source": _normalize_traffic_source(traffic_source),
                 }
             )
         except Exception as exc:  # noqa: BLE001 — observability never crashes

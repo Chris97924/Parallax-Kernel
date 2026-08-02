@@ -195,17 +195,31 @@ else
   echo "❌ /healthz 非 200"; exit 1
 fi
 
+# ⚠️ 2026-08-02 起，下面兩個 gauge 依 traffic_source 分 label
+# （natural / synthetic / unknown）。bare metric name 會回**多條 series**，
+# `.data.result[0]` 取到哪一條不保證，可能把 synthetic 的讀數當成整體 SLO。
+# 每條查詢都要顯式指定 partition，並用 max() 收成單一 series。
+#   natural   = DoD 與 alert 的語意（門檻對它判）
+#   synthetic = M4 burn-in loader；自然流量出現前，只有它有讀數
+# 某個 partition 沒資料時回 "missing"（誠實的「沒量到」，不是 0）。
+
 # 4. Dual-read 寫入錯誤率（用真實 gauge，不是不存在的 errors_total counter）
-WRITE_ERR=$(curl -s http://localhost:9090/api/v1/query \
-  --data-urlencode 'query=parallax_dual_read_write_error_rate' \
+WRITE_ERR_NATURAL=$(curl -s http://localhost:9090/api/v1/query \
+  --data-urlencode 'query=max(parallax_dual_read_write_error_rate{traffic_source="natural"})' \
   | jq -r '.data.result[0].value[1] // "missing"')
-echo "dual_read_write_error_rate = $WRITE_ERR（DoD ≤ 0.0005；> 0.0005 → 升 P1）"
+WRITE_ERR_SYNTHETIC=$(curl -s http://localhost:9090/api/v1/query \
+  --data-urlencode 'query=max(parallax_dual_read_write_error_rate{traffic_source="synthetic"})' \
+  | jq -r '.data.result[0].value[1] // "missing"')
+echo "dual_read_write_error_rate natural=$WRITE_ERR_NATURAL synthetic=$WRITE_ERR_SYNTHETIC（DoD ≤ 0.0005 對 natural 判；> 0.0005 → 升 P1）"
 
 # 5. Discrepancy 抽樣（72h 滾動平均，確認 deploy 未引入 drift）
-DISCREPANCY=$(curl -s http://localhost:9090/api/v1/query \
-  --data-urlencode 'query=parallax_dual_read_discrepancy_rate' \
+DISCREPANCY_NATURAL=$(curl -s http://localhost:9090/api/v1/query \
+  --data-urlencode 'query=max(parallax_dual_read_discrepancy_rate{traffic_source="natural"})' \
   | jq -r '.data.result[0].value[1] // "missing"')
-echo "dual_read_discrepancy_rate = $DISCREPANCY（DoD ≤ 0.001 / 30 min → DualReadDiscrepancyRateHigh warning）"
+DISCREPANCY_SYNTHETIC=$(curl -s http://localhost:9090/api/v1/query \
+  --data-urlencode 'query=max(parallax_dual_read_discrepancy_rate{traffic_source="synthetic"})' \
+  | jq -r '.data.result[0].value[1] // "missing"')
+echo "dual_read_discrepancy_rate natural=$DISCREPANCY_NATURAL synthetic=$DISCREPANCY_SYNTHETIC（DoD ≤ 0.001 對 natural 判 / 30 min → DualReadDiscrepancyRateHigh warning）"
 ```
 
 ---

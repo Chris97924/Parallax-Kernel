@@ -295,6 +295,57 @@ def test_dual_read_log_records_gauge_counts_every_partition(
     assert counts == {"natural": 0.0, "synthetic": 3.0, "unknown": 2.0}
 
 
+def test_newest_record_age_gauge_partitioned_by_traffic_source(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Freshness is reported per partition, from the newest record in each.
+
+    The record COUNT is a lagging silence detector: a writer that stops leaves
+    its backlog in the 72h window, so the count cannot reach zero for a full
+    window. Age notices at once — this is what lets the silence alert fire in
+    minutes rather than days.
+    """
+    _write_in_window(
+        tmp_path / "dual_read",
+        [
+            _decision(traffic_source="synthetic", minutes_ago=90),
+            _decision(traffic_source="synthetic", minutes_ago=2),
+            _decision(traffic_source="natural", minutes_ago=45),
+        ],
+    )
+
+    body = client.get("/metrics").text
+    ages = _labelled_samples(body, "parallax_dual_read_log_newest_record_age_seconds")
+
+    assert set(ages) == {"synthetic", "natural"}
+    # Newest synthetic record is the 2-minute-old one, not the 90-minute-old one.
+    assert ages["synthetic"] == pytest.approx(120, abs=60)
+    assert ages["natural"] == pytest.approx(2700, abs=60)
+
+
+def test_newest_record_age_absent_when_no_records(client: TestClient) -> None:
+    """An empty corpus emits no freshness series at all.
+
+    The silence alert leans on this: its ``absent(...)`` arm is what covers
+    "there are no records to be fresh", and it only means something if the
+    exposition genuinely omits the series rather than reporting a zero age,
+    which would read as "just written".
+    """
+    body = client.get("/metrics").text
+
+    assert _labelled_samples(body, "parallax_dual_read_log_newest_record_age_seconds") == {}
+    assert _unlabelled_sample(body, "parallax_dual_read_log_newest_record_age_seconds") is None
+    # The family is still declared so the gauge is discoverable when empty.
+    assert "# TYPE parallax_dual_read_log_newest_record_age_seconds gauge" in body
+    # ...and the count gauge still reports, which is how "nothing recent" is
+    # told apart from "nothing at all".
+    assert _labelled_samples(body, "parallax_dual_read_log_records_total") == {
+        "natural": 0.0,
+        "synthetic": 0.0,
+        "unknown": 0.0,
+    }
+
+
 def test_dir_missing_gauge_distinguishes_misconfig_from_quiet_window(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

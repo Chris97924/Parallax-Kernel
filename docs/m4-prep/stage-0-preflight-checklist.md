@@ -66,10 +66,19 @@ repo 內建 default `parallax/logs/`。
 # ZenBook: 取 systemd 實際注入的值，不要相信 shell 裡的 env
 DUAL_READ_LOG_DIR_RESOLVED=$(
   systemctl show parallax-server.service -p Environment \
-    | tr ' ' '\n' | sed -n 's/^DUAL_READ_LOG_DIR=//p'
+    | sed 's/^Environment=//' \
+    | tr ' ' '\n' \
+    | sed -n 's/^DUAL_READ_LOG_DIR=//p' \
+    | tail -n 1
 )
 echo "resolved: ${DUAL_READ_LOG_DIR_RESOLVED:?DUAL_READ_LOG_DIR not set on the service — STOP}"
 ```
+
+> `systemctl show -p Environment` 印的是 **`Environment=K1=v1 K2=v2 ...` 一整行**，property 名也在裡面。
+> 所以要先剝掉 `Environment=` 前綴再拆空白——否則當 `DUAL_READ_LOG_DIR` 剛好是**第一個**變數時，
+> 拆出來的 token 是 `Environment=DUAL_READ_LOG_DIR=/path`，`^DUAL_READ_LOG_DIR=` 比不中，
+> 變數落空、上面的 `:?` 直接把你擋在這一步（比默默量錯目錄好，但別以為是「服務沒設」）。
+> `tail -n 1` 是防同名重複注入時取最後生效的那個（systemd 後蓋前）。
 
 **下一節每一條驗證命令都必須顯式帶 `--log-dir="${DUAL_READ_LOG_DIR_RESOLVED}"`**，
 不能只靠 shell 的環境變數。oncall 的 shell 不會繼承 systemd 注入的 env——這正是 Gate-5

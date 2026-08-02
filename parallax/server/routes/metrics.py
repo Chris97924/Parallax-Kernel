@@ -31,6 +31,7 @@ re-walk the JSONL files. Tests can reset the cache via
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
 import re
 import threading
 import time
@@ -50,6 +51,9 @@ from prometheus_client import (
 
 from parallax.obs.log import get_logger as _get_logger
 from parallax.obs.metrics import registry as _inhouse_registry
+from parallax.router.dual_read_metrics import (
+    _parse_timestamp as _dual_read_parse_timestamp,  # noqa: PLC2701
+)
 from parallax.router.dual_read_metrics import (
     compute_all_rates as _dual_read_compute_all_rates,
 )
@@ -89,6 +93,7 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
         "dual_read_metrics_compute_error",
         "dual_read_log_records_total",
         "dual_read_log_dir_missing",
+        "dual_read_log_newest_record_age_seconds",
         "arbitration_p99_latency_ms",
         "arbitration_policy_version",
     }
@@ -154,6 +159,33 @@ def _record_traffic_source(record: dict[str, Any]) -> str:
     return _TRAFFIC_SOURCE_UNKNOWN
 
 
+def _newest_record_age_seconds(
+    records: list[dict[str, Any]],
+    *,
+    now: _dt.datetime,
+) -> float | None:
+    """Seconds since the newest record in ``records``; ``None`` if unmeasurable.
+
+    ``load_records`` returns records sorted by timestamp ascending and the
+    partition lists built from it preserve that order, so the last element is
+    the newest. Timestamps are parsed with the loader's own helper so this can
+    never disagree with the window filter about what a timestamp means.
+
+    Clamped at zero: a record stamped in the future (clock skew between the
+    writer and the scraping host) is "as fresh as possible", not negatively
+    aged, which would read as a huge value under a ``> threshold`` alert.
+    """
+    for record in reversed(records):
+        raw = record.get("timestamp")
+        if not isinstance(raw, str):
+            continue
+        parsed = _dual_read_parse_timestamp(raw)
+        if parsed is None:
+            continue
+        return max(0.0, (now - parsed).total_seconds())
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class _DualReadSnapshot:
     """One cache-miss worth of dual-read exposition state.
@@ -164,6 +196,11 @@ class _DualReadSnapshot:
     unlike a zero, cannot be misread as "measured and healthy" — which is
     the failure mode that produced the Gate-5 misdiagnosis.
 
+    ``newest_age`` follows the same absent-not-zero rule. It exists because
+    ``counts`` is a lagging silence detector: a writer that stops leaves its
+    backlog in the window, so the count does not reach zero until a whole
+    ``_DUAL_READ_WINDOW`` has elapsed. Freshness notices immediately.
+
     ``counts`` is the opposite: it always carries every partition in
     ``_TRAFFIC_SOURCE_PARTITIONS``, zeros included, because a count of zero
     is itself a measurement ("we walked the corpus and found none"). Paired
@@ -173,6 +210,7 @@ class _DualReadSnapshot:
 
     rates: dict[str, dict[str, float]]
     counts: dict[str, float]
+    newest_age: dict[str, float]
     dir_missing: float
     compute_error: float
 
@@ -267,6 +305,7 @@ def _collect_dual_read_metrics() -> _DualReadSnapshot:
     """
     rates: dict[str, dict[str, float]] = {}
     counts: dict[str, float] = dict.fromkeys(_TRAFFIC_SOURCE_PARTITIONS, 0.0)
+    newest_age: dict[str, float] = {}
     dir_missing = 0.0
     compute_error = 0.0
 
@@ -278,8 +317,14 @@ def _collect_dual_read_metrics() -> _DualReadSnapshot:
         for record in loaded.records:
             partitions.setdefault(_record_traffic_source(record), []).append(record)
 
+        # One clock reading for the whole snapshot so the partitions' ages are
+        # comparable to each other and to the window they were loaded with.
+        now = _dt.datetime.now(_dt.UTC)
         for source, source_records in partitions.items():
             counts[source] = float(len(source_records))
+            age = _newest_record_age_seconds(source_records, now=now)
+            if age is not None:
+                newest_age[source] = age
             computed = _dual_read_compute_all_rates(source_records)
             rates[source] = {
                 "dual_read_discrepancy_rate": float(computed["discrepancy_rate"]),
@@ -303,6 +348,7 @@ def _collect_dual_read_metrics() -> _DualReadSnapshot:
         return _DualReadSnapshot(
             rates={},
             counts=dict.fromkeys(_TRAFFIC_SOURCE_PARTITIONS, 0.0),
+            newest_age={},
             dir_missing=dir_missing,
             compute_error=1.0,
         )
@@ -310,6 +356,7 @@ def _collect_dual_read_metrics() -> _DualReadSnapshot:
     return _DualReadSnapshot(
         rates=rates,
         counts=counts,
+        newest_age=newest_age,
         dir_missing=dir_missing,
         compute_error=compute_error,
     )
@@ -550,6 +597,23 @@ def _build_payload() -> str:
     )
     for source in _TRAFFIC_SOURCE_PARTITIONS:
         log_records.labels(traffic_source=source).set(dr_metrics.counts[source])
+
+    # Freshness. The record count above is a LAGGING silence detector: a writer
+    # that stops leaves its backlog sitting in the 72h window, so the count
+    # does not reach zero until the whole window has rolled over. Age notices
+    # at once, which is what lets DualReadDecisionLogSilent alert on a broken
+    # writer in minutes instead of days.
+    newest_age = Gauge(
+        "parallax_dual_read_log_newest_record_age_seconds",
+        "Seconds since the newest dual-read decision-log record in the 72h DoD "
+        "window, by traffic_source. Absent for a partition with no in-window "
+        "records — read alongside parallax_dual_read_log_records_total, which "
+        "always reports, to tell 'nothing recent' from 'nothing at all'.",
+        labelnames=["traffic_source"],
+        registry=reg,
+    )
+    for source, age_seconds in sorted(dr_metrics.newest_age.items()):
+        newest_age.labels(traffic_source=source).set(age_seconds)
 
     Gauge(
         "parallax_dual_read_log_dir_missing",

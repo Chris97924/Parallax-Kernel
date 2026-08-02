@@ -95,3 +95,6 @@ eval/run_phase2_pro.sh
 
 # Apex runtime logs (per-day dual-read decisions, audit envelopes)
 parallax/logs/
+
+# OMX session-tooling logs — local runtime artifact, never part of a change.
+.omx/

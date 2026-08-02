@@ -35,6 +35,7 @@ from parallax.router.discrepancy_live import (
     DualReadOutcome,
     _normalize_traffic_source,
     record_dual_read_outcome,
+    record_dual_read_request,
 )
 from parallax.router.dual_read_decision_log import append_decision
 from parallax.router.live_arbitration import arbitrate
@@ -148,6 +149,16 @@ class DualReadRouter:
         failures are caught and classified — they never propagate to the caller.
         Primary failures DO propagate (fail-closed in the canonical direction).
         """
+        # Count the ATTEMPT, first thing and unconditionally. This is the
+        # liveness signal DualReadDecisionLogSilent joins against, and its
+        # placement is load-bearing: it must advance even when the primary
+        # store raises and even when the decision-log write fails, because the
+        # alert's whole job is to notice that requests are arriving while the
+        # log is not advancing. Move it inside `_log_decision` (or after it)
+        # and a broken writer stops both signals at once, the traffic guard
+        # reads false, and the alert goes quiet exactly when it should fire.
+        record_dual_read_request(traffic_source=traffic_source)
+
         cid = correlation_id if correlation_id is not None else str(uuid.uuid4())
 
         # ------------------------------------------------------------------

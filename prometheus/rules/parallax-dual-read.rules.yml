@@ -164,12 +164,24 @@ groups:
       # closeout rather than become standing noise. `up == 0` owns the
       # scrape-down case.
       #
-      # Known gap: parallax_aphelion_total is not incremented for
-      # outcome="skipped" (dual-read disabled), and parallax_dual_read_-
-      # outcomes_total, which would cover it, is registered but never
-      # rendered on the wire. A writer that broke while every request was
-      # being skipped would not be caught here. Tracked with the other
-      # never-exposed dual-read series in issue #101.
+      # The traffic guard uses parallax_dual_read_requests_total, a counter
+      # that exists for this alert: labelled by traffic_source only, never by
+      # user_id, and incremented at request ENTRY — before the decision-log
+      # write is attempted and outside its exception handling. Both properties
+      # are load-bearing:
+      #
+      #   * No user_id. prometheus_client retains every label combination for
+      #     the life of the process, so a user that queries once leaves a
+      #     series pinned at 1 forever; increase() diffs last-minus-first and
+      #     returns 0 for it, and there is no "series appeared" delta because
+      #     Prometheus has no earlier sample. Summing increase() over a
+      #     user_id-partitioned counter therefore reads ~0 under traffic made
+      #     of mostly-unique users and SUPPRESSES this alert — which is what
+      #     an earlier version of this rule did with parallax_aphelion_total.
+      #   * Counted at entry. Attempts and successful log writes are separate
+      #     signals and their divergence IS the alarm. A counter that only
+      #     advanced on a successful write would go silent together with the
+      #     writer it is supposed to be watching.
       - alert: DualReadDecisionLogSilent
         # `min without (traffic_source)` collapses only the partition label,
         # keeping job/instance, and takes the freshest partition — the log is
@@ -181,7 +193,7 @@ groups:
               min without (traffic_source) (parallax_dual_read_log_newest_record_age_seconds) > 900
               or absent(parallax_dual_read_log_newest_record_age_seconds)
             )
-            and on() (sum(increase(parallax_aphelion_total[15m])) > 0)
+            and on() (sum(increase(parallax_dual_read_requests_total[15m])) > 0)
           )
         for: 15m
         labels:

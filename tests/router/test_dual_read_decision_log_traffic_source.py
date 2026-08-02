@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import prometheus_client
 import pytest
 
 from parallax.retrieval.contracts import RetrievalEvidence
@@ -93,3 +94,90 @@ def test_skipped_path_also_records_traffic_source(log_dir: Path) -> None:
     assert len(records) == 1, records
     assert records[0]["outcome"] == "skipped"
     assert records[0]["traffic_source"] == "synthetic"
+
+
+# ---------------------------------------------------------------------------
+# parallax_dual_read_requests_total — liveness counter for
+# DualReadDecisionLogSilent. Its placement is the contract, not just its
+# existence: it counts ATTEMPTS, so it must keep advancing when the thing it
+# is watching is broken.
+# ---------------------------------------------------------------------------
+
+
+def _requests_total(traffic_source: str) -> float:
+    """Read parallax_dual_read_requests_total{traffic_source} from the registry."""
+    value = prometheus_client.REGISTRY.get_sample_value(
+        "parallax_dual_read_requests_total",
+        {"traffic_source": traffic_source},
+    )
+    return 0.0 if value is None else value
+
+
+def test_request_counter_carries_traffic_source_and_no_user_id() -> None:
+    """The counter is partitioned by traffic_source ONLY.
+
+    A ``user_id`` label would make the alert's ``sum(increase(...))`` guard
+    unusable: prometheus_client keeps every label set for the process
+    lifetime, so a one-shot user's series sits pinned at 1 forever and
+    contributes a delta of zero. That is the defect this counter replaced.
+    """
+    before = _requests_total("synthetic")
+    router = DualReadRouter(primary=_StubPort(_evidence("a")), secondary=_StubPort(_evidence("a")))
+    router.query(_request(), traffic_source="synthetic")
+
+    assert _requests_total("synthetic") - before == 1
+
+    for metric in prometheus_client.REGISTRY.collect():
+        if metric.name == "parallax_dual_read_requests":
+            for sample in metric.samples:
+                assert "user_id" not in sample.labels, sample.labels
+            break
+    else:  # pragma: no cover - only reached if the counter vanished
+        pytest.fail("parallax_dual_read_requests not registered")
+
+
+def test_request_counter_advances_when_decision_log_write_fails(
+    log_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken writer must NOT silence the liveness signal.
+
+    This is the placement contract. ``_log_decision`` swallows writer
+    failures, so if the counter lived inside or after the write path it would
+    stop exactly when the decision log stopped — the traffic guard would read
+    false and ``DualReadDecisionLogSilent`` could never fire in the one
+    situation it exists for. Attempts and successful writes must diverge here.
+    """
+    import parallax.router.dual_read as dual_read_module
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated decision-log write failure")
+
+    monkeypatch.setattr(dual_read_module, "append_decision", _boom)
+
+    before = _requests_total("natural")
+    router = DualReadRouter(primary=_StubPort(_evidence("a")), secondary=_StubPort(_evidence("a")))
+    router.query(_request())
+
+    assert _requests_total("natural") - before == 1, "liveness counter died with the writer"
+    assert _records(log_dir) == [], "the write was supposed to fail"
+
+
+def test_request_counter_advances_when_primary_query_raises(log_dir: Path) -> None:
+    """Counted at request entry, so even a failed request registers as traffic.
+
+    Primary failures propagate by design and write no decision record. If they
+    also went uncounted, a wholly broken primary would look like "no traffic"
+    and suppress the silence alert — the same hole one layer up.
+    """
+
+    class _RaisingPort:
+        def query(self, request: QueryRequest) -> RetrievalEvidence:
+            raise RuntimeError("primary is down")
+
+    before = _requests_total("natural")
+    router = DualReadRouter(primary=_RaisingPort(), secondary=_StubPort(_evidence("a")))
+    with pytest.raises(RuntimeError, match="primary is down"):
+        router.query(_request())
+
+    assert _requests_total("natural") - before == 1
+    assert _records(log_dir) == []

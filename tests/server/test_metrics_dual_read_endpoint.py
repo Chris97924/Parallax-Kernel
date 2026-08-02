@@ -346,6 +346,25 @@ def test_newest_record_age_absent_when_no_records(client: TestClient) -> None:
     }
 
 
+def test_dual_read_requests_counter_reaches_the_wire(client: TestClient) -> None:
+    """The liveness counter must actually be exposed, not just registered.
+
+    It lives in the DEFAULT registry, and ``_build_payload`` serializes a
+    fresh ``CollectorRegistry`` — anything not explicitly plucked out never
+    reaches a scrape. That is precisely how the never-exposed dual-read series
+    tracked in #101 became invisible, so the alert's traffic guard would be
+    querying a metric Prometheus has never seen.
+    """
+    from parallax.router.discrepancy_live import record_dual_read_request
+
+    record_dual_read_request(traffic_source="synthetic")
+
+    body = client.get("/metrics").text
+    samples = _labelled_samples(body, "parallax_dual_read_requests_total")
+
+    assert samples.get("synthetic", 0.0) >= 1.0, body[-2000:]
+
+
 def test_dir_missing_gauge_distinguishes_misconfig_from_quiet_window(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -94,6 +94,10 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
         "dual_read_log_records_total",
         "dual_read_log_dir_missing",
         "dual_read_log_newest_record_age_seconds",
+        # Rendered from the DEFAULT registry below rather than built as a
+        # Gauge here, but an in-house counter sanitizing to this name would
+        # still emit a second metric of the same name into the same payload.
+        "dual_read_requests_total",
         "arbitration_p99_latency_ms",
         "arbitration_policy_version",
     }
@@ -670,6 +674,11 @@ def _build_payload() -> str:
             "parallax_aphelion",
             "parallax_canary_shadow_attempts",
             "parallax_canary_shadow_outcomes",
+            # Liveness signal for DualReadDecisionLogSilent. Labelled by
+            # traffic_source only — the alert sums increase() over it, which
+            # is unusable on a counter that carries user_id (a one-shot user's
+            # series sits pinned at 1 forever and contributes a delta of 0).
+            "parallax_dual_read_requests",
         )
     )
     return generate_latest(reg).decode("utf-8") + default_registry_counters

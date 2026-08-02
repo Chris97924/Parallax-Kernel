@@ -52,6 +52,9 @@ from prometheus_client import (
 from parallax.obs.log import get_logger as _get_logger
 from parallax.obs.metrics import registry as _inhouse_registry
 from parallax.router.dual_read_metrics import (
+    TRAFFIC_SOURCE_PARTITIONS as _DUAL_READ_TRAFFIC_SOURCE_PARTITIONS,
+)
+from parallax.router.dual_read_metrics import (
     _parse_timestamp as _dual_read_parse_timestamp,  # noqa: PLC2701
 )
 from parallax.router.dual_read_metrics import (
@@ -59,6 +62,9 @@ from parallax.router.dual_read_metrics import (
 )
 from parallax.router.dual_read_metrics import (
     load_records as _dual_read_load_records,
+)
+from parallax.router.dual_read_metrics import (
+    partition_by_traffic_source as _dual_read_partition_by_traffic_source,
 )
 from parallax.router.live_arbitration import POLICY_VERSION_DEFAULT
 from parallax.server.auth import (
@@ -108,59 +114,20 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
 # than a magic literal so an operator can grep for it.
 _DUAL_READ_WINDOW = "72h"
 
-# Read-side traffic_source partitions for the dual-read decision-log corpus.
-# ``unknown`` is deliberately NOT one of the two values the write side can
-# produce — see ``_record_traffic_source`` for why it exists and why it is
-# emitted rather than folded into ``natural``.
-_TRAFFIC_SOURCE_PARTITIONS: tuple[str, ...] = ("natural", "synthetic", "unknown")
-_TRAFFIC_SOURCE_UNKNOWN = "unknown"
-
-
-def _record_traffic_source(record: dict[str, Any]) -> str:
-    """Partition one decision-log record by its recorded ``traffic_source``.
-
-    Read-side semantics, and they are deliberately NOT the write-side
-    semantics — the asymmetry is the whole point, so do not "fix" it:
-
-    * **Write side** (``DualReadRouter._log_decision`` →
-      ``discrepancy_live._normalize_traffic_source``) resolves an *absent
-      or unrecognized* value to ``"natural"``. That is the fail-safe
-      mandated by ``docs/m4-prep/traffic-gap-resolution.md`` §6: a live
-      request that arrives with no ``X-Parallax-Traffic-Source`` header is
-      real production traffic and must never be discounted. Because that
-      normalization runs unconditionally, **every record written from that
-      code onward carries an explicit ``traffic_source``** of exactly
-      ``"synthetic"`` or ``"natural"``.
-
-    * **Read side** (here) maps a *missing* field to ``"unknown"``. A record
-      with no ``traffic_source`` key was not written by a request whose
-      header was absent — it was written by a build that could not record
-      the field at all, so its provenance is genuinely unknown. As of
-      2026-08-02 roughly 245k such records sit in the live 72h corpus and
-      they are known to be 100% synthetic burn-in traffic. Read-defaulting
-      them to ``"natural"`` would dump that entire backlog into the
-      natural-labelled gauges the moment those gauges exist, pinning
-      ``{traffic_source="natural"}`` at a conflict rate of 1.0 and poisoning
-      the exact Phase-2 gate (§3.3) the label was added to make measurable.
-
-    §6 rejected an ``"unknown"`` class on the grounds that no alert would be
-    wired against it. That objection is answered here: the bucket is
-    closed-ended (no new record can land in it), it drains to zero within
-    ``_DUAL_READ_WINDOW`` of deploy, and it is counted on
-    ``parallax_dual_read_log_records_total{traffic_source="unknown"}`` so an
-    operator can watch it drain rather than infer it.
-    """
-    raw = record.get("traffic_source")
-    if not isinstance(raw, str):
-        return _TRAFFIC_SOURCE_UNKNOWN
-    candidate = raw.strip().lower()
-    if candidate in ("synthetic", "natural"):
-        return candidate
-    # Present but unrecognized: the writer normalizes to one of the two known
-    # values, so this is foreign or hand-edited data. "Unknown" is the honest
-    # answer — folding it into ``natural`` would attribute unaudited records
-    # to the gate-bearing partition.
-    return _TRAFFIC_SOURCE_UNKNOWN
+# Read-side traffic_source partitioning lives in ``dual_read_metrics`` — the
+# module both authoritative gates on this corpus import from. /metrics and
+# ``scripts/dual_read_continuity_check.py`` MUST agree on how a record is
+# attributed; when they did not, they contradicted each other and could block
+# a promotion between them. ``unknown`` is deliberately not one of the two
+# values the write side can produce — see ``record_traffic_source`` for why.
+#
+# §6 rejected an ``"unknown"`` class on the grounds that no alert would be
+# wired against it. That objection is answered here: the bucket is
+# closed-ended (no new record can land in it), it drains to zero within
+# ``_DUAL_READ_WINDOW`` of deploy, and it is counted on
+# ``parallax_dual_read_log_records_total{traffic_source="unknown"}`` so an
+# operator can watch it drain rather than infer it.
+_TRAFFIC_SOURCE_PARTITIONS = _DUAL_READ_TRAFFIC_SOURCE_PARTITIONS
 
 
 def _newest_record_age_seconds(
@@ -317,9 +284,7 @@ def _collect_dual_read_metrics() -> _DualReadSnapshot:
         loaded = _dual_read_load_records(since=parse_window(_DUAL_READ_WINDOW))
         dir_missing = 1.0 if loaded.dir_missing else 0.0
 
-        partitions: dict[str, list[dict[str, Any]]] = {}
-        for record in loaded.records:
-            partitions.setdefault(_record_traffic_source(record), []).append(record)
+        partitions = _dual_read_partition_by_traffic_source(loaded.records)
 
         # One clock reading for the whole snapshot so the partitions' ages are
         # comparable to each other and to the window they were loaded with.

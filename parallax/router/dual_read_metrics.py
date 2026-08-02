@@ -64,6 +64,10 @@ __all__ = [
     "CROSSWALK_MISS_THRESHOLD",
     "CIRCUIT_OPEN_72H_MAX",
     "DEFAULT_DATA_QUALITY_FILTER",
+    "TRAFFIC_SOURCE_PARTITIONS",
+    "TRAFFIC_SOURCE_UNKNOWN",
+    "record_traffic_source",
+    "partition_by_traffic_source",
     "LoadResult",
     "discrepancy_rate",
     "arbitration_conflict_rate",
@@ -147,6 +151,69 @@ def _normalize_outcome(record: dict[str, Any]) -> str | None:
     if isinstance(val, str) and val:
         return val
     return None
+
+
+TRAFFIC_SOURCE_UNKNOWN = "unknown"
+TRAFFIC_SOURCE_PARTITIONS: tuple[str, ...] = ("natural", "synthetic", TRAFFIC_SOURCE_UNKNOWN)
+
+
+def record_traffic_source(record: dict[str, Any]) -> str:
+    """Partition one decision-log record by its recorded ``traffic_source``.
+
+    Read-side semantics, and they are deliberately NOT the write-side
+    semantics — the asymmetry is the whole point, so do not "fix" it:
+
+    * **Write side** (``DualReadRouter._log_decision`` →
+      ``discrepancy_live._normalize_traffic_source``) resolves an *absent or
+      unrecognized* value to ``"natural"``. That is the fail-safe mandated by
+      ``docs/m4-prep/traffic-gap-resolution.md`` §6: a live request arriving
+      with no ``X-Parallax-Traffic-Source`` header is real production traffic
+      and must never be discounted. Because that normalization runs
+      unconditionally, every record written from that code onward carries an
+      explicit ``"synthetic"`` or ``"natural"``.
+
+    * **Read side** (here) maps a *missing* field to ``"unknown"``. A record
+      with no ``traffic_source`` key was not written by a header-less request
+      — it was written by a build that could not record the field at all, so
+      its provenance is genuinely unknown. As of 2026-08-02 roughly 245k such
+      records sit in the live 72h corpus and are known to be 100% synthetic
+      burn-in. Read-defaulting them to ``"natural"`` would dump that backlog
+      into the natural-labelled numbers and poison the exact Phase-2 gate
+      (§3.3) the label exists to make measurable.
+
+    This lives in the shared module rather than in either consumer because
+    ``/metrics`` and ``scripts/dual_read_continuity_check.py`` are two
+    authoritative gates on the same corpus. When they partitioned it
+    differently — or when one partitioned and the other did not — they
+    contradicted each other and could block a promotion between them.
+    """
+    raw = record.get("traffic_source")
+    if not isinstance(raw, str):
+        return TRAFFIC_SOURCE_UNKNOWN
+    candidate = raw.strip().lower()
+    if candidate in ("synthetic", "natural"):
+        return candidate
+    # Present but unrecognized: the writer only ever emits the two known
+    # values, so this is foreign or hand-edited data. "Unknown" is the honest
+    # answer — folding it into ``natural`` would attribute unaudited records
+    # to the gate-bearing partition.
+    return TRAFFIC_SOURCE_UNKNOWN
+
+
+def partition_by_traffic_source(
+    records: Iterable[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group records by :func:`record_traffic_source`.
+
+    Only partitions that actually have records appear as keys — callers that
+    need a fixed set iterate :data:`TRAFFIC_SOURCE_PARTITIONS` themselves and
+    decide what an empty partition means for their surface. ``/metrics``
+    treats it as "emit no series"; the DoD CLI treats it as "cannot evaluate".
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        out.setdefault(record_traffic_source(record), []).append(record)
+    return out
 
 
 @dataclasses.dataclass(frozen=True)

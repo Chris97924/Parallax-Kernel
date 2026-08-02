@@ -96,34 +96,59 @@ repo default 那個路徑在 systemd hardening（`ProtectHome=read-only`）下 s
 `parallax_dual_read_log_records_total{traffic_source=...}`（窗內筆數，含 0）。
 量到 0 之前先看這兩個 gauge，別再用 rate gauge 反推目錄健康。
 
+### ⚠️ exit code 是三態，不是二態
+
+> **新增 2026-08-02**
+
+`dual_read_continuity_check` 的判決**只看 `natural` partition**，與 alert rule 的
+`{traffic_source="natural"}` selector 同一個母體（兩個 gate 母體不一致會互相打架：
+burn-in 期 synthetic 的 conflict rate 合理地是 1.0，混在一起算會讓 CLI FAIL 而 alert 靜默）。
+`synthetic` / `unknown` 的數字照樣印出來，只是不參與判決。
+
+| exit | 意義 | 該怎麼辦 |
+|---|---|---|
+| `0` | PASS — natural partition 全數達標 | continue |
+| `1` | FAIL — 門檻被破 / log dir 不存在 / `--min-records` 未達 | **STOP**，記 blocker |
+| `2` | `INSUFFICIENT_NATURAL` — natural 筆數 < `--natural-min-records`（預設 100） | **不是失敗**，是「還不能評」 |
+
+**exit 2 不要當 FAIL 記進 blocker**。它就是 `traffic-gap-resolution.md` §3.3 的
+`WARN_NATURAL_INSUFFICIENT`：自然流量樣本不足、Phase-2 semantic gate 無從評估。
+M4 canary 已於 2026-08-02 由 Chris 拍板以 Phase-1 收官、Phase-2 移交「接真自然流量」
+milestone，所以 M4 stage 推進期間**看到 exit 2 是預期狀態**。
+
+只想看現有資料（不管自然流量夠不夠，例如 smoke run 或重放 synthetic-only corpus）→
+加 `--natural-min-records=0`，行為等同分割前。
+
 ### 驗證命令
 
 ```bash
 # 前置：${DUAL_READ_LOG_DIR_RESOLVED} 來自上一節，未設就不要往下跑
+# 三態 exit：0=PASS / 1=FAIL(記 blocker) / 2=INSUFFICIENT_NATURAL(不是失敗)
 
-# dual_read_discrepancy_rate — 連續 72h < 0.1%
+# dual_read_discrepancy_rate — 連續 72h < 0.1%（natural partition）
 dual_read_continuity_check \
   --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=discrepancy \
   --format=json
-# 預期 exit 0，JSON 內 "pass": true
+# 預期 exit 0（JSON 內 "status": "pass"）；exit 2 = 自然流量不足，非失敗
 
-# arbitration_conflict_rate — 連續 72h < 1%
+# arbitration_conflict_rate — 連續 72h < 1%（natural partition）
 dual_read_continuity_check \
   --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=arbitration_conflict \
   --format=json
-# 預期 exit 0
+# 預期 exit 0；exit 2 = 自然流量不足，非失敗
+# ⚠️ 這條在 burn-in 期若 synthetic 顯示 1.0 屬正常——判決只看 natural
 
-# dual_read_write_error_rate — 連續 72h < 0.02%
+# dual_read_write_error_rate — 連續 72h < 0.02%（natural partition）
 dual_read_continuity_check \
   --log-dir="${DUAL_READ_LOG_DIR_RESOLVED:?run the resolve step above first}" \
   --since=72h \
   --metric=write_error \
   --format=json
-# 預期 exit 0
+# 預期 exit 0；exit 2 = 自然流量不足，非失敗
 
 # aphelion_unreachable_rate — < 0.5% (PR #27 deploy 後)
 curl -s "http://prometheus:9090/api/v1/query" \

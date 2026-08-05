@@ -2,6 +2,21 @@ groups:
   - name: parallax_dual_read
     interval: 30s
     rules:
+      # user_id-stripped aggregate (same treatment issue #76 gave the canary
+      # counters). parallax_dual_read_outcomes_total carries a high-cardinality
+      # user_id label. rate()/increase() is computed PER SERIES and only then
+      # summed, so a one-time user whose child series holds a single sample in
+      # the range extrapolates to ~0 and is dropped — under-counting exactly
+      # the sparse natural traffic the alerts below select on. Recording
+      # `sum without (user_id) (...)` at the 30s group interval collapses
+      # user_id into a stable, densely-sampled aggregate first; increase() over
+      # THAT reflects every user's increment.
+      #
+      # MUST stay above its consumers: rules in a group evaluate sequentially,
+      # in order, so the aggregate has to be recorded before it is read.
+      - record: parallax_dual_read_outcomes:sum_without_user_id
+        expr: sum without (user_id) (parallax_dual_read_outcomes_total)
+
       - alert: CrosswalkMissRateHigh
         # Aggregated with sum() on both sides because miss_orphan_total carries
         # labels [user_id] while outcomes_total carries [user_id, outcome].
@@ -68,9 +83,9 @@ groups:
             Lifespan drain handler hit the 15-minute timeout — in-flight requests
             were force-cut. Investigate stuck connections or upstream blocks.
 
-      # The four dual-read DoD gauges below are exposed by
+      # The three dual-read DoD gauges below are exposed by
       # parallax/server/routes/metrics.py partitioned by `traffic_source`
-      # (`natural` | `synthetic` | `unknown`). All four alerts select
+      # (`natural` | `synthetic` | `unknown`). All three alerts select
       # `natural` only, which is the Phase-2 semantic gate defined in
       # docs/m4-prep/traffic-gap-resolution.md §3.3 — the M4 burn-in
       # synthetic loader runs continuously and legitimately produces a 100%
@@ -134,35 +149,77 @@ groups:
             primary write path and Aphelion bridge stub for raised exceptions.
             Runbook: docs/m3-runbooks/observability-cookbook.md §5 場景 A.
 
-      # Until #101 this selected `max by (user_id, traffic_source)` over a
-      # gauge that never reached the wire at all: discrepancy_live.py
-      # registered parallax_aphelion_unreachable_rate into the DEFAULT
-      # registry and set it on every outcome, but _build_payload serializes a
-      # fresh CollectorRegistry, so no scrape ever carried it. The rule — and
-      # Grafana panel 2's two targets — matched nothing, for 5 minutes at a
-      # time, forever. metrics.py is now the single producer, computed from
-      # the same 72h corpus as its three siblings above, which is also why
-      # `user_id` is gone from the aggregation: the exposed gauge no longer
-      # carries it (see the cardinality note in discrepancy_live.py).
+      # This alert exists to warn about a circuit-breaker trip, so it has to
+      # measure what the breaker measures. It did not.
       #
-      # Alert threshold (1%) intentionally looser than the DoD exit threshold
-      # (0.5%, APHELION_UNREACHABLE_THRESHOLD) — same rationale as the two
-      # alerts above. Sustained breach is what precedes a circuit-breaker trip.
+      # Two bugs, fixed in two passes:
+      #
+      #   #101 — it selected a gauge that never reached the wire at all.
+      #   discrepancy_live.py registered parallax_aphelion_unreachable_rate
+      #   into the DEFAULT registry and set it on every outcome, but
+      #   _build_payload serializes a fresh CollectorRegistry, so no scrape
+      #   ever carried it. The rule matched nothing, forever.
+      #
+      #   #103 review — wiring it to the 72h DoD gauge fixed the wrong window.
+      #   The breaker (parallax/router/circuit_breaker.py) trips on a 300s
+      #   rolling window at 1% with >= 50 observations; the DoD gauge is a 72h
+      #   corpus average. Those disagree in the exact scenario this alert is
+      #   for: a sudden Aphelion outage against a large healthy 72h backlog
+      #   trips the breaker while the 72h average stays well under 1%, so the
+      #   warning never fires. It is a slow-moving gauge asked to detect a fast
+      #   event.
+      #
+      # So this now computes a 300s ratio off the outcome counter, matching the
+      # breaker term for term:
+      #
+      #   window       [5m]                    <- WINDOW_SECONDS = 300.0
+      #   threshold    > 0.01                  <- TRIP_THRESHOLD = 0.01 (strict)
+      #   sample floor >= 50 in-window         <- MIN_OBSERVATIONS = 50
+      #
+      # The `>= 50` denominator guard does double duty: it is the breaker's
+      # cold-start flap guard AND the division-by-zero guard. Below 50
+      # observations the comparison drops the sample and the alert is no-data
+      # — deliberately NOT `or vector(0)`, because a fabricated 0 would read as
+      # "measured, and healthy" on a window where nothing was measured. Same
+      # absent-not-zero rule the gauges follow.
+      #
+      # for: 0m is the parity choice, not an oversight. The [5m] range IS the
+      # breaker's window, so the smoothing is already in the expression; adding
+      # a `for:` on top would delay the warning past the trip it is supposed to
+      # precede. CircuitBreakerTripped uses for: 0m for the same reason.
+      #
+      # parallax_aphelion_unreachable_rate is NOT dead — it stays the 72h DoD
+      # view on Grafana panel 2 and in the corpus exit criteria. It is simply
+      # the wrong instrument for a 300s question. Two windows, two consumers.
       - alert: AphelionUnreachableRateHigh
         expr: |
-          max by (traffic_source) (parallax_aphelion_unreachable_rate{traffic_source="natural"}) > 0.01
-        for: 5m
+          (
+            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m]))
+            /
+            (sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural"}[5m])) >= 50)
+          ) > 0.01
+        for: 0m
         labels:
           severity: warning
           component: parallax_dual_read
         annotations:
-          summary: Aphelion unreachable rate above 1% for 5min — circuit breaker imminent
+          summary: Aphelion unreachable rate above 1% over 300s — circuit breaker tripping
           description: |
-            Sustained aphelion_unreachable_rate above 1% for 5 minutes triggers
-            the circuit breaker. New dual-read requests will fall back to canonical-only.
-            Manual re-arm via POST /admin/circuit_breaker/reset after Aphelion recovers.
+            Natural-traffic aphelion_unreachable rate exceeded 1% over the same
+            300s window and 50-observation floor the dual-read circuit breaker
+            trips on, so the breaker is tripping now or is about to. New
+            dual-read requests fall back to canonical-only once it does.
+            The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
+            after Aphelion recovers. Note this alert RESOLVES on its own once
+            the breaker opens — fallback stops producing aphelion_unreachable
+            outcomes — so resolution here does NOT mean the breaker re-armed.
+            CircuitBreakerTripped is the signal for the trip itself (and per
+            #102 that alert's metric is itself never-on-the-wire).
+            Runbook: docs/m3-runbooks/observability-cookbook.md §5.
 
-      # Selecting {traffic_source="natural"} above means the four DoD alerts
+      # Selecting {traffic_source="natural"} above means all four
+      # natural-selecting alerts (the three DoD gauges plus
+      # AphelionUnreachableRateHigh)
       # go quiet when there is no natural traffic — correct, but it removes
       # the only signal that the decision-log corpus is being read at all.
       # This alert is that signal. It covers two independent faults, and it

@@ -1,0 +1,240 @@
+# promtool rules unit test for AphelionUnreachableRateHigh (#103 review fix).
+#
+# Run:  promtool test rules prometheus/tests/parallax-dual-read.test.yml
+#
+# Lives OUTSIDE prometheus/rules/ so the `promtool check rules` CI step (which
+# globs prometheus/rules/**) does not try to parse this test file as a rule
+# file. The `promtool test rules` CI step globs prometheus/tests/**/*.test.yml
+# and picks this up with no workflow change.
+#
+# What is under test
+# ------------------
+# The alert exists to warn that the dual-read circuit breaker is tripping, so
+# it must measure what the breaker measures (parallax/router/circuit_breaker.py):
+#
+#     WINDOW_SECONDS   = 300.0   -> [5m] range
+#     TRIP_THRESHOLD   = 0.01    -> > 0.01, strict
+#     MIN_OBSERVATIONS = 50      -> >= 50 in-window denominator guard
+#
+# Before this fix the alert read the 72h DoD gauge, which cannot see a 300s
+# outage against a large healthy backlog. These cases pin the three terms plus
+# the traffic_source partition, so CI asserts BEHAVIOUR and not just syntax.
+#
+# Series shape note: parallax_dual_read_outcomes_total carries user_id, and the
+# rule file records a `sum without (user_id)` aggregate first (issue #76). Each
+# case below therefore uses several distinct user_id children — a per-series
+# increase() would drop the one-time users and under-count, which case 5 pins
+# directly.
+
+rule_files:
+  - ../rules/parallax-dual-read.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # -------------------------------------------------------------------------
+  # 1. FIRES — natural traffic crosses 1% with a healthy sample size.
+  #    Per 30s step: 5 unreachable, 95 match (split 60/35 across two users so
+  #    the recorded aggregate has to sum more than one child). Over the 5m
+  #    window that is ~50 unreachable of ~1000 total = ~5% > 1%, with the
+  #    denominator far above the 50-observation floor.
+  #    This is the case that pins the 1% threshold: loosen it and this stops
+  #    firing.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: fires when natural unreachable rate exceeds 1 percent over 300s
+    input_series:
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
+        values: '0+5x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+        values: '0+60x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u2"}'
+        values: '0+35x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: parallax_dual_read
+            exp_annotations:
+              summary: Aphelion unreachable rate above 1% over 300s — circuit breaker tripping
+              description: |
+                Natural-traffic aphelion_unreachable rate exceeded 1% over the same
+                300s window and 50-observation floor the dual-read circuit breaker
+                trips on, so the breaker is tripping now or is about to. New
+                dual-read requests fall back to canonical-only once it does.
+                The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
+                after Aphelion recovers. Note this alert RESOLVES on its own once
+                the breaker opens — fallback stops producing aphelion_unreachable
+                outcomes — so resolution here does NOT mean the breaker re-armed.
+                CircuitBreakerTripped is the signal for the trip itself (and per
+                #102 that alert's metric is itself never-on-the-wire).
+                Runbook: docs/m3-runbooks/observability-cookbook.md §5.
+
+  # -------------------------------------------------------------------------
+  # 2. SILENT below the threshold — 1 unreachable per ~1000 outcomes (0.1%),
+  #    an order of magnitude under the 1% trip threshold, with a large sample.
+  #    Guards against a regression that alerts on any unreachable at all.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: silent when natural unreachable rate is below 1 percent
+    input_series:
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
+        values: '0+1x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+        values: '0+999x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 3. SILENT under the 50-observation floor — this is the breaker's
+  #    MIN_OBSERVATIONS cold-start flap guard. The ratio here is ~33%, far over
+  #    the threshold, but only ~30 outcomes landed in the window, so the
+  #    breaker would NOT trip and neither may the alert. Without the `>= 50`
+  #    guard this case fires and pages on statistical noise.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: silent when in-window sample size is under the 50 observation floor
+    input_series:
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
+        values: '0+1x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+        values: '0+2x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 4. SILENT when the unreachable traffic is synthetic — the M4 burn-in loader
+  #    legitimately runs at a high unreachable rate against claim ids present
+  #    in neither store. An unpartitioned selector alerts on the loader
+  #    forever, which is the #100 lesson.
+  #
+  #    Natural traffic runs ALONGSIDE it here, healthy and above the 50-sample
+  #    floor, deliberately: with no natural traffic at all the denominator
+  #    guard alone would keep this quiet and the case would pass without ever
+  #    exercising the partition. A regression that drops traffic_source from
+  #    the numerator leaks the loader's unreachables into the natural ratio and
+  #    fires — which is what this case is here to catch.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: silent when the unreachable traffic is synthetic and natural is healthy
+    input_series:
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="synthetic",user_id="parallax-burn-in-synth"}'
+        values: '0+100x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+        values: '0+100x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 6. THE REGRESSION CASE for the #103 review finding — a sudden outage
+  #    against a large healthy backlog. This is the scenario the 72h DoD gauge
+  #    structurally cannot see, and the reason this alert had to move to a
+  #    300s window.
+  #
+  #    50 minutes of healthy traffic (200k matches, zero unreachable), then
+  #    Aphelion falls over: matches stop, unreachables climb. At the end of the
+  #    window the LAST 300s is ~100% unreachable — the breaker is tripping —
+  #    while the all-time ratio is only 1000/201000 ~= 0.5%, comfortably under
+  #    the 1% threshold. A long-window expression reads healthy right through
+  #    the outage. Widening [5m] back out must break this case.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: fires on a sudden outage that a long window would average away
+    input_series:
+      # Healthy for ~50m, then flat: the backlog a 72h average would drown in.
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+        values: '0+2000x100 200000+0x20'
+      # Zero unreachable for ~50m, then the outage starts.
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
+        values: '0+0x100 0+50x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: parallax_dual_read
+            exp_annotations:
+              summary: Aphelion unreachable rate above 1% over 300s — circuit breaker tripping
+              description: |
+                Natural-traffic aphelion_unreachable rate exceeded 1% over the same
+                300s window and 50-observation floor the dual-read circuit breaker
+                trips on, so the breaker is tripping now or is about to. New
+                dual-read requests fall back to canonical-only once it does.
+                The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
+                after Aphelion recovers. Note this alert RESOLVES on its own once
+                the breaker opens — fallback stops producing aphelion_unreachable
+                outcomes — so resolution here does NOT mean the breaker re-armed.
+                CircuitBreakerTripped is the signal for the trip itself (and per
+                #102 that alert's metric is itself never-on-the-wire).
+                Runbook: docs/m3-runbooks/observability-cookbook.md §5.
+    promql_expr_test:
+      # Pin the premise, so the case cannot silently stop testing what it says:
+      # the all-time ratio really is under the 1% threshold. If this ever rises
+      # above 0.01 the outage is no longer "averaged away" and case 6 would
+      # pass for the wrong reason.
+      - expr: |
+          (
+            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[72h]))
+            /
+            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural"}[72h]))
+          ) < bool 0.01
+        eval_time: 60m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # -------------------------------------------------------------------------
+  # 5. The user_id-stripping recording rule is load-bearing, not decoration.
+  #    Five one-time users each emit a single outcome and then sit flat, which
+  #    is what prometheus_client does with a retained label child. Per-series
+  #    increase() sees a flat series and returns 0 for every one of them, so
+  #    the OLD sum-of-increases idiom reads 0 and the alert can never fire on
+  #    sparse natural traffic. The recorded aggregate counts all five.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: user_id stripped aggregate counts one-time users the raw counter drops
+    input_series:
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+        values: '1+0x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u2"}'
+        values: '_ _ 1+0x18'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u3"}'
+        values: '_ _ _ _ 1+0x16'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u4"}'
+        values: '_ _ _ _ _ _ 1+0x14'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u5"}'
+        values: '_ _ _ _ _ _ _ _ 1+0x12'
+    promql_expr_test:
+      # The aggregate materialises all five one-time users as one series.
+      - expr: parallax_dual_read_outcomes:sum_without_user_id{outcome="match",traffic_source="natural"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'parallax_dual_read_outcomes:sum_without_user_id{outcome="match", traffic_source="natural"}'
+            value: 5
+
+      # The OLD idiom drops every one of them: each child is flat in range.
+      - expr: sum(increase(parallax_dual_read_outcomes_total{traffic_source="natural"}[10m]))
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+
+      # The aggregate does not. `> bool` yields a deterministic 1 regardless of
+      # increase()'s extrapolation, asserting "no longer under-counted".
+      - expr: |
+          sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural"}[10m]))
+          > bool
+          sum(increase(parallax_dual_read_outcomes_total{traffic_source="natural"}[10m]))
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1

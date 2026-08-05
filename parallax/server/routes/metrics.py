@@ -96,14 +96,17 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
         "dual_read_discrepancy_rate",
         "arbitration_conflict_rate",
         "dual_read_write_error_rate",
+        "aphelion_unreachable_rate",
         "dual_read_metrics_compute_error",
         "dual_read_log_records_total",
         "dual_read_log_dir_missing",
         "dual_read_log_newest_record_age_seconds",
         # Rendered from the DEFAULT registry below rather than built as a
-        # Gauge here, but an in-house counter sanitizing to this name would
-        # still emit a second metric of the same name into the same payload.
+        # Gauge here, but an in-house counter sanitizing to one of these names
+        # would still emit a second metric of the same name into the same
+        # payload.
         "dual_read_requests_total",
+        "dual_read_outcomes_total",
         "arbitration_p99_latency_ms",
         "arbitration_policy_version",
     }
@@ -299,6 +302,7 @@ def _collect_dual_read_metrics() -> _DualReadSnapshot:
                 "dual_read_discrepancy_rate": float(computed["discrepancy_rate"]),
                 "arbitration_conflict_rate": float(computed["arbitration_conflict_rate"]),
                 "dual_read_write_error_rate": float(computed["write_error_rate"]),
+                "aphelion_unreachable_rate": float(computed["aphelion_unreachable_rate"]),
             }
     except Exception as exc:  # noqa: BLE001 — observability never crashes scrape
         _log.warning(
@@ -544,6 +548,17 @@ def _build_payload() -> str:
             labelnames=["traffic_source"],
             registry=reg,
         ),
+        # Note the denominator asymmetry against its three siblings: here the
+        # unreachable count IS the numerator, so excluding it would divide a
+        # quantity by zero-minus-itself. Denominator is ALL in-window outcomes
+        # (parallax.router.dual_read_metrics §"Denominator semantics").
+        "aphelion_unreachable_rate": Gauge(
+            "parallax_aphelion_unreachable_rate",
+            "Fraction of dual-read outcomes where Aphelion was unreachable over the "
+            "72h DoD window, by traffic_source. Denominator is ALL outcomes.",
+            labelnames=["traffic_source"],
+            registry=reg,
+        ),
     }
     for source, source_rates in sorted(dr_metrics.rates.items()):
         for metric_key, gauge in dual_read_gauges.items():
@@ -644,6 +659,20 @@ def _build_payload() -> str:
             # is unusable on a counter that carries user_id (a one-shot user's
             # series sits pinned at 1 forever and contributes a delta of 0).
             "parallax_dual_read_requests",
+            # Incremented on every outcome by discrepancy_live, and until #101
+            # never rendered — the same never-on-the-wire defect as the
+            # unreachable-rate gauge above, found by the #101 sweep. Three
+            # consumers were reading a series Prometheus had never seen: the
+            # CrosswalkMissRateHigh denominator and Grafana panels 3 and 8.
+            #
+            # CARDINALITY: this carries user_id (~1 distinct value in the
+            # current burn-in corpus, but unbounded under natural traffic) on
+            # top of outcome, so it is the widest series on this endpoint —
+            # up to 5x parallax_aphelion_total, which already carries user_id.
+            # If natural traffic ever makes that bite, aggregate it away here
+            # rather than dropping it: panel 8 needs the outcome dimension,
+            # and the alternative is going back to a dead panel.
+            "parallax_dual_read_outcomes",
         )
     )
     return generate_latest(reg).decode("utf-8") + default_registry_counters

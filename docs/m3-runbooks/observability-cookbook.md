@@ -28,12 +28,13 @@
 | 1 | `parallax_dual_read_discrepancy_rate` | ✅ | ✅ `DualReadDiscrepancyRateHigh` | `> 0.001`（0.1 %）for 30m / severity warning（對齊 M3 DoD 的 0.1 % 門檻） |
 | 2 | `parallax_arbitration_conflict_rate` | ✅ | ✅ `ArbitrationConflictRateHigh` | `> 0.015`（1.5 %）for 1m / severity warning（alert 較鬆，留 0.5 % buffer 對 14-day corpus DoD 的 1 % 退場條件） |
 | 3 | `parallax_dual_read_write_error_rate` | ✅ | ✅ `DualReadWriteErrorRateHigh` | `> 0.0005`（0.05 %）for 2m / severity warning（alert 較鬆，留 0.03 % buffer 對 corpus DoD 的 0.02 %） |
-| 4 | `parallax_aphelion_unreachable_rate` | ✅ | ✅ `AphelionUnreachableRateHigh` | `> 0.01`（1 %）for 5m / severity warning（5 min 內持續即將觸發 circuit breaker） |
-| 5 | `parallax_crosswalk_miss_orphan_total` / `parallax_dual_read_outcomes_total` | ✅ | ✅ `CrosswalkMissRateHigh` | rate 比 `> 0.05`（5 %）for 30m / severity warning |
+| 4 | `parallax_aphelion_unreachable_rate`（gauge，72h DoD 用）／ `parallax_dual_read_outcomes:sum_without_user_id`（alert 用） | ✅（#101 起才真正上線） | ✅ `AphelionUnreachableRateHigh` | **300s all-source** ratio `> 0.01`（1 %）+ 分母 `>= 50` + `outcome!="skipped"` + `by (job,instance)` for 0m / severity warning（五項全對齊 breaker）。⚠️ 兩個刻意的不對稱：gauge 與 alert 讀**不同窗**（gauge=72h corpus DoD，alert=300s 營運事件）；且 alert **不帶 traffic_source**，因為 breaker 看不見它。見 §4.A 註解 |
+| 5 | `parallax_crosswalk_miss_orphan_total` / `parallax_dual_read_outcomes_total` | 分母 ✅（#101 起）；**分子 ❌ 無 producer** | ⚠️ `CrosswalkMissRateHigh` 目前恆為 no-data | rate 比 `> 0.05`（5 %）for 30m / severity warning |
 | 6 | `parallax_circuit_breaker_tripped_total` | ✅ | ✅ `CircuitBreakerTripped` | `increase[10m] > 0` for 0m / severity critical（單調 counter，**沒有 72h windowed gauge**） |
 
 > **重要修正**：
 > - 不存在 `circuit_open_count_72h` gauge，請改用 `parallax_circuit_breaker_tripped_total` counter + `increase[Xh]` 表達式。
+> - **「Gauge 部署 ✅」≠ 真的能被 scrape 到**（#101）。`/metrics` 的 `_build_payload` 會序列化一份**全新的** `CollectorRegistry`，只把固定名單上的 counter 從 default registry 撈出來；註冊在 default registry 但不在名單上的 collector，永遠不會出現在任何一次 scrape。第 4 列與第 5 列的分母都踩過這個坑（分別註冊於 `discrepancy_live.py`，卻從未被 render），alert 與 Grafana panel 長期比對到空集合。加新 gauge/counter 時，驗收條件是**實際 scrape 一次看到那一行**，不是「有註冊」。
 > - `parallax_arbitration_conflict_rate` 與 `parallax_dual_read_write_error_rate` 對應 alert rule 已部署（2026-05-04 PR），閾值 `1.5 %` / `0.05 %` 設計留 buffer 對 14-day corpus DoD 1 % / 0.02 %。
 > - 14-day corpus 退場條件 `< 0.1 %` 對齊 deployed `DualReadDiscrepancyRateHigh > 0.001`。
 
@@ -103,10 +104,40 @@ groups:
         for: 30m
         labels: { severity: warning, component: parallax_dual_read }
 
-      # Aphelion 不可達（circuit breaker imminent）
+      # Aphelion 不可達（circuit breaker 正在跳 / 即將跳）
+      # 2026-08-05（PR #103 review）起改讀 **300s counter ratio**，不再讀 72h DoD gauge：
+      # breaker（parallax/router/circuit_breaker.py）是 300s / 1% / >=50 observations，
+      # 72h gauge 在「大量健康 backlog + 突發斷線」時會被平均掉而永遠不觸發——
+      # 正是這條 alert 存在的那個場景。**五個項**全部對齊 breaker：
+      #   窗 [5m]=WINDOW_SECONDS 300s／閾值 >0.01=TRIP_THRESHOLD／分母 >=50=MIN_OBSERVATIONS
+      #   ／母體 outcome!="skipped"=dual_read.py:501 那道 gate／範圍 by (job,instance)=breaker 是 process-local
+      # 分母 `>= 50` 同時是 cold-start flap guard 與除零保護；不足 50 筆是 no-data（**不是** 0.0）。
+      # `skipped`（DUAL_READ 關閉、CHANGE_TRACE legacy_kind=bug 短路）根本沒呼叫 Aphelion，
+      # 算進分母會稀釋成「看起來健康」而 breaker 已經在跳。`primary_only` **要留著**，它有進 breaker。
+      #
+      # ⚠️ **這條刻意「不」帶 traffic_source**，跟上面三條 DoD alert 相反 —— 兩者問的問題不同：
+      #   DoD alerts：「自然流量語意上健康嗎？」→ 只看 natural（synthetic burn-in 數字不能當生產正確性證據，#100）
+      #   這條：「這個 replica 的 breaker 是不是要把流量切成 canonical-only 了？」→ 看**全部** source
+      # 依據：`record_unreachable_observation(*, observed_unreachable: bool)` 只吃一個 bool，
+      # deque 是 `deque[tuple[float, bool]]`，`_record()` 從來沒把 traffic_source 傳給它 ——
+      # breaker 天生看不見 traffic source，M4 loader 跟自然流量一樣會把它跳掉。
+      # 只看 natural 會讓 loader 觸發真實 trip 而警報全程靜音（2026-08-05 r3 修）。
+      # burn-in 期間這條會把 loader 流量也算進去；**若一上線就響，那是 true positive**（breaker 真的在跳），
+      # 而且目前是唯一看得到的管道 —— #102 讓 CircuitBreakerTripped 根本無法觸發。
       - alert: AphelionUnreachableRateHigh
-        expr: parallax_aphelion_unreachable_rate > 0.01       # 1 %
-        for: 5m
+        expr: |
+          (
+            sum by (job, instance) (
+              increase(parallax_dual_read_outcomes:sum_without_user_id{outcome="aphelion_unreachable"}[5m])
+            )
+            /
+            (
+              sum by (job, instance) (
+                increase(parallax_dual_read_outcomes:sum_without_user_id{outcome!="skipped"}[5m])
+              ) >= 50
+            )
+          ) > 0.01
+        for: 0m        # [5m] range 本身就是 breaker 的窗，再加 for: 會晚於它要預警的那次 trip
         labels: { severity: warning, component: parallax_dual_read }
 
       # circuit breaker 跳脫（counter increase）

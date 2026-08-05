@@ -2,6 +2,28 @@ groups:
   - name: parallax_dual_read
     interval: 30s
     rules:
+      # user_id-stripped aggregate (same treatment issue #76 gave the canary
+      # counters). parallax_dual_read_outcomes_total carries a high-cardinality
+      # user_id label. rate()/increase() is computed PER SERIES and only then
+      # summed, so a one-time user whose child series holds a single sample in
+      # the range extrapolates to ~0 and is dropped — under-counting exactly
+      # the sparse natural traffic the alerts below select on. Recording
+      # `sum without (user_id) (...)` at the 30s group interval collapses
+      # user_id into a stable, densely-sampled aggregate first; increase() over
+      # THAT reflects every user's increment.
+      #
+      # `without (user_id)` rather than `by (...)` is deliberate on two counts.
+      # It drops ONLY the high-cardinality label, so it keeps `outcome` and
+      # `traffic_source` for the selectors below — and, load-bearing for the
+      # per-instance alerting below, it keeps the `job` and `instance` labels
+      # Prometheus attaches at scrape time. An explicit `by (...)` list would
+      # silently drop scrape identity the first time someone forgot to list it.
+      #
+      # MUST stay above its consumers: rules in a group evaluate sequentially,
+      # in order, so the aggregate has to be recorded before it is read.
+      - record: parallax_dual_read_outcomes:sum_without_user_id
+        expr: sum without (user_id) (parallax_dual_read_outcomes_total)
+
       - alert: CrosswalkMissRateHigh
         # Aggregated with sum() on both sides because miss_orphan_total carries
         # labels [user_id] while outcomes_total carries [user_id, outcome].
@@ -14,6 +36,20 @@ groups:
         # instead of producing NaN. NaN comparison semantics differ across
         # Prometheus versions, so the explicit guard is safer than relying on
         # default behavior.
+        #
+        # STILL LATENT AFTER #101 — do not read this rule as live. #101 wired
+        # the DENOMINATOR (parallax_dual_read_outcomes_total was incremented on
+        # every outcome but never rendered by /metrics). The NUMERATOR remains
+        # absent for a different and deeper reason: parallax_crosswalk_miss_orphan_total
+        # is registered in parallax/router/crosswalk_backfill.py, a module no
+        # code under parallax/ or scripts/ imports, and its only incrementer
+        # record_orphan_miss() has no production call site — the lazy-crosswalk
+        # miss path that was meant to call it was never wired up. So the
+        # collector is not even in the default registry of a running server.
+        # This alert therefore evaluates to no-data, NOT to a healthy 0.
+        # Fixing it is producer work (call record_orphan_miss from the
+        # crosswalk lookup path), deliberately out of scope for #101's
+        # exposition-wiring change. Same for Grafana panels 3 and 4.
         expr: |
           (sum(rate(parallax_crosswalk_miss_orphan_total[5m]))
            /
@@ -28,20 +64,6 @@ groups:
             crosswalk_miss_rate has exceeded 5% for over 30 minutes.
             See runbook docs/lane-c/m3-dual-read-runbook.md §Failure-Modes.
             48h SLO observation window must restart if this fires during pre-flip phase.
-
-      - alert: AphelionUnreachableRateHigh
-        expr: |
-          max by (user_id, traffic_source) (parallax_aphelion_unreachable_rate) > 0.01
-        for: 5m
-        labels:
-          severity: warning
-          component: parallax_dual_read
-        annotations:
-          summary: Aphelion unreachable rate above 1% for 5min — circuit breaker imminent
-          description: |
-            Sustained aphelion_unreachable_rate above 1% for 5 minutes triggers
-            the circuit breaker. New dual-read requests will fall back to canonical-only.
-            Manual re-arm via POST /admin/circuit_breaker/reset after Aphelion recovers.
 
       - alert: CircuitBreakerTripped
         expr: increase(parallax_circuit_breaker_tripped_total[10m]) > 0
@@ -134,9 +156,173 @@ groups:
             primary write path and Aphelion bridge stub for raised exceptions.
             Runbook: docs/m3-runbooks/observability-cookbook.md §5 場景 A.
 
-      # Selecting {traffic_source="natural"} above means the three DoD alerts
-      # go quiet when there is no natural traffic — correct, but it removes
-      # the only signal that the decision-log corpus is being read at all.
+      # This alert exists to warn about a circuit-breaker trip, so it has to
+      # measure what the breaker measures. It did not.
+      #
+      # Two bugs, fixed in two passes:
+      #
+      #   #101 — it selected a gauge that never reached the wire at all.
+      #   discrepancy_live.py registered parallax_aphelion_unreachable_rate
+      #   into the DEFAULT registry and set it on every outcome, but
+      #   _build_payload serializes a fresh CollectorRegistry, so no scrape
+      #   ever carried it. The rule matched nothing, forever.
+      #
+      #   #103 review — wiring it to the 72h DoD gauge fixed the wrong window.
+      #   The breaker (parallax/router/circuit_breaker.py) trips on a 300s
+      #   rolling window at 1% with >= 50 observations; the DoD gauge is a 72h
+      #   corpus average. Those disagree in the exact scenario this alert is
+      #   for: a sudden Aphelion outage against a large healthy 72h backlog
+      #   trips the breaker while the 72h average stays well under 1%, so the
+      #   warning never fires. It is a slow-moving gauge asked to detect a fast
+      #   event.
+      #
+      # So this now computes a 300s ratio off the outcome counter, matching the
+      # breaker term for term:
+      #
+      #   window       [5m]                    <- WINDOW_SECONDS = 300.0
+      #   threshold    > 0.01                  <- TRIP_THRESHOLD = 0.01 (strict)
+      #   sample floor >= 50 in-window         <- MIN_OBSERVATIONS = 50
+      #   population   outcome!="skipped"      <- the _record() gate, below
+      #   sources      ALL of them             <- the breaker cannot see them
+      #   scope        by (job, instance)      <- the breaker is process-local
+      #
+      # WHICH OUTCOMES COUNT (#103 review P2-a). dual_read.py:499-505 feeds the
+      # breaker from exactly one place:
+      #
+      #     if outcome != "skipped":
+      #         get_breaker_state().record_unreachable_observation(
+      #             observed_unreachable=(outcome == "aphelion_unreachable"))
+      #
+      # so the breaker's denominator is match | diverge | primary_only |
+      # aphelion_unreachable, and its numerator is aphelion_unreachable. The
+      # counter this alert reads is incremented by record_dual_read_outcome(),
+      # whose ONLY call site is the same _record() a few lines above that gate
+      # — so counter increments and breaker observations correspond 1:1 except
+      # for `skipped`, and `outcome!="skipped"` reproduces the breaker's
+      # population exactly rather than approximately.
+      #
+      # `skipped` is the DUAL_READ-disabled path and the CHANGE_TRACE
+      # legacy_kind=bug short-circuit (dual_read.py:206, :235). Aphelion is
+      # never called, so those requests cannot be evidence that Aphelion is
+      # unreachable. Leaving them in inflates the denominator and can hold this
+      # alert under 1% while the breaker, which never saw them, is over it.
+      #
+      # primary_only deliberately STAYS IN — do not "fix" it out. It is not
+      # skipped, so it DOES feed the breaker (as a non-unreachable
+      # observation). No bug-parity exclusions are encoded here: the selector
+      # matches what the breaker actually counts today, not a workaround for
+      # something it misses.
+      #
+      # NO traffic_source SELECTOR, AND THAT IS THE POINT (#103 review r3).
+      # This alert is deliberately NOT natural-only, unlike the three DoD
+      # alerts above. They answer different questions:
+      #
+      #   DoD alerts        "is natural traffic semantically healthy?"
+      #                     -> {traffic_source="natural"}, because synthetic
+      #                        burn-in numbers are not evidence about
+      #                        production correctness (#100).
+      #   this alert        "is a breaker about to cut this replica over to
+      #                     canonical-only?"
+      #                     -> every source, because the breaker counts every
+      #                        source.
+      #
+      # record_unreachable_observation(*, observed_unreachable: bool) takes a
+      # bool and nothing else; its deque is deque[tuple[float, bool]]; and
+      # _record() never passes traffic_source to it. The breaker is therefore
+      # traffic-source-blind by construction, and synthetic burn-in traffic
+      # trips it exactly as readily as natural traffic does. Filtering to
+      # natural here — which this rule did between the r1 and r3 review passes,
+      # by reflex from the DoD convention — would let the M4 loader drive a
+      # real trip while the warning stayed silent. A tripped breaker degrades
+      # ALL traffic to canonical-only regardless of what tripped it, so the
+      # warning must see what the breaker sees.
+      #
+      # Consequence worth knowing before deploy: while the burn-in loader runs,
+      # this alert reports on loader traffic too. If it fires immediately on
+      # deploy that is a TRUE POSITIVE about breaker state, not noise to be
+      # filtered — and it is currently the only way to see it, because #102
+      # leaves CircuitBreakerTripped unable to fire at all.
+      #
+      # PER-INSTANCE, NOT FLEET-WIDE (#103 review P2-b). BreakerState is
+      # process-local (circuit_breaker.py — a singleton deque per process), so
+      # each replica trips on its own traffic. A bare sum() collapses every
+      # replica into one ratio, and one instance melting down gets diluted by
+      # its healthy peers until the fleet average stays under 1% while that
+      # replica has already tripped and is serving canonical-only. Aggregating
+      # `by (job, instance)` on BOTH sides evaluates the same population each
+      # breaker does, and keeps the label sets identical across the division so
+      # the vector match stays 1:1. The firing alert then names the instance
+      # that tripped.
+      #
+      # The recording rule keeps `traffic_source` as a label — other consumers
+      # may want to slice on it, and one aggregate serving both is cleaner than
+      # a second near-identical rule. Aggregating `by (job, instance)` here
+      # sums it away, which is exactly the fleet-of-one-process population the
+      # breaker holds in its deque.
+      #
+      # The `>= 50` denominator guard does double duty: it is the breaker's
+      # cold-start flap guard AND the division-by-zero guard. Below 50
+      # observations the comparison drops the sample and the alert is no-data
+      # — deliberately NOT `or vector(0)`, because a fabricated 0 would read as
+      # "measured, and healthy" on a window where nothing was measured. Same
+      # absent-not-zero rule the gauges follow.
+      #
+      # for: 0m is the parity choice, not an oversight. The [5m] range IS the
+      # breaker's window, so the smoothing is already in the expression; adding
+      # a `for:` on top would delay the warning past the trip it is supposed to
+      # precede. CircuitBreakerTripped uses for: 0m for the same reason.
+      #
+      # parallax_aphelion_unreachable_rate is NOT dead — it stays the 72h DoD
+      # view on Grafana panel 2 and in the corpus exit criteria. It is simply
+      # the wrong instrument for a 300s question. Two windows, two consumers.
+      - alert: AphelionUnreachableRateHigh
+        expr: |
+          (
+            sum by (job, instance) (
+              increase(parallax_dual_read_outcomes:sum_without_user_id{outcome="aphelion_unreachable"}[5m])
+            )
+            /
+            (
+              sum by (job, instance) (
+                increase(parallax_dual_read_outcomes:sum_without_user_id{outcome!="skipped"}[5m])
+              ) >= 50
+            )
+          ) > 0.01
+        for: 0m
+        labels:
+          severity: warning
+          component: parallax_dual_read
+        annotations:
+          summary: Aphelion unreachable rate above 1% over 300s on {{ $labels.instance }} — circuit breaker tripping
+          description: |
+            aphelion_unreachable rate on instance {{ $labels.instance }}
+            exceeded 1% over the same 300s window, 50-observation floor and
+            outcome population (everything but "skipped") the dual-read circuit
+            breaker trips on, so THAT replica's breaker is tripping now or is
+            about to. New dual-read requests on it fall back to canonical-only
+            once it does.
+            The breaker is process-local, so this is a per-instance condition:
+            healthy peers do NOT make it safe to ignore.
+            ALL traffic sources are counted here, synthetic burn-in included,
+            because the breaker itself is traffic-source-blind and a trip
+            degrades every request on that replica no matter what caused it.
+            Do not dismiss this as "just the loader" — check the breaker.
+            The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
+            against that instance after Aphelion recovers. Note this alert
+            RESOLVES on its own once the breaker opens — fallback stops
+            producing aphelion_unreachable outcomes — so resolution here does
+            NOT mean the breaker re-armed.
+            CircuitBreakerTripped is the signal for the trip itself (and per
+            #102 that alert's metric is itself never-on-the-wire).
+            Runbook: docs/m3-runbooks/observability-cookbook.md §5.
+
+      # Selecting {traffic_source="natural"} means the three DoD alerts go
+      # quiet when there is no natural traffic — correct, but it removes the
+      # only signal that the decision-log corpus is being read at all.
+      # (AphelionUnreachableRateHigh is deliberately NOT in that set: it
+      # matches the traffic-source-blind breaker, so it keeps reporting on
+      # synthetic traffic. It is not a substitute for this alert either — it
+      # watches the breaker, not the corpus.)
       # This alert is that signal. It covers two independent faults, and it
       # deliberately treats them differently.
       #

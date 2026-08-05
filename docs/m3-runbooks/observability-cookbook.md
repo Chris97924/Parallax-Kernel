@@ -28,7 +28,7 @@
 | 1 | `parallax_dual_read_discrepancy_rate` | ✅ | ✅ `DualReadDiscrepancyRateHigh` | `> 0.001`（0.1 %）for 30m / severity warning（對齊 M3 DoD 的 0.1 % 門檻） |
 | 2 | `parallax_arbitration_conflict_rate` | ✅ | ✅ `ArbitrationConflictRateHigh` | `> 0.015`（1.5 %）for 1m / severity warning（alert 較鬆，留 0.5 % buffer 對 14-day corpus DoD 的 1 % 退場條件） |
 | 3 | `parallax_dual_read_write_error_rate` | ✅ | ✅ `DualReadWriteErrorRateHigh` | `> 0.0005`（0.05 %）for 2m / severity warning（alert 較鬆，留 0.03 % buffer 對 corpus DoD 的 0.02 %） |
-| 4 | `parallax_aphelion_unreachable_rate`（gauge，72h DoD 用）／ `parallax_dual_read_outcomes:sum_without_user_id`（alert 用） | ✅（#101 起才真正上線） | ✅ `AphelionUnreachableRateHigh` | **300s** natural ratio `> 0.01`（1 %）+ 分母 `>= 50` for 0m / severity warning（對齊 breaker 的 300s/1%/50-obs）。⚠️ gauge 與 alert 讀**不同窗**是刻意的：gauge = 72h corpus DoD，alert = 300s 營運事件，見 §4.A 註解 |
+| 4 | `parallax_aphelion_unreachable_rate`（gauge，72h DoD 用）／ `parallax_dual_read_outcomes:sum_without_user_id`（alert 用） | ✅（#101 起才真正上線） | ✅ `AphelionUnreachableRateHigh` | **300s all-source** ratio `> 0.01`（1 %）+ 分母 `>= 50` + `outcome!="skipped"` + `by (job,instance)` for 0m / severity warning（五項全對齊 breaker）。⚠️ 兩個刻意的不對稱：gauge 與 alert 讀**不同窗**（gauge=72h corpus DoD，alert=300s 營運事件）；且 alert **不帶 traffic_source**，因為 breaker 看不見它。見 §4.A 註解 |
 | 5 | `parallax_crosswalk_miss_orphan_total` / `parallax_dual_read_outcomes_total` | 分母 ✅（#101 起）；**分子 ❌ 無 producer** | ⚠️ `CrosswalkMissRateHigh` 目前恆為 no-data | rate 比 `> 0.05`（5 %）for 30m / severity warning |
 | 6 | `parallax_circuit_breaker_tripped_total` | ✅ | ✅ `CircuitBreakerTripped` | `increase[10m] > 0` for 0m / severity critical（單調 counter，**沒有 72h windowed gauge**） |
 
@@ -114,16 +114,26 @@ groups:
       # 分母 `>= 50` 同時是 cold-start flap guard 與除零保護；不足 50 筆是 no-data（**不是** 0.0）。
       # `skipped`（DUAL_READ 關閉、CHANGE_TRACE legacy_kind=bug 短路）根本沒呼叫 Aphelion，
       # 算進分母會稀釋成「看起來健康」而 breaker 已經在跳。`primary_only` **要留著**，它有進 breaker。
+      #
+      # ⚠️ **這條刻意「不」帶 traffic_source**，跟上面三條 DoD alert 相反 —— 兩者問的問題不同：
+      #   DoD alerts：「自然流量語意上健康嗎？」→ 只看 natural（synthetic burn-in 數字不能當生產正確性證據，#100）
+      #   這條：「這個 replica 的 breaker 是不是要把流量切成 canonical-only 了？」→ 看**全部** source
+      # 依據：`record_unreachable_observation(*, observed_unreachable: bool)` 只吃一個 bool，
+      # deque 是 `deque[tuple[float, bool]]`，`_record()` 從來沒把 traffic_source 傳給它 ——
+      # breaker 天生看不見 traffic source，M4 loader 跟自然流量一樣會把它跳掉。
+      # 只看 natural 會讓 loader 觸發真實 trip 而警報全程靜音（2026-08-05 r3 修）。
+      # burn-in 期間這條會把 loader 流量也算進去；**若一上線就響，那是 true positive**（breaker 真的在跳），
+      # 而且目前是唯一看得到的管道 —— #102 讓 CircuitBreakerTripped 根本無法觸發。
       - alert: AphelionUnreachableRateHigh
         expr: |
           (
-            sum by (job, instance, traffic_source) (
-              increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m])
+            sum by (job, instance) (
+              increase(parallax_dual_read_outcomes:sum_without_user_id{outcome="aphelion_unreachable"}[5m])
             )
             /
             (
-              sum by (job, instance, traffic_source) (
-                increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome!="skipped"}[5m])
+              sum by (job, instance) (
+                increase(parallax_dual_read_outcomes:sum_without_user_id{outcome!="skipped"}[5m])
               ) >= 50
             )
           ) > 0.01

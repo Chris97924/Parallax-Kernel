@@ -183,6 +183,7 @@ groups:
       #   threshold    > 0.01                  <- TRIP_THRESHOLD = 0.01 (strict)
       #   sample floor >= 50 in-window         <- MIN_OBSERVATIONS = 50
       #   population   outcome!="skipped"      <- the _record() gate, below
+      #   sources      ALL of them             <- the breaker cannot see them
       #   scope        by (job, instance)      <- the breaker is process-local
       #
       # WHICH OUTCOMES COUNT (#103 review P2-a). dual_read.py:499-505 feeds the
@@ -212,16 +213,52 @@ groups:
       # matches what the breaker actually counts today, not a workaround for
       # something it misses.
       #
+      # NO traffic_source SELECTOR, AND THAT IS THE POINT (#103 review r3).
+      # This alert is deliberately NOT natural-only, unlike the three DoD
+      # alerts above. They answer different questions:
+      #
+      #   DoD alerts        "is natural traffic semantically healthy?"
+      #                     -> {traffic_source="natural"}, because synthetic
+      #                        burn-in numbers are not evidence about
+      #                        production correctness (#100).
+      #   this alert        "is a breaker about to cut this replica over to
+      #                     canonical-only?"
+      #                     -> every source, because the breaker counts every
+      #                        source.
+      #
+      # record_unreachable_observation(*, observed_unreachable: bool) takes a
+      # bool and nothing else; its deque is deque[tuple[float, bool]]; and
+      # _record() never passes traffic_source to it. The breaker is therefore
+      # traffic-source-blind by construction, and synthetic burn-in traffic
+      # trips it exactly as readily as natural traffic does. Filtering to
+      # natural here — which this rule did between the r1 and r3 review passes,
+      # by reflex from the DoD convention — would let the M4 loader drive a
+      # real trip while the warning stayed silent. A tripped breaker degrades
+      # ALL traffic to canonical-only regardless of what tripped it, so the
+      # warning must see what the breaker sees.
+      #
+      # Consequence worth knowing before deploy: while the burn-in loader runs,
+      # this alert reports on loader traffic too. If it fires immediately on
+      # deploy that is a TRUE POSITIVE about breaker state, not noise to be
+      # filtered — and it is currently the only way to see it, because #102
+      # leaves CircuitBreakerTripped unable to fire at all.
+      #
       # PER-INSTANCE, NOT FLEET-WIDE (#103 review P2-b). BreakerState is
       # process-local (circuit_breaker.py — a singleton deque per process), so
       # each replica trips on its own traffic. A bare sum() collapses every
       # replica into one ratio, and one instance melting down gets diluted by
       # its healthy peers until the fleet average stays under 1% while that
       # replica has already tripped and is serving canonical-only. Aggregating
-      # `by (job, instance, traffic_source)` on BOTH sides evaluates the same
-      # population each breaker does, and keeps the label sets identical across
-      # the division so the vector match stays 1:1. The firing alert then names
-      # the instance that tripped.
+      # `by (job, instance)` on BOTH sides evaluates the same population each
+      # breaker does, and keeps the label sets identical across the division so
+      # the vector match stays 1:1. The firing alert then names the instance
+      # that tripped.
+      #
+      # The recording rule keeps `traffic_source` as a label — other consumers
+      # may want to slice on it, and one aggregate serving both is cleaner than
+      # a second near-identical rule. Aggregating `by (job, instance)` here
+      # sums it away, which is exactly the fleet-of-one-process population the
+      # breaker holds in its deque.
       #
       # The `>= 50` denominator guard does double duty: it is the breaker's
       # cold-start flap guard AND the division-by-zero guard. Below 50
@@ -241,13 +278,13 @@ groups:
       - alert: AphelionUnreachableRateHigh
         expr: |
           (
-            sum by (job, instance, traffic_source) (
-              increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m])
+            sum by (job, instance) (
+              increase(parallax_dual_read_outcomes:sum_without_user_id{outcome="aphelion_unreachable"}[5m])
             )
             /
             (
-              sum by (job, instance, traffic_source) (
-                increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome!="skipped"}[5m])
+              sum by (job, instance) (
+                increase(parallax_dual_read_outcomes:sum_without_user_id{outcome!="skipped"}[5m])
               ) >= 50
             )
           ) > 0.01
@@ -258,14 +295,18 @@ groups:
         annotations:
           summary: Aphelion unreachable rate above 1% over 300s on {{ $labels.instance }} — circuit breaker tripping
           description: |
-            Natural-traffic aphelion_unreachable rate on instance
-            {{ $labels.instance }} exceeded 1% over the same 300s window,
-            50-observation floor and outcome population (everything but
-            "skipped") the dual-read circuit breaker trips on, so THAT
-            replica's breaker is tripping now or is about to. New dual-read
-            requests on it fall back to canonical-only once it does.
+            aphelion_unreachable rate on instance {{ $labels.instance }}
+            exceeded 1% over the same 300s window, 50-observation floor and
+            outcome population (everything but "skipped") the dual-read circuit
+            breaker trips on, so THAT replica's breaker is tripping now or is
+            about to. New dual-read requests on it fall back to canonical-only
+            once it does.
             The breaker is process-local, so this is a per-instance condition:
             healthy peers do NOT make it safe to ignore.
+            ALL traffic sources are counted here, synthetic burn-in included,
+            because the breaker itself is traffic-source-blind and a trip
+            degrades every request on that replica no matter what caused it.
+            Do not dismiss this as "just the loader" — check the breaker.
             The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
             against that instance after Aphelion recovers. Note this alert
             RESOLVES on its own once the breaker opens — fallback stops
@@ -275,11 +316,13 @@ groups:
             #102 that alert's metric is itself never-on-the-wire).
             Runbook: docs/m3-runbooks/observability-cookbook.md §5.
 
-      # Selecting {traffic_source="natural"} above means all four
-      # natural-selecting alerts (the three DoD gauges plus
-      # AphelionUnreachableRateHigh)
-      # go quiet when there is no natural traffic — correct, but it removes
-      # the only signal that the decision-log corpus is being read at all.
+      # Selecting {traffic_source="natural"} means the three DoD alerts go
+      # quiet when there is no natural traffic — correct, but it removes the
+      # only signal that the decision-log corpus is being read at all.
+      # (AphelionUnreachableRateHigh is deliberately NOT in that set: it
+      # matches the traffic-source-blind breaker, so it keeps reporting on
+      # synthetic traffic. It is not a substitute for this alert either — it
+      # watches the breaker, not the corpus.)
       # This alert is that signal. It covers two independent faults, and it
       # deliberately treats them differently.
       #

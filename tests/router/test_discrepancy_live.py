@@ -177,16 +177,6 @@ def _scrape_counter_value(metric_name: str, labels: dict[str, str]) -> float:
     return 0.0
 
 
-def _scrape_gauge_value(metric_name: str, labels: dict[str, str]) -> float:
-    """Read a labeled gauge value directly from REGISTRY."""
-    for metric in prometheus_client.REGISTRY.collect():
-        if metric.name == metric_name:
-            for sample in metric.samples:
-                if sample.labels == labels:
-                    return sample.value
-    return 0.0
-
-
 def test_prometheus_counter_increments() -> None:
     """record_dual_read_outcome N times → REGISTRY counter == N."""
     # Use a unique user_id per test invocation to avoid cross-test pollution
@@ -223,43 +213,33 @@ def test_prometheus_counter_carries_traffic_source_label() -> None:
     assert (after - before) == 1
 
 
-def test_prometheus_gauge_reflects_rate() -> None:
-    """After recording, gauge value matches aphelion_unreachable_rate()."""
-    uid = "prom_gauge_test_user"
-    record_dual_read_outcome(user_id=uid, outcome="aphelion_unreachable")
-    record_dual_read_outcome(user_id=uid, outcome="match")
-    record_dual_read_outcome(user_id=uid, outcome="match")
+def test_rate_gauges_have_a_single_producer() -> None:
+    """This module must register NO rate gauges.
 
-    expected = aphelion_unreachable_rate(user_id=uid)
-    gauge_val = _scrape_gauge_value(
-        "parallax_aphelion_unreachable_rate",
-        {"user_id": uid, "traffic_source": "natural"},
-    )
-    assert abs(gauge_val - expected) < 1e-9
+    It used to register ``parallax_dual_read_discrepancy_rate`` (removed in
+    #100) and ``parallax_aphelion_unreachable_rate`` (removed in #101), both
+    labelled ``["user_id", "traffic_source"]``, while
+    ``parallax.server.routes.metrics`` independently built gauges of the same
+    names from the 72h decision-log corpus. Only the latter ever reached the
+    wire, so these were written on every outcome and read by nobody — and the
+    two carried different label sets, so any future change that did render the
+    default registry would have emitted two contradictory definitions of one
+    metric name. metrics.py is the single producer of both.
 
-
-def test_discrepancy_rate_has_a_single_producer() -> None:
-    """This module must NOT register ``parallax_dual_read_discrepancy_rate``.
-
-    It used to, labelled ``["user_id", "traffic_source"]``, while
-    ``parallax.server.routes.metrics`` independently built a gauge of the
-    same name from the 72h decision-log corpus. Only the latter ever reached
-    the wire, so this one was written on every outcome and read by nobody —
-    and the two carried different label sets, so any future change that did
-    render the default registry would have emitted two contradictory
-    definitions of one metric name. metrics.py is the single producer.
-
-    The rate itself is still computed and still public; the assertion below
-    pins that the collector is gone, not the measurement.
+    The rates themselves are still computed and still public; the assertions
+    below pin that the collectors are gone, not the measurements.
     """
     uid = "single_producer_test_user"
     record_dual_read_outcome(user_id=uid, outcome="diverge")
     record_dual_read_outcome(user_id=uid, outcome="match")
+    record_dual_read_outcome(user_id=uid, outcome="aphelion_unreachable")
 
     assert dual_read_discrepancy_rate(user_id=uid) == pytest.approx(0.5)
+    assert aphelion_unreachable_rate(user_id=uid) == pytest.approx(1 / 3)
 
     registered = {metric.name for metric in prometheus_client.REGISTRY.collect()}
     assert "parallax_dual_read_discrepancy_rate" not in registered
+    assert "parallax_aphelion_unreachable_rate" not in registered
 
 
 # ---------------------------------------------------------------------------

@@ -28,12 +28,13 @@
 | 1 | `parallax_dual_read_discrepancy_rate` | ✅ | ✅ `DualReadDiscrepancyRateHigh` | `> 0.001`（0.1 %）for 30m / severity warning（對齊 M3 DoD 的 0.1 % 門檻） |
 | 2 | `parallax_arbitration_conflict_rate` | ✅ | ✅ `ArbitrationConflictRateHigh` | `> 0.015`（1.5 %）for 1m / severity warning（alert 較鬆，留 0.5 % buffer 對 14-day corpus DoD 的 1 % 退場條件） |
 | 3 | `parallax_dual_read_write_error_rate` | ✅ | ✅ `DualReadWriteErrorRateHigh` | `> 0.0005`（0.05 %）for 2m / severity warning（alert 較鬆，留 0.03 % buffer 對 corpus DoD 的 0.02 %） |
-| 4 | `parallax_aphelion_unreachable_rate` | ✅ | ✅ `AphelionUnreachableRateHigh` | `> 0.01`（1 %）for 5m / severity warning（5 min 內持續即將觸發 circuit breaker） |
-| 5 | `parallax_crosswalk_miss_orphan_total` / `parallax_dual_read_outcomes_total` | ✅ | ✅ `CrosswalkMissRateHigh` | rate 比 `> 0.05`（5 %）for 30m / severity warning |
+| 4 | `parallax_aphelion_unreachable_rate` | ✅（#101 起才真正上線） | ✅ `AphelionUnreachableRateHigh` | `{traffic_source="natural"}` `> 0.01`（1 %）for 5m / severity warning（5 min 內持續即將觸發 circuit breaker） |
+| 5 | `parallax_crosswalk_miss_orphan_total` / `parallax_dual_read_outcomes_total` | 分母 ✅（#101 起）；**分子 ❌ 無 producer** | ⚠️ `CrosswalkMissRateHigh` 目前恆為 no-data | rate 比 `> 0.05`（5 %）for 30m / severity warning |
 | 6 | `parallax_circuit_breaker_tripped_total` | ✅ | ✅ `CircuitBreakerTripped` | `increase[10m] > 0` for 0m / severity critical（單調 counter，**沒有 72h windowed gauge**） |
 
 > **重要修正**：
 > - 不存在 `circuit_open_count_72h` gauge，請改用 `parallax_circuit_breaker_tripped_total` counter + `increase[Xh]` 表達式。
+> - **「Gauge 部署 ✅」≠ 真的能被 scrape 到**（#101）。`/metrics` 的 `_build_payload` 會序列化一份**全新的** `CollectorRegistry`，只把固定名單上的 counter 從 default registry 撈出來；註冊在 default registry 但不在名單上的 collector，永遠不會出現在任何一次 scrape。第 4 列與第 5 列的分母都踩過這個坑（分別註冊於 `discrepancy_live.py`，卻從未被 render），alert 與 Grafana panel 長期比對到空集合。加新 gauge/counter 時，驗收條件是**實際 scrape 一次看到那一行**，不是「有註冊」。
 > - `parallax_arbitration_conflict_rate` 與 `parallax_dual_read_write_error_rate` 對應 alert rule 已部署（2026-05-04 PR），閾值 `1.5 %` / `0.05 %` 設計留 buffer 對 14-day corpus DoD 1 % / 0.02 %。
 > - 14-day corpus 退場條件 `< 0.1 %` 對齊 deployed `DualReadDiscrepancyRateHigh > 0.001`。
 
@@ -105,7 +106,8 @@ groups:
 
       # Aphelion 不可達（circuit breaker imminent）
       - alert: AphelionUnreachableRateHigh
-        expr: parallax_aphelion_unreachable_rate > 0.01       # 1 %
+        expr: |
+          max by (traffic_source) (parallax_aphelion_unreachable_rate{traffic_source="natural"}) > 0.01
         for: 5m
         labels: { severity: warning, component: parallax_dual_read }
 

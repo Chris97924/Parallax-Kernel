@@ -115,6 +115,7 @@ def test_metrics_includes_dual_read_gauges(client: TestClient) -> None:
         "parallax_dual_read_discrepancy_rate",
         "parallax_arbitration_conflict_rate",
         "parallax_dual_read_write_error_rate",
+        "parallax_aphelion_unreachable_rate",
         "parallax_arbitration_p99_latency_ms",
         "parallax_arbitration_policy_version",
     ):
@@ -269,6 +270,156 @@ def test_dual_read_gauges_absent_rather_than_zero_when_no_records(
     assert _unlabelled_sample(body, "parallax_arbitration_conflict_rate") is None
     # The family itself is still declared, so dashboards do not 404.
     assert "# TYPE parallax_arbitration_conflict_rate gauge" in body
+
+
+# ---------------------------------------------------------------------------
+# #101 — never-on-the-wire metrics
+# ---------------------------------------------------------------------------
+
+
+def test_aphelion_unreachable_rate_reaches_the_wire(client: TestClient, tmp_path: Path) -> None:
+    """``parallax_aphelion_unreachable_rate`` must appear in a scrape at all.
+
+    It was registered by ``discrepancy_live`` into the DEFAULT registry and
+    set on every outcome, but ``_build_payload`` serializes a *fresh*
+    ``CollectorRegistry`` and plucks a fixed list of counters out of the
+    default one — so the gauge was written continuously and never scraped.
+    ``AphelionUnreachableRateHigh`` and both Grafana panel-2 targets have
+    been matching nothing since they were written (#101).
+
+    Registration is not exposition; only a scrape proves exposition.
+    """
+    _write_in_window(
+        tmp_path / "dual_read",
+        # Synthetic: 1 of 4 unreachable → 0.25.
+        [_decision(outcome="aphelion_unreachable", traffic_source="synthetic")]
+        + [_decision(traffic_source="synthetic") for _ in range(3)]
+        # Natural: 0 of 2 unreachable → 0.0, and the series must EXIST to say so.
+        + [_decision(traffic_source="natural") for _ in range(2)],
+    )
+
+    body = client.get("/metrics").text
+    unreachable = _labelled_samples(body, "parallax_aphelion_unreachable_rate")
+
+    assert unreachable["synthetic"] == pytest.approx(0.25)
+    assert unreachable["natural"] == pytest.approx(0.0)
+
+
+def test_aphelion_unreachable_rate_denominator_is_all_outcomes(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Its denominator is ALL outcomes — unlike its three sibling gauges.
+
+    The siblings exclude ``aphelion_unreachable`` from the denominator; here
+    the unreachable count IS the numerator, so excluding it would measure the
+    metric against everything it is not. Pinned because the exposition builds
+    all four from one ``compute_all_rates`` call and the asymmetry is easy to
+    "tidy up" into a bug.
+
+    1 unreachable + 3 match: ALL-outcomes gives 1/4 = 0.25, whereas the
+    sibling denominator would give 1/3 ≈ 0.333.
+    """
+    _write_in_window(
+        tmp_path / "dual_read",
+        [_decision(outcome="aphelion_unreachable", traffic_source="natural")]
+        + [_decision(outcome="match", traffic_source="natural") for _ in range(3)],
+    )
+
+    body = client.get("/metrics").text
+    unreachable = _labelled_samples(body, "parallax_aphelion_unreachable_rate")
+    discrepancy = _labelled_samples(body, "parallax_dual_read_discrepancy_rate")
+
+    assert unreachable["natural"] == pytest.approx(0.25)
+    # Same corpus, sibling gauge: 0 diverge over the 3 non-unreachable records.
+    assert discrepancy["natural"] == pytest.approx(0.0)
+
+
+def test_aphelion_unreachable_rate_absent_rather_than_zero_when_no_records(
+    client: TestClient,
+) -> None:
+    """An empty corpus emits NO unreachable series — never a healthy 0.0.
+
+    Same absent-not-zero contract as the other DoD gauges: "Aphelion has
+    never been observed unreachable because nothing was measured" must not
+    render identically to "Aphelion is reachable".
+    """
+    body = client.get("/metrics").text
+
+    assert _labelled_samples(body, "parallax_aphelion_unreachable_rate") == {}
+    assert _unlabelled_sample(body, "parallax_aphelion_unreachable_rate") is None
+    # The family is still declared, so panel 2 shows No data rather than 404.
+    assert "# TYPE parallax_aphelion_unreachable_rate gauge" in body
+
+
+def test_aphelion_unreachable_rate_has_a_single_producer(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Only the exposition builds this gauge; discrepancy_live must not.
+
+    Two producers of one metric name with different label sets is the defect
+    #100 removed for ``parallax_dual_read_discrepancy_rate``; this is the same
+    hazard for the unreachable rate. The scraped series must carry
+    ``traffic_source`` alone — a ``user_id`` label here would mean the
+    default-registry gauge came back and put ~82k series on the wire.
+    """
+    from parallax.router.discrepancy_live import record_dual_read_outcome
+
+    record_dual_read_outcome(user_id="single_producer_probe", outcome="aphelion_unreachable")
+
+    body = client.get("/metrics").text
+    lines = [
+        line
+        for line in body.splitlines()
+        if line.startswith("parallax_aphelion_unreachable_rate") and not line.startswith("#")
+    ]
+
+    # Recording an outcome must NOT be what puts the gauge on the wire: the
+    # exposition owns it. Asserting only "no user_id label" would pass
+    # vacuously on the broken code, where there are no sample lines at all.
+    from parallax.server.routes import metrics as metrics_route
+
+    _write_in_window(
+        tmp_path / "dual_read",
+        [_decision(outcome="aphelion_unreachable", traffic_source="natural")],
+    )
+    metrics_route._reset_cache_for_tests()
+    exposed = [
+        line
+        for line in client.get("/metrics").text.splitlines()
+        if line.startswith("parallax_aphelion_unreachable_rate{") and not line.startswith("#")
+    ]
+
+    assert exposed, "exposition emits no unreachable-rate series for a corpus that has one"
+    assert not any("user_id" in line for line in exposed + lines), exposed + lines
+
+
+def test_dual_read_outcomes_counter_reaches_the_wire(client: TestClient) -> None:
+    """``parallax_dual_read_outcomes_total`` must be scrapeable (#101 item b).
+
+    Second instance of the same never-on-the-wire defect, found by the same
+    sweep: ``discrepancy_live`` increments this counter on every outcome, but
+    it was not in ``_build_payload``'s default-registry render list, so three
+    consumers were querying a series Prometheus had never seen — the
+    ``CrosswalkMissRateHigh`` denominator and Grafana panels 3 and 8.
+    """
+    from parallax.router.discrepancy_live import record_dual_read_outcome
+
+    record_dual_read_outcome(
+        user_id="outcomes_wire_probe", outcome="diverge", traffic_source="synthetic"
+    )
+
+    body = client.get("/metrics").text
+    matching = [
+        line
+        for line in body.splitlines()
+        if line.startswith("parallax_dual_read_outcomes_total{")
+        and 'outcome="diverge"' in line
+        and 'user_id="outcomes_wire_probe"' in line
+        and 'traffic_source="synthetic"' in line
+    ]
+
+    assert matching, f"counter never reached the scrape; tail={body[-2000:]}"
+    assert float(matching[0].rsplit(" ", 1)[-1]) >= 1.0
 
 
 # ---------------------------------------------------------------------------

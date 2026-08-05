@@ -82,7 +82,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Fraction of dual-read requests where Aphelion was unreachable. DoD: < 0.005 (0.5%). Green < 0.25%, yellow 0.25-0.5%, red > 0.5%.",
+      "description": "Fraction of dual-read outcomes where Aphelion was unreachable over the 72h DoD window, split by traffic_source. Denominator is ALL outcomes, unlike the discrepancy/conflict/write-error panels which exclude aphelion_unreachable. DoD: < 0.005 (0.5%) on the natural series only — synthetic is the M4 burn-in loader and unknown is the pre-2026-08-02 backlog of records written before the writer recorded traffic_source (closed-ended; drains out of the 72h window). A series that is absent rather than 0 means no records of that kind were observed. Until 2026-08-05 this panel matched nothing at all: the gauge was registered but never rendered by /metrics (#101). Green < 0.25%, yellow 0.25-0.5%, red > 0.5%.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -132,6 +132,13 @@
           "instant": true,
           "legendFormat": "natural",
           "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "max(parallax_aphelion_unreachable_rate{traffic_source=\"unknown\"})",
+          "instant": true,
+          "legendFormat": "unknown (pre-2026-08-02 backlog)",
+          "refId": "C"
         }
       ],
       "title": "Aphelion unreachable rate",

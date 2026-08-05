@@ -1,8 +1,12 @@
 """M3-T1.1 — Live in-process discrepancy counter for US-011 Dual-read.
 
-In-process Prometheus counters/gauges fed live by the ``DualReadRouter``
-(T1.2). M2's ``parallax/shadow/discrepancy.py`` parses JSONL files offline;
-this module is the live in-process counterpart.
+In-process Prometheus counters fed live by the ``DualReadRouter`` (T1.2).
+M2's ``parallax/shadow/discrepancy.py`` parses JSONL files offline; this
+module is the live in-process counterpart.
+
+Counters only — this module registers no gauges. The rate gauges it used to
+mirror are exposed by ``parallax.server.routes.metrics`` from the 72h
+decision-log corpus; see the note in the collectors section below.
 
 Public API:
     DUAL_READ_DISCREPANCY_RATE_THRESHOLD  -- 0.1% (Option B, ralplan §6 line 416)
@@ -97,18 +101,6 @@ def _get_or_create_counter(
         return prometheus_client.REGISTRY._names_to_collectors[name + "_total"]  # type: ignore[return-value]
 
 
-def _get_or_create_gauge(
-    name: str,
-    documentation: str,
-    labelnames: list[str],
-) -> prometheus_client.Gauge:
-    """Return an existing Gauge or create a new one."""
-    try:
-        return prometheus_client.Gauge(name, documentation, labelnames)
-    except ValueError:
-        return prometheus_client.REGISTRY._names_to_collectors[name]  # type: ignore[return-value]
-
-
 _outcomes_counter = _get_or_create_counter(
     "parallax_dual_read_outcomes",
     "Total dual-read outcome events by type, user, and burn-in traffic source.",
@@ -145,30 +137,30 @@ _requests_counter = _get_or_create_counter(
     ["traffic_source"],
 )
 
-# NOTE: this module deliberately does NOT register a
-# ``parallax_dual_read_discrepancy_rate`` gauge. It used to, labelled
-# ``["user_id", "traffic_source"]``, which made two producers of that one
-# metric name: this one, and the 72h DoD gauge built by
+# NOTE: this module deliberately registers NO gauges. It used to register
+# ``parallax_dual_read_discrepancy_rate`` and
+# ``parallax_aphelion_unreachable_rate``, both labelled
+# ``["user_id", "traffic_source"]``, which made two producers of each of
+# those metric names: these, and the 72h DoD gauges built by
 # ``parallax.server.routes.metrics._build_payload``. Only the latter ever
 # reached the wire — ``_build_payload`` serializes a fresh
-# ``CollectorRegistry`` and plucks just three named counters out of the
-# default registry, so this gauge was set on every outcome and read by
+# ``CollectorRegistry`` and plucks a fixed list of counters out of the
+# default registry, so these gauges were set on every outcome and read by
 # nobody. Worse, the two carried different label sets, so anything that ever
 # did render the default registry would have produced two contradictory
 # definitions of one metric name.
 #
-# ``metrics.py`` is now the single producer, partitioned by
-# ``traffic_source``. The rolling-window rate this gauge mirrored is still
-# computed and still public — call ``dual_read_discrepancy_rate()``.
-# Re-adding a collector here would also put the high-cardinality ``user_id``
-# label back on the wire; ``parallax_aphelion_total`` already carries it and
-# has ~82k distinct values in the live corpus.
-
-_unreachable_rate_gauge = _get_or_create_gauge(
-    "parallax_aphelion_unreachable_rate",
-    "Rolling-window fraction of dual-read outcomes where Aphelion was unreachable.",
-    ["user_id", "traffic_source"],
-)
+# The discrepancy gauge went in #100; the unreachable gauge went in #101,
+# where the never-rendered half was what left ``AphelionUnreachableRateHigh``
+# and two Grafana targets matching nothing at all.
+#
+# ``metrics.py`` is now the single producer of both, partitioned by
+# ``traffic_source``. The rolling-window rates these gauges mirrored are
+# still computed and still public — call ``dual_read_discrepancy_rate()``
+# and ``aphelion_unreachable_rate()``. Re-adding a collector here would also
+# put the high-cardinality ``user_id`` label back on the wire;
+# ``parallax_aphelion_total`` already carries it and has ~82k distinct
+# values in the live corpus.
 
 # ---------------------------------------------------------------------------
 # LiveDiscrepancyCounter
@@ -289,19 +281,17 @@ def record_dual_read_outcome(
 
     1. Increment ``parallax_dual_read_outcomes_total{outcome, user_id, traffic_source}``.
     2. Append to singleton rolling window.
-    3. Recompute and SET the unreachable-rate gauge for ``user_id``.
 
-    The discrepancy rate is deliberately not mirrored onto a collector here
-    — see the note above ``_unreachable_rate_gauge``.
+    Neither the discrepancy rate nor the unreachable rate is mirrored onto a
+    collector here — see the "registers NO gauges" note in the collectors
+    section. Both are exposed by ``parallax.server.routes.metrics``, computed
+    from the 72h decision-log corpus and partitioned by ``traffic_source``.
     """
     source = _normalize_traffic_source(traffic_source)
     _outcomes_counter.labels(outcome=outcome, user_id=user_id, traffic_source=source).inc()
     if outcome != "skipped":
         _aphelion_counter.labels(user_id=user_id, traffic_source=source).inc()
     _singleton.record(user_id=user_id, outcome=outcome, traffic_source=source)
-    _unreachable_rate_gauge.labels(user_id=user_id, traffic_source=source).set(
-        _singleton.aphelion_unreachable_rate(user_id=user_id, traffic_source=source)
-    )
 
 
 def record_dual_read_request(*, traffic_source: str | None = None) -> None:

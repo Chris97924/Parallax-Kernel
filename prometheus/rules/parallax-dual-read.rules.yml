@@ -14,6 +14,20 @@ groups:
         # instead of producing NaN. NaN comparison semantics differ across
         # Prometheus versions, so the explicit guard is safer than relying on
         # default behavior.
+        #
+        # STILL LATENT AFTER #101 — do not read this rule as live. #101 wired
+        # the DENOMINATOR (parallax_dual_read_outcomes_total was incremented on
+        # every outcome but never rendered by /metrics). The NUMERATOR remains
+        # absent for a different and deeper reason: parallax_crosswalk_miss_orphan_total
+        # is registered in parallax/router/crosswalk_backfill.py, a module no
+        # code under parallax/ or scripts/ imports, and its only incrementer
+        # record_orphan_miss() has no production call site — the lazy-crosswalk
+        # miss path that was meant to call it was never wired up. So the
+        # collector is not even in the default registry of a running server.
+        # This alert therefore evaluates to no-data, NOT to a healthy 0.
+        # Fixing it is producer work (call record_orphan_miss from the
+        # crosswalk lookup path), deliberately out of scope for #101's
+        # exposition-wiring change. Same for Grafana panels 3 and 4.
         expr: |
           (sum(rate(parallax_crosswalk_miss_orphan_total[5m]))
            /
@@ -28,20 +42,6 @@ groups:
             crosswalk_miss_rate has exceeded 5% for over 30 minutes.
             See runbook docs/lane-c/m3-dual-read-runbook.md §Failure-Modes.
             48h SLO observation window must restart if this fires during pre-flip phase.
-
-      - alert: AphelionUnreachableRateHigh
-        expr: |
-          max by (user_id, traffic_source) (parallax_aphelion_unreachable_rate) > 0.01
-        for: 5m
-        labels:
-          severity: warning
-          component: parallax_dual_read
-        annotations:
-          summary: Aphelion unreachable rate above 1% for 5min — circuit breaker imminent
-          description: |
-            Sustained aphelion_unreachable_rate above 1% for 5 minutes triggers
-            the circuit breaker. New dual-read requests will fall back to canonical-only.
-            Manual re-arm via POST /admin/circuit_breaker/reset after Aphelion recovers.
 
       - alert: CircuitBreakerTripped
         expr: increase(parallax_circuit_breaker_tripped_total[10m]) > 0
@@ -68,9 +68,9 @@ groups:
             Lifespan drain handler hit the 15-minute timeout — in-flight requests
             were force-cut. Investigate stuck connections or upstream blocks.
 
-      # The three dual-read DoD gauges below are exposed by
+      # The four dual-read DoD gauges below are exposed by
       # parallax/server/routes/metrics.py partitioned by `traffic_source`
-      # (`natural` | `synthetic` | `unknown`). All three alerts select
+      # (`natural` | `synthetic` | `unknown`). All four alerts select
       # `natural` only, which is the Phase-2 semantic gate defined in
       # docs/m4-prep/traffic-gap-resolution.md §3.3 — the M4 burn-in
       # synthetic loader runs continuously and legitimately produces a 100%
@@ -134,7 +134,35 @@ groups:
             primary write path and Aphelion bridge stub for raised exceptions.
             Runbook: docs/m3-runbooks/observability-cookbook.md §5 場景 A.
 
-      # Selecting {traffic_source="natural"} above means the three DoD alerts
+      # Until #101 this selected `max by (user_id, traffic_source)` over a
+      # gauge that never reached the wire at all: discrepancy_live.py
+      # registered parallax_aphelion_unreachable_rate into the DEFAULT
+      # registry and set it on every outcome, but _build_payload serializes a
+      # fresh CollectorRegistry, so no scrape ever carried it. The rule — and
+      # Grafana panel 2's two targets — matched nothing, for 5 minutes at a
+      # time, forever. metrics.py is now the single producer, computed from
+      # the same 72h corpus as its three siblings above, which is also why
+      # `user_id` is gone from the aggregation: the exposed gauge no longer
+      # carries it (see the cardinality note in discrepancy_live.py).
+      #
+      # Alert threshold (1%) intentionally looser than the DoD exit threshold
+      # (0.5%, APHELION_UNREACHABLE_THRESHOLD) — same rationale as the two
+      # alerts above. Sustained breach is what precedes a circuit-breaker trip.
+      - alert: AphelionUnreachableRateHigh
+        expr: |
+          max by (traffic_source) (parallax_aphelion_unreachable_rate{traffic_source="natural"}) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          component: parallax_dual_read
+        annotations:
+          summary: Aphelion unreachable rate above 1% for 5min — circuit breaker imminent
+          description: |
+            Sustained aphelion_unreachable_rate above 1% for 5 minutes triggers
+            the circuit breaker. New dual-read requests will fall back to canonical-only.
+            Manual re-arm via POST /admin/circuit_breaker/reset after Aphelion recovers.
+
+      # Selecting {traffic_source="natural"} above means the four DoD alerts
       # go quiet when there is no natural traffic — correct, but it removes
       # the only signal that the decision-log corpus is being read at all.
       # This alert is that signal. It covers two independent faults, and it

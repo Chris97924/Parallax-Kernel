@@ -108,15 +108,24 @@ groups:
       # 2026-08-05（PR #103 review）起改讀 **300s counter ratio**，不再讀 72h DoD gauge：
       # breaker（parallax/router/circuit_breaker.py）是 300s / 1% / >=50 observations，
       # 72h gauge 在「大量健康 backlog + 突發斷線」時會被平均掉而永遠不觸發——
-      # 正是這條 alert 存在的那個場景。三個項都對齊 breaker 常數。
-      # 分母 `>= 50` 同時是 breaker 的 cold-start flap guard 與除零保護；
-      # 不足 50 筆時是 no-data（**不是** 0.0）。
+      # 正是這條 alert 存在的那個場景。**五個項**全部對齊 breaker：
+      #   窗 [5m]=WINDOW_SECONDS 300s／閾值 >0.01=TRIP_THRESHOLD／分母 >=50=MIN_OBSERVATIONS
+      #   ／母體 outcome!="skipped"=dual_read.py:501 那道 gate／範圍 by (job,instance)=breaker 是 process-local
+      # 分母 `>= 50` 同時是 cold-start flap guard 與除零保護；不足 50 筆是 no-data（**不是** 0.0）。
+      # `skipped`（DUAL_READ 關閉、CHANGE_TRACE legacy_kind=bug 短路）根本沒呼叫 Aphelion，
+      # 算進分母會稀釋成「看起來健康」而 breaker 已經在跳。`primary_only` **要留著**，它有進 breaker。
       - alert: AphelionUnreachableRateHigh
         expr: |
           (
-            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m]))
+            sum by (job, instance, traffic_source) (
+              increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m])
+            )
             /
-            (sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural"}[5m])) >= 50)
+            (
+              sum by (job, instance, traffic_source) (
+                increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome!="skipped"}[5m])
+              ) >= 50
+            )
           ) > 0.01
         for: 0m        # [5m] range 本身就是 breaker 的窗，再加 for: 會晚於它要預警的那次 trip
         labels: { severity: warning, component: parallax_dual_read }

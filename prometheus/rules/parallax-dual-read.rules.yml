@@ -12,6 +12,13 @@ groups:
       # user_id into a stable, densely-sampled aggregate first; increase() over
       # THAT reflects every user's increment.
       #
+      # `without (user_id)` rather than `by (...)` is deliberate on two counts.
+      # It drops ONLY the high-cardinality label, so it keeps `outcome` and
+      # `traffic_source` for the selectors below — and, load-bearing for the
+      # per-instance alerting below, it keeps the `job` and `instance` labels
+      # Prometheus attaches at scrape time. An explicit `by (...)` list would
+      # silently drop scrape identity the first time someone forgot to list it.
+      #
       # MUST stay above its consumers: rules in a group evaluate sequentially,
       # in order, so the aggregate has to be recorded before it is read.
       - record: parallax_dual_read_outcomes:sum_without_user_id
@@ -175,6 +182,46 @@ groups:
       #   window       [5m]                    <- WINDOW_SECONDS = 300.0
       #   threshold    > 0.01                  <- TRIP_THRESHOLD = 0.01 (strict)
       #   sample floor >= 50 in-window         <- MIN_OBSERVATIONS = 50
+      #   population   outcome!="skipped"      <- the _record() gate, below
+      #   scope        by (job, instance)      <- the breaker is process-local
+      #
+      # WHICH OUTCOMES COUNT (#103 review P2-a). dual_read.py:499-505 feeds the
+      # breaker from exactly one place:
+      #
+      #     if outcome != "skipped":
+      #         get_breaker_state().record_unreachable_observation(
+      #             observed_unreachable=(outcome == "aphelion_unreachable"))
+      #
+      # so the breaker's denominator is match | diverge | primary_only |
+      # aphelion_unreachable, and its numerator is aphelion_unreachable. The
+      # counter this alert reads is incremented by record_dual_read_outcome(),
+      # whose ONLY call site is the same _record() a few lines above that gate
+      # — so counter increments and breaker observations correspond 1:1 except
+      # for `skipped`, and `outcome!="skipped"` reproduces the breaker's
+      # population exactly rather than approximately.
+      #
+      # `skipped` is the DUAL_READ-disabled path and the CHANGE_TRACE
+      # legacy_kind=bug short-circuit (dual_read.py:206, :235). Aphelion is
+      # never called, so those requests cannot be evidence that Aphelion is
+      # unreachable. Leaving them in inflates the denominator and can hold this
+      # alert under 1% while the breaker, which never saw them, is over it.
+      #
+      # primary_only deliberately STAYS IN — do not "fix" it out. It is not
+      # skipped, so it DOES feed the breaker (as a non-unreachable
+      # observation). No bug-parity exclusions are encoded here: the selector
+      # matches what the breaker actually counts today, not a workaround for
+      # something it misses.
+      #
+      # PER-INSTANCE, NOT FLEET-WIDE (#103 review P2-b). BreakerState is
+      # process-local (circuit_breaker.py — a singleton deque per process), so
+      # each replica trips on its own traffic. A bare sum() collapses every
+      # replica into one ratio, and one instance melting down gets diluted by
+      # its healthy peers until the fleet average stays under 1% while that
+      # replica has already tripped and is serving canonical-only. Aggregating
+      # `by (job, instance, traffic_source)` on BOTH sides evaluates the same
+      # population each breaker does, and keeps the label sets identical across
+      # the division so the vector match stays 1:1. The firing alert then names
+      # the instance that tripped.
       #
       # The `>= 50` denominator guard does double duty: it is the breaker's
       # cold-start flap guard AND the division-by-zero guard. Below 50
@@ -194,25 +241,36 @@ groups:
       - alert: AphelionUnreachableRateHigh
         expr: |
           (
-            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m]))
+            sum by (job, instance, traffic_source) (
+              increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m])
+            )
             /
-            (sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural"}[5m])) >= 50)
+            (
+              sum by (job, instance, traffic_source) (
+                increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome!="skipped"}[5m])
+              ) >= 50
+            )
           ) > 0.01
         for: 0m
         labels:
           severity: warning
           component: parallax_dual_read
         annotations:
-          summary: Aphelion unreachable rate above 1% over 300s — circuit breaker tripping
+          summary: Aphelion unreachable rate above 1% over 300s on {{ $labels.instance }} — circuit breaker tripping
           description: |
-            Natural-traffic aphelion_unreachable rate exceeded 1% over the same
-            300s window and 50-observation floor the dual-read circuit breaker
-            trips on, so the breaker is tripping now or is about to. New
-            dual-read requests fall back to canonical-only once it does.
+            Natural-traffic aphelion_unreachable rate on instance
+            {{ $labels.instance }} exceeded 1% over the same 300s window,
+            50-observation floor and outcome population (everything but
+            "skipped") the dual-read circuit breaker trips on, so THAT
+            replica's breaker is tripping now or is about to. New dual-read
+            requests on it fall back to canonical-only once it does.
+            The breaker is process-local, so this is a per-instance condition:
+            healthy peers do NOT make it safe to ignore.
             The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
-            after Aphelion recovers. Note this alert RESOLVES on its own once
-            the breaker opens — fallback stops producing aphelion_unreachable
-            outcomes — so resolution here does NOT mean the breaker re-armed.
+            against that instance after Aphelion recovers. Note this alert
+            RESOLVES on its own once the breaker opens — fallback stops
+            producing aphelion_unreachable outcomes — so resolution here does
+            NOT mean the breaker re-armed.
             CircuitBreakerTripped is the signal for the trip itself (and per
             #102 that alert's metric is itself never-on-the-wire).
             Runbook: docs/m3-runbooks/observability-cookbook.md §5.

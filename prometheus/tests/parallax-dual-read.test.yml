@@ -1,4 +1,4 @@
-# promtool rules unit test for AphelionUnreachableRateHigh (#103 review fix).
+# promtool rules unit test for AphelionUnreachableRateHigh (#103 review).
 #
 # Run:  promtool test rules prometheus/tests/parallax-dual-read.test.yml
 #
@@ -10,21 +10,23 @@
 # What is under test
 # ------------------
 # The alert exists to warn that the dual-read circuit breaker is tripping, so
-# it must measure what the breaker measures (parallax/router/circuit_breaker.py):
+# it must measure what the breaker measures. The breaker
+# (parallax/router/circuit_breaker.py, fed at dual_read.py:499-505) is:
 #
-#     WINDOW_SECONDS   = 300.0   -> [5m] range
-#     TRIP_THRESHOLD   = 0.01    -> > 0.01, strict
-#     MIN_OBSERVATIONS = 50      -> >= 50 in-window denominator guard
+#     WINDOW_SECONDS   = 300.0            -> [5m] range
+#     TRIP_THRESHOLD   = 0.01             -> > 0.01, strict
+#     MIN_OBSERVATIONS = 50               -> >= 50 in-window denominator guard
+#     population       = outcome != "skipped"
+#     scope            = process-local    -> by (job, instance, traffic_source)
 #
-# Before this fix the alert read the 72h DoD gauge, which cannot see a 300s
-# outage against a large healthy backlog. These cases pin the three terms plus
-# the traffic_source partition, so CI asserts BEHAVIOUR and not just syntax.
+# Each case pins one of those terms, so CI asserts BEHAVIOUR and not just
+# syntax. Every series carries job/instance because the alert aggregates by
+# scrape identity; a test without them would not exercise that at all.
 #
 # Series shape note: parallax_dual_read_outcomes_total carries user_id, and the
-# rule file records a `sum without (user_id)` aggregate first (issue #76). Each
-# case below therefore uses several distinct user_id children — a per-series
-# increase() would drop the one-time users and under-count, which case 5 pins
-# directly.
+# rule file records a `sum without (user_id)` aggregate first (issue #76). A
+# per-series increase() would drop one-time users and under-count, which case 5
+# pins directly.
 
 rule_files:
   - ../rules/parallax-dual-read.rules.yml
@@ -44,11 +46,11 @@ tests:
   - interval: 30s
     name: fires when natural unreachable rate exceeds 1 percent over 300s
     input_series:
-      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+5x20'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+60x20'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u2"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u2",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+35x20'
     alert_rule_test:
       - eval_time: 10m
@@ -57,17 +59,25 @@ tests:
           - exp_labels:
               severity: warning
               component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+              traffic_source: natural
             exp_annotations:
-              summary: Aphelion unreachable rate above 1% over 300s — circuit breaker tripping
+              summary: Aphelion unreachable rate above 1% over 300s on 10.0.0.1:8765 — circuit breaker tripping
               description: |
-                Natural-traffic aphelion_unreachable rate exceeded 1% over the same
-                300s window and 50-observation floor the dual-read circuit breaker
-                trips on, so the breaker is tripping now or is about to. New
-                dual-read requests fall back to canonical-only once it does.
+                Natural-traffic aphelion_unreachable rate on instance
+                10.0.0.1:8765 exceeded 1% over the same 300s window,
+                50-observation floor and outcome population (everything but
+                "skipped") the dual-read circuit breaker trips on, so THAT
+                replica's breaker is tripping now or is about to. New dual-read
+                requests on it fall back to canonical-only once it does.
+                The breaker is process-local, so this is a per-instance condition:
+                healthy peers do NOT make it safe to ignore.
                 The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
-                after Aphelion recovers. Note this alert RESOLVES on its own once
-                the breaker opens — fallback stops producing aphelion_unreachable
-                outcomes — so resolution here does NOT mean the breaker re-armed.
+                against that instance after Aphelion recovers. Note this alert
+                RESOLVES on its own once the breaker opens — fallback stops
+                producing aphelion_unreachable outcomes — so resolution here does
+                NOT mean the breaker re-armed.
                 CircuitBreakerTripped is the signal for the trip itself (and per
                 #102 that alert's metric is itself never-on-the-wire).
                 Runbook: docs/m3-runbooks/observability-cookbook.md §5.
@@ -80,9 +90,9 @@ tests:
   - interval: 30s
     name: silent when natural unreachable rate is below 1 percent
     input_series:
-      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+1x20'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+999x20'
     alert_rule_test:
       - eval_time: 10m
@@ -99,9 +109,9 @@ tests:
   - interval: 30s
     name: silent when in-window sample size is under the 50 observation floor
     input_series:
-      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+1x20'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+2x20'
     alert_rule_test:
       - eval_time: 10m
@@ -124,73 +134,14 @@ tests:
   - interval: 30s
     name: silent when the unreachable traffic is synthetic and natural is healthy
     input_series:
-      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="synthetic",user_id="parallax-burn-in-synth"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="synthetic",user_id="parallax-burn-in-synth",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+100x20'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '0+100x20'
     alert_rule_test:
       - eval_time: 10m
         alertname: AphelionUnreachableRateHigh
         exp_alerts: []
-
-  # -------------------------------------------------------------------------
-  # 6. THE REGRESSION CASE for the #103 review finding — a sudden outage
-  #    against a large healthy backlog. This is the scenario the 72h DoD gauge
-  #    structurally cannot see, and the reason this alert had to move to a
-  #    300s window.
-  #
-  #    50 minutes of healthy traffic (200k matches, zero unreachable), then
-  #    Aphelion falls over: matches stop, unreachables climb. At the end of the
-  #    window the LAST 300s is ~100% unreachable — the breaker is tripping —
-  #    while the all-time ratio is only 1000/201000 ~= 0.5%, comfortably under
-  #    the 1% threshold. A long-window expression reads healthy right through
-  #    the outage. Widening [5m] back out must break this case.
-  # -------------------------------------------------------------------------
-  - interval: 30s
-    name: fires on a sudden outage that a long window would average away
-    input_series:
-      # Healthy for ~50m, then flat: the backlog a 72h average would drown in.
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
-        values: '0+2000x100 200000+0x20'
-      # Zero unreachable for ~50m, then the outage starts.
-      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1"}'
-        values: '0+0x100 0+50x20'
-    alert_rule_test:
-      - eval_time: 60m
-        alertname: AphelionUnreachableRateHigh
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              component: parallax_dual_read
-            exp_annotations:
-              summary: Aphelion unreachable rate above 1% over 300s — circuit breaker tripping
-              description: |
-                Natural-traffic aphelion_unreachable rate exceeded 1% over the same
-                300s window and 50-observation floor the dual-read circuit breaker
-                trips on, so the breaker is tripping now or is about to. New
-                dual-read requests fall back to canonical-only once it does.
-                The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
-                after Aphelion recovers. Note this alert RESOLVES on its own once
-                the breaker opens — fallback stops producing aphelion_unreachable
-                outcomes — so resolution here does NOT mean the breaker re-armed.
-                CircuitBreakerTripped is the signal for the trip itself (and per
-                #102 that alert's metric is itself never-on-the-wire).
-                Runbook: docs/m3-runbooks/observability-cookbook.md §5.
-    promql_expr_test:
-      # Pin the premise, so the case cannot silently stop testing what it says:
-      # the all-time ratio really is under the 1% threshold. If this ever rises
-      # above 0.01 the outage is no longer "averaged away" and case 6 would
-      # pass for the wrong reason.
-      - expr: |
-          (
-            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[72h]))
-            /
-            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural"}[72h]))
-          ) < bool 0.01
-        eval_time: 60m
-        exp_samples:
-          - labels: '{}'
-            value: 1
 
   # -------------------------------------------------------------------------
   # 5. The user_id-stripping recording rule is load-bearing, not decoration.
@@ -203,22 +154,24 @@ tests:
   - interval: 30s
     name: user_id stripped aggregate counts one-time users the raw counter drops
     input_series:
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
         values: '1+0x20'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u2"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u2",job="parallax",instance="10.0.0.1:8765"}'
         values: '_ _ 1+0x18'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u3"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u3",job="parallax",instance="10.0.0.1:8765"}'
         values: '_ _ _ _ 1+0x16'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u4"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u4",job="parallax",instance="10.0.0.1:8765"}'
         values: '_ _ _ _ _ _ 1+0x14'
-      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u5"}'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u5",job="parallax",instance="10.0.0.1:8765"}'
         values: '_ _ _ _ _ _ _ _ 1+0x12'
     promql_expr_test:
-      # The aggregate materialises all five one-time users as one series.
+      # The aggregate materialises all five one-time users as one series, and
+      # keeps job/instance — which an explicit `by (...)` list could have
+      # dropped, breaking the per-instance scoping the alert depends on.
       - expr: parallax_dual_read_outcomes:sum_without_user_id{outcome="match",traffic_source="natural"}
         eval_time: 10m
         exp_samples:
-          - labels: 'parallax_dual_read_outcomes:sum_without_user_id{outcome="match", traffic_source="natural"}'
+          - labels: 'parallax_dual_read_outcomes:sum_without_user_id{outcome="match", traffic_source="natural", job="parallax", instance="10.0.0.1:8765"}'
             value: 5
 
       # The OLD idiom drops every one of them: each child is flat in range.
@@ -238,3 +191,188 @@ tests:
         exp_samples:
           - labels: '{}'
             value: 1
+
+  # -------------------------------------------------------------------------
+  # 6. THE WINDOW REGRESSION CASE — a sudden outage against a large healthy
+  #    backlog. This is the scenario the 72h DoD gauge structurally cannot see,
+  #    and the reason this alert moved to a 300s window.
+  #
+  #    50 minutes of healthy traffic (200k matches, zero unreachable), then
+  #    Aphelion falls over: matches stop, unreachables climb. At the end the
+  #    LAST 300s is ~100% unreachable — the breaker is tripping — while the
+  #    all-time ratio is only 1000/201000 ~= 0.5%, comfortably under the 1%
+  #    threshold. A long-window expression reads healthy right through the
+  #    outage. Widening [5m] back out must break this case.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: fires on a sudden outage that a long window would average away
+    input_series:
+      # Healthy for ~50m, then flat: the backlog a 72h average would drown in.
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+2000x100 200000+0x20'
+      # Zero unreachable for ~50m, then the outage starts.
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x100 0+50x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+              traffic_source: natural
+            exp_annotations:
+              summary: Aphelion unreachable rate above 1% over 300s on 10.0.0.1:8765 — circuit breaker tripping
+              description: |
+                Natural-traffic aphelion_unreachable rate on instance
+                10.0.0.1:8765 exceeded 1% over the same 300s window,
+                50-observation floor and outcome population (everything but
+                "skipped") the dual-read circuit breaker trips on, so THAT
+                replica's breaker is tripping now or is about to. New dual-read
+                requests on it fall back to canonical-only once it does.
+                The breaker is process-local, so this is a per-instance condition:
+                healthy peers do NOT make it safe to ignore.
+                The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
+                against that instance after Aphelion recovers. Note this alert
+                RESOLVES on its own once the breaker opens — fallback stops
+                producing aphelion_unreachable outcomes — so resolution here does
+                NOT mean the breaker re-armed.
+                CircuitBreakerTripped is the signal for the trip itself (and per
+                #102 that alert's metric is itself never-on-the-wire).
+                Runbook: docs/m3-runbooks/observability-cookbook.md §5.
+    promql_expr_test:
+      # Pin the premise, so the case cannot silently stop testing what it says:
+      # the all-time ratio really is under the 1% threshold. If this ever rises
+      # above 0.01 the outage is no longer "averaged away" and case 6 would
+      # pass for the wrong reason.
+      - expr: |
+          (
+            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[72h]))
+            /
+            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome!="skipped"}[72h]))
+          ) < bool 0.01
+        eval_time: 60m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # -------------------------------------------------------------------------
+  # 7. #103 review P2-a — `skipped` outcomes must NOT dilute the denominator.
+  #    dual_read.py:501 gates the breaker on `outcome != "skipped"`, so the
+  #    DUAL_READ-disabled path and the CHANGE_TRACE legacy_kind=bug
+  #    short-circuit never reach Aphelion and never reach the breaker.
+  #
+  #    Attempted traffic here is 4 unreachable + 96 match per step = 4%, which
+  #    the breaker sees and trips on. A flood of `skipped` at 900/step swamps
+  #    it: counting those, the ratio falls to 4/1000 = 0.4% and the alert goes
+  #    quiet while the breaker is tripping — precisely the P2-a failure.
+  #    Putting `skipped` back in the denominator must break this case.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: skipped outcomes do not dilute the denominator the breaker never saw
+    input_series:
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+4x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+96x20'
+      # The dilutant: Aphelion was never called for any of these.
+      - series: 'parallax_dual_read_outcomes_total{outcome="skipped",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+900x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+              traffic_source: natural
+            exp_annotations:
+              summary: Aphelion unreachable rate above 1% over 300s on 10.0.0.1:8765 — circuit breaker tripping
+              description: |
+                Natural-traffic aphelion_unreachable rate on instance
+                10.0.0.1:8765 exceeded 1% over the same 300s window,
+                50-observation floor and outcome population (everything but
+                "skipped") the dual-read circuit breaker trips on, so THAT
+                replica's breaker is tripping now or is about to. New dual-read
+                requests on it fall back to canonical-only once it does.
+                The breaker is process-local, so this is a per-instance condition:
+                healthy peers do NOT make it safe to ignore.
+                The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
+                against that instance after Aphelion recovers. Note this alert
+                RESOLVES on its own once the breaker opens — fallback stops
+                producing aphelion_unreachable outcomes — so resolution here does
+                NOT mean the breaker re-armed.
+                CircuitBreakerTripped is the signal for the trip itself (and per
+                #102 that alert's metric is itself never-on-the-wire).
+                Runbook: docs/m3-runbooks/observability-cookbook.md §5.
+    promql_expr_test:
+      # Pin the premise: counting `skipped` really would have hidden this.
+      # 4 unreachable per 1000 total = 0.4%, under the 1% threshold.
+      - expr: |
+          (
+            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural",outcome="aphelion_unreachable"}[5m]))
+            /
+            sum(increase(parallax_dual_read_outcomes:sum_without_user_id{traffic_source="natural"}[5m]))
+          ) < bool 0.01
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # -------------------------------------------------------------------------
+  # 8. #103 review P2-b — evaluate per scrape identity, because BreakerState is
+  #    process-local: instance -2 trips on its own traffic no matter how -1 and
+  #    -3 are doing.
+  #
+  #    -2 runs at 20% unreachable (its breaker is tripping); -1 and -3 are
+  #    clean. The assertion is not merely "something fires" but that EXACTLY
+  #    ONE alert fires and it is labelled instance -2. A bare sum() collapses
+  #    job/instance into a single fleet-wide series, so it cannot name the
+  #    failing replica and fails this case.
+  # -------------------------------------------------------------------------
+  - interval: 30s
+    name: per instance evaluation names the failing replica and spares healthy peers
+    input_series:
+      # Healthy peers, high volume.
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+200x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.3:8765"}'
+        values: '0+200x20'
+      # Melting down: 20 unreachable of 100 per step = 20%.
+      - series: 'parallax_dual_read_outcomes_total{outcome="aphelion_unreachable",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.2:8765"}'
+        values: '0+20x20'
+      - series: 'parallax_dual_read_outcomes_total{outcome="match",traffic_source="natural",user_id="u1",job="parallax",instance="10.0.0.2:8765"}'
+        values: '0+80x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AphelionUnreachableRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.2:8765
+              traffic_source: natural
+            exp_annotations:
+              summary: Aphelion unreachable rate above 1% over 300s on 10.0.0.2:8765 — circuit breaker tripping
+              description: |
+                Natural-traffic aphelion_unreachable rate on instance
+                10.0.0.2:8765 exceeded 1% over the same 300s window,
+                50-observation floor and outcome population (everything but
+                "skipped") the dual-read circuit breaker trips on, so THAT
+                replica's breaker is tripping now or is about to. New dual-read
+                requests on it fall back to canonical-only once it does.
+                The breaker is process-local, so this is a per-instance condition:
+                healthy peers do NOT make it safe to ignore.
+                The breaker is manual-reset ONLY: POST /admin/circuit_breaker/reset
+                against that instance after Aphelion recovers. Note this alert
+                RESOLVES on its own once the breaker opens — fallback stops
+                producing aphelion_unreachable outcomes — so resolution here does
+                NOT mean the breaker re-armed.
+                CircuitBreakerTripped is the signal for the trip itself (and per
+                #102 that alert's metric is itself never-on-the-wire).
+                Runbook: docs/m3-runbooks/observability-cookbook.md §5.

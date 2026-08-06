@@ -45,7 +45,33 @@ from parallax.router.circuit_breaker import get_breaker_state
 from parallax.router.config import is_dual_read_enabled
 from parallax.router.inflight import inflight_gauge
 
-__all__ = ["DualReadSnapshotMiddleware", "install_middleware"]
+__all__ = ["DualReadSnapshotMiddleware", "INFLIGHT_EXCLUDED_PATHS", "install_middleware"]
+
+# Paths that do NOT count toward ``parallax_inflight_requests``.
+#
+# The gauge means "application work that a graceful drain must wait for"
+# (inflight.py: "requests currently being processed (dual-read-aware path)").
+# Monitoring traffic is neither: nothing is served on behalf of a user, and a
+# drain must not block on a scrape or a liveness probe.
+#
+# ``/metrics`` is the load-bearing case and the reason this set exists. The
+# gauge is READ WHILE SERVING THE SCRAPE, so without this exclusion every
+# scrape reported at least 1 and an idle instance could never report 0. That
+# is not cosmetic: docs/m3-runbooks/q8-drain-runbook.md selects stuck
+# instances with ``parallax_inflight_requests > 0`` and its CI/CD deploy gate
+# waits for ``sum(parallax_inflight_requests) == 0``, so every healthy
+# instance would be classified as stuck and the gate would burn its full
+# 960-second timeout on every deploy. Found by the #102 review; the defect was
+# invisible before #102 because the gauge had never reached the wire at all.
+#
+# ``/healthz`` is here for the same reason rather than by analogy: a liveness
+# probe is in flight for a moment on a schedule, so leaving it in makes that
+# same ``== 0`` gate flake intermittently instead of failing constantly —
+# strictly harder to diagnose. Both are excluded, or the gate is still wrong.
+#
+# Exact match, not prefix: a future ``/metrics/foo`` route serving real work
+# should count, and a caller cannot dodge the gauge by prefixing a path.
+INFLIGHT_EXCLUDED_PATHS = frozenset({"/metrics", "/healthz"})
 
 
 class DualReadSnapshotMiddleware(BaseHTTPMiddleware):
@@ -54,7 +80,9 @@ class DualReadSnapshotMiddleware(BaseHTTPMiddleware):
     1. Snapshots ``DUAL_READ`` env flag + circuit-breaker state once at
        request entry into ``request.state.dual_read``.
     2. Wraps the rest of the request in the inflight gauge with a
-       ``try/finally`` guard that always decrements on exit.
+       ``try/finally`` guard that always decrements on exit — except for
+       :data:`INFLIGHT_EXCLUDED_PATHS`, which are monitoring endpoints
+       rather than drainable work.
     """
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:  # type: ignore[override]
@@ -63,7 +91,14 @@ class DualReadSnapshotMiddleware(BaseHTTPMiddleware):
         breaker_tripped = get_breaker_state().is_tripped()
         request.state.dual_read = env_says_true and not breaker_tripped
 
-        # 2. CRITICAL try/finally — inflight gauge MUST decrement even when
+        # 2. Monitoring endpoints are not drainable work — see
+        #    INFLIGHT_EXCLUDED_PATHS. The flag snapshot above still happens for
+        #    them: it is per-request state with no drain semantics, and
+        #    skipping it would be an unrelated behaviour change.
+        if request.url.path in INFLIGHT_EXCLUDED_PATHS:
+            return await call_next(request)
+
+        # 3. CRITICAL try/finally — inflight gauge MUST decrement even when
         #    call_next raises (auth errors, validation errors, bare exceptions).
         inflight_gauge.inc()
         try:

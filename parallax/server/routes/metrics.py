@@ -109,6 +109,13 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
         "dual_read_outcomes_total",
         "arbitration_p99_latency_ms",
         "arbitration_policy_version",
+        # #102 — same treatment, same reason: rendered from the DEFAULT
+        # registry at the bottom of ``_build_payload``, so an in-house counter
+        # sanitizing to one of these would put a second metric of the same
+        # name in the same payload and break the scrape parse.
+        "circuit_breaker_tripped_total",
+        "drain_timeout_total",
+        "inflight_requests",
     }
 )
 
@@ -444,6 +451,39 @@ def _render_default_registry_counter(name: str) -> str:
     return ""
 
 
+def _render_default_registry_gauge(name: str) -> str:
+    """Render a live prometheus_client Gauge from the DEFAULT registry as text.
+
+    Gauge sibling of :func:`_render_default_registry_counter`, needed because
+    that helper hardcodes the counter shape: it appends ``_total`` to the name
+    and emits ``# TYPE ... counter``. A Gauge's sample name IS its metric name
+    (no suffix munging — only Counters get their trailing ``_total`` stripped
+    at construction), so passing a gauge through the counter renderer would
+    emit a ``<name>_total`` header with no matching sample lines under it.
+
+    Same default-registry rationale otherwise: ``_build_payload`` serializes a
+    *fresh* ``CollectorRegistry``, so a Gauge registered into
+    ``prometheus_client.REGISTRY`` never reaches a scrape unless plucked out
+    here. Returns ``""`` when the metric is not registered — i.e. when the
+    defining module was never imported, which in a running server cannot
+    happen (see the call site).
+    """
+    for metric in REGISTRY.collect():
+        if metric.name != name:
+            continue
+        lines = [
+            f"# HELP {name} {metric.documentation}",
+            f"# TYPE {name} gauge",
+        ]
+        for sample in metric.samples:
+            if sample.name != name:
+                continue
+            labels = _format_prometheus_labels(sample.labels)
+            lines.append(f"{name}{labels} {sample.value}")
+        return "\n".join(lines) + "\n"
+    return ""
+
+
 def _build_payload() -> str:
     """Render Prometheus text format combining in-house counters + shadow gauges."""
     reg = CollectorRegistry()
@@ -673,9 +713,83 @@ def _build_payload() -> str:
             # rather than dropping it: panel 8 needs the outcome dimension,
             # and the alternative is going back to a dead panel.
             "parallax_dual_read_outcomes",
+            # ------------------------------------------------------------------
+            # #102 — third instance of the never-on-the-wire class. Both of
+            # these back a severity=critical alert in
+            # prometheus/rules/parallax-dual-read.rules.yml
+            # (CircuitBreakerTripped, DrainTimeoutDetected) and neither could
+            # ever fire: the collectors are registered into the DEFAULT registry
+            # at circuit_breaker.py:61 and lifespan.py:50 and were never plucked
+            # out here, so every scrape omitted them and both alerts evaluated
+            # against no-data forever.
+            #
+            # BASE NAMES, NOT WIRE NAMES. prometheus_client strips a trailing
+            # ``_total`` from a Counter at construction, so
+            # ``Counter("parallax_circuit_breaker_tripped_total")`` collects
+            # under ``parallax_circuit_breaker_tripped`` and emits a
+            # ``parallax_circuit_breaker_tripped_total`` sample. This helper
+            # matches on the collected name and re-appends the suffix; passing
+            # the wire name here would match nothing and silently render "".
+            #
+            # These are unlabelled (both Counters take no ``labelnames``), so
+            # each contributes exactly one series plus whatever job/instance
+            # Prometheus attaches at scrape time. No cardinality concern.
+            "parallax_circuit_breaker_tripped",
+            "parallax_drain_timeout",
         )
     )
-    return generate_latest(reg).decode("utf-8") + default_registry_counters
+
+    # #102 — the gauge half of the same defect (inflight.py:37). Rendered
+    # through the gauge helper rather than appended to the tuple above because
+    # a Gauge carries no ``_total`` suffix.
+    #
+    # Deliberately reported EVEN WHEN ZERO, and the two counters above likewise.
+    # This is the one place the absent-not-zero rule the DoD gauges follow is
+    # inverted, and the inversion is load-bearing rather than an oversight:
+    #
+    #   * The counters back ``increase(...) > 0`` alerts. A counter that only
+    #     appeared on its first increment would spring into existence already
+    #     at 1.0, and increase() over a series whose samples are all 1.0 is
+    #     0 — so the very first trip, the event the CRITICAL alert exists for,
+    #     would read as "measured, and healthy". Exporting from zero gives
+    #     Prometheus the baseline sample that makes the step visible. Pinned by
+    #     the ``absent-until-first-increment`` case in
+    #     prometheus/tests/parallax-dual-read.test.yml, which fails if this
+    #     changes.
+    #   * The gauge is a live concurrency reading, not a rate over a corpus.
+    #     Zero is a genuine measurement ("the tracker was read and nothing is
+    #     in flight"), the same reason parallax_dual_read_log_records_total
+    #     reports its zeros. A drain runbook needs to tell "0 in flight, safe
+    #     to stop" from "no data, cannot tell".
+    #
+    # THE SCRAPE DOES NOT COUNT ITSELF, and that took a fix to be true.
+    # DualReadSnapshotMiddleware reads this gauge WHILE SERVING the scrape, so
+    # while it tracked every path the exported value was always >= 1 and an
+    # idle instance could never report 0 — which breaks
+    # docs/m3-runbooks/q8-drain-runbook.md, whose deploy gate waits for
+    # ``sum(parallax_inflight_requests) == 0`` and would have burned its full
+    # 960s timeout on every deploy. Fixed at the source rather than here:
+    # ``INFLIGHT_EXCLUDED_PATHS`` in middleware/dual_read_snapshot.py drops
+    # /metrics and /healthz from the gauge entirely.
+    #
+    # Fixing it in the middleware rather than subtracting a fudge factor here
+    # is what keeps this series honest: the exporter still reports exactly what
+    # the collector holds, so the wire and ``get_inflight_count()`` — which the
+    # drain loop polls in-process — agree by construction instead of differing
+    # by an offset nobody would remember. Pinned by
+    # test_metrics_scrape_is_not_counted_as_inflight_work.
+    #
+    # All three collectors are in a running server's default registry
+    # unconditionally: app.py imports lifespan (drain_timeout_total, and it
+    # imports inflight) at line 46 and the admin circuit-breaker route
+    # (circuit_breaker_tripped_total) at line 53. The helpers still return ""
+    # rather than raising if that ever stops being true — losing one series is
+    # better than 500-ing the whole scrape.
+    default_registry_gauges = _render_default_registry_gauge("parallax_inflight_requests")
+
+    return (
+        generate_latest(reg).decode("utf-8") + default_registry_counters + default_registry_gauges
+    )
 
 
 @router.get("/metrics", response_class=PlainTextResponse)

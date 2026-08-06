@@ -1,4 +1,8 @@
-# promtool rules unit test for AphelionUnreachableRateHigh (#103 review).
+# promtool rules unit tests for the parallax_dual_read group.
+#
+#   cases 1-8   AphelionUnreachableRateHigh          (#103 review)
+#   cases 9-14  CircuitBreakerTripped     — CRITICAL (#102)
+#   cases 15-19 DrainTimeoutDetected      — CRITICAL (#102)
 #
 # Run:  promtool test rules prometheus/tests/parallax-dual-read.test.yml
 #
@@ -7,8 +11,14 @@
 # file. The `promtool test rules` CI step globs prometheus/tests/**/*.test.yml
 # and picks this up with no workflow change.
 #
-# What is under test
-# ------------------
+# These are MUTATION-CHECKED, not merely passing: each alert expression was
+# mutated one clause at a time (window narrowed, window widened, `> 0` loosened
+# to `>= 0`, increase() dropped for a level test, labels aggregated away with
+# sum()) and every mutant was confirmed to fail at least one case below. A
+# green run therefore means the guards hold, not just that the YAML parses.
+#
+# What is under test — cases 1-8
+# ------------------------------
 # The alert exists to warn that the dual-read circuit breaker is tripping, so
 # it must measure what the breaker measures. The breaker
 # (parallax/router/circuit_breaker.py, fed at dual_read.py:499-505) is:
@@ -82,8 +92,10 @@ tests:
                 RESOLVES on its own once the breaker opens — fallback stops
                 producing aphelion_unreachable outcomes — so resolution here does
                 NOT mean the breaker re-armed.
-                CircuitBreakerTripped is the signal for the trip itself (and per
-                #102 that alert's metric is itself never-on-the-wire).
+                CircuitBreakerTripped is the signal for the trip itself; since #102
+                put its counter on the wire, that alert fires too. It clears ~10m
+                after the trip when the increment ages out of its window, so
+                neither alert going quiet means the breaker re-armed.
                 Runbook: docs/m3-runbooks/observability-cookbook.md §5.
 
   # -------------------------------------------------------------------------
@@ -178,8 +190,10 @@ tests:
                 RESOLVES on its own once the breaker opens — fallback stops
                 producing aphelion_unreachable outcomes — so resolution here does
                 NOT mean the breaker re-armed.
-                CircuitBreakerTripped is the signal for the trip itself (and per
-                #102 that alert's metric is itself never-on-the-wire).
+                CircuitBreakerTripped is the signal for the trip itself; since #102
+                put its counter on the wire, that alert fires too. It clears ~10m
+                after the trip when the increment ages out of its window, so
+                neither alert going quiet means the breaker re-armed.
                 Runbook: docs/m3-runbooks/observability-cookbook.md §5.
     promql_expr_test:
       # Pin the premise: a natural-only selector really would have missed this.
@@ -293,8 +307,10 @@ tests:
                 RESOLVES on its own once the breaker opens — fallback stops
                 producing aphelion_unreachable outcomes — so resolution here does
                 NOT mean the breaker re-armed.
-                CircuitBreakerTripped is the signal for the trip itself (and per
-                #102 that alert's metric is itself never-on-the-wire).
+                CircuitBreakerTripped is the signal for the trip itself; since #102
+                put its counter on the wire, that alert fires too. It clears ~10m
+                after the trip when the increment ages out of its window, so
+                neither alert going quiet means the breaker re-armed.
                 Runbook: docs/m3-runbooks/observability-cookbook.md §5.
     promql_expr_test:
       # Pin the premise, so the case cannot silently stop testing what it says:
@@ -363,8 +379,10 @@ tests:
                 RESOLVES on its own once the breaker opens — fallback stops
                 producing aphelion_unreachable outcomes — so resolution here does
                 NOT mean the breaker re-armed.
-                CircuitBreakerTripped is the signal for the trip itself (and per
-                #102 that alert's metric is itself never-on-the-wire).
+                CircuitBreakerTripped is the signal for the trip itself; since #102
+                put its counter on the wire, that alert fires too. It clears ~10m
+                after the trip when the increment ages out of its window, so
+                neither alert going quiet means the breaker re-armed.
                 Runbook: docs/m3-runbooks/observability-cookbook.md §5.
     promql_expr_test:
       # Pin the premise: counting `skipped` really would have hidden this.
@@ -433,6 +451,372 @@ tests:
                 RESOLVES on its own once the breaker opens — fallback stops
                 producing aphelion_unreachable outcomes — so resolution here does
                 NOT mean the breaker re-armed.
-                CircuitBreakerTripped is the signal for the trip itself (and per
-                #102 that alert's metric is itself never-on-the-wire).
+                CircuitBreakerTripped is the signal for the trip itself; since #102
+                put its counter on the wire, that alert fires too. It clears ~10m
+                after the trip when the increment ages out of its window, so
+                neither alert going quiet means the breaker re-armed.
                 Runbook: docs/m3-runbooks/observability-cookbook.md §5.
+
+  # ===========================================================================
+  # #102 — CircuitBreakerTripped and DrainTimeoutDetected.
+  #
+  # Both are severity: critical, and until #102 wired their counters onto
+  # /metrics neither could ever fire — they evaluated against no-data forever.
+  # Neither EXPRESSION was wrong, which is why nothing caught it for three
+  # releases: a syntax check passes happily on a rule that selects a metric
+  # nobody emits. These cases assert the alerts against synthetic series shaped
+  # like the real exposition, so they fail if the exposition regresses OR if a
+  # guard clause in the expression is loosened.
+  #
+  # LABEL PARITY WITH THE REAL EXPOSITION. Every series below carries job and
+  # instance and NOTHING ELSE. That is derived, not guessed: both counters are
+  # constructed with no labelnames (circuit_breaker.py:61, lifespan.py:50), and
+  # tests/server/test_metrics_never_on_wire_102.py
+  # ::test_series_carry_no_labels_beyond_scrape_identity scrapes the live
+  # endpoint and asserts the label block is empty — leaving job/instance, which
+  # Prometheus attaches at scrape time and no exporter can see, as the only
+  # labels a real sample can carry. If someone adds a label to either counter,
+  # that test fails first and points here.
+  # ===========================================================================
+
+  # -------------------------------------------------------------------------
+  # 9. FIRES on a trip. The counter sits at 0 for 20m, then steps to 1.
+  #    Evaluated 7m after the step, so the step is inside [10m] but OUTSIDE a
+  #    hypothetical narrower window: mutate the range to [5m] and this stops
+  #    firing. Pins the lower bound of the window.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: circuit breaker trip fires within the 10m window
+    input_series:
+      - series: 'parallax_circuit_breaker_tripped_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x20 1+0x20'
+    alert_rule_test:
+      - eval_time: 28m
+        alertname: CircuitBreakerTripped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+            exp_annotations:
+              summary: Dual-read circuit breaker tripped
+              description: |
+                The dual-read circuit breaker has tripped within the last 10 minutes.
+                Investigate Aphelion availability and run POST /admin/circuit_breaker/reset
+                once the underlying issue is resolved.
+
+  # -------------------------------------------------------------------------
+  # 10. SILENT when the breaker has never tripped. increase() over a flat-zero
+  #     counter is 0, and 0 > 0 is false. Mutate the comparison to >= 0 and
+  #     this fires on every healthy replica forever — the mutant this case
+  #     exists to kill.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: circuit breaker silent when never tripped
+    input_series:
+      - series: 'parallax_circuit_breaker_tripped_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CircuitBreakerTripped
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 11. SILENT once the trip has aged out of the window. Same series as case 9,
+  #     evaluated 20m after the step. Kills TWO mutants at once:
+  #       * widening the range ([30m], [1h]) — the step re-enters the window
+  #         and this fires;
+  #       * dropping increase() for a level test
+  #         (parallax_circuit_breaker_tripped_total > 0) — a monotonic counter
+  #         never returns to 0, so that fires forever after the first trip and
+  #         the alert becomes permanent noise nobody can clear. reset()
+  #         deliberately does NOT decrement the counter (circuit_breaker.py
+  #         reset() docstring), so this is a real mutant, not a theoretical one.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: circuit breaker silent once the trip ages out of the window
+    input_series:
+      - series: 'parallax_circuit_breaker_tripped_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x20 1+0x20'
+    alert_rule_test:
+      - eval_time: 41m
+        alertname: CircuitBreakerTripped
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 12. THE EXPOSITION CONTRACT, stated as an alert test.
+  #
+  #     Here the counter is ABSENT until its first increment and then springs
+  #     into existence already at 1.0 — exactly what "absent-not-zero", applied
+  #     to this counter by analogy with the DoD gauges, would produce.
+  #
+  #     The alert NEVER FIRES. Every sample in the window is 1.0, so increase()
+  #     reports 0 and the trip reads as "measured, and healthy". The breaker is
+  #     manual-reset, so there is no second edge coming to save it either: the
+  #     replica sits degraded to canonical-only and nothing pages.
+  #
+  #     This is why /metrics exports these counters FROM ZERO rather than on
+  #     first observation (parallax/server/routes/metrics.py, the #102 block at
+  #     the bottom of _build_payload). Change that and case 9 keeps passing
+  #     while production goes silent — this case is the one that notices.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: absent-until-first-increment counter cannot fire the trip alert
+    input_series:
+      - series: 'parallax_circuit_breaker_tripped_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '_x20 1+0x20'
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: CircuitBreakerTripped
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: CircuitBreakerTripped
+        exp_alerts: []
+      - eval_time: 28m
+        alertname: CircuitBreakerTripped
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CircuitBreakerTripped
+        exp_alerts: []
+    promql_expr_test:
+      # Not no-data — a flat, confident zero. That is what makes it dangerous.
+      - expr: increase(parallax_circuit_breaker_tripped_total[10m])
+        eval_time: 25m
+        exp_samples:
+          - labels: '{instance="10.0.0.1:8765", job="parallax"}'
+            value: 0
+
+  # -------------------------------------------------------------------------
+  # 13. PER-INSTANCE. BreakerState is process-local (a singleton deque per
+  #     process), so one replica tripping says nothing about its peers. The
+  #     expression aggregates nothing, which is correct here — and must stay
+  #     that way. A sum() "tidy-up" would collapse both replicas into one
+  #     unlabelled alert that cannot name the instance an operator has to POST
+  #     the manual reset to.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: circuit breaker names the tripping replica and spares healthy peers
+    input_series:
+      - series: 'parallax_circuit_breaker_tripped_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x20 1+0x20'
+      - series: 'parallax_circuit_breaker_tripped_total{job="parallax",instance="10.0.0.2:8765"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - eval_time: 28m
+        alertname: CircuitBreakerTripped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+            exp_annotations:
+              summary: Dual-read circuit breaker tripped
+              description: |
+                The dual-read circuit breaker has tripped within the last 10 minutes.
+                Investigate Aphelion availability and run POST /admin/circuit_breaker/reset
+                once the underlying issue is resolved.
+
+  # -------------------------------------------------------------------------
+  # 14. A SECOND trip after an operator reset still fires. reset() clears the
+  #     breaker state but deliberately does NOT decrement the counter, so the
+  #     second trip is a 1 -> 2 step rather than a 0 -> 1 one. An expression
+  #     that only recognised the first edge would leave every subsequent
+  #     incident unpaged.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: circuit breaker fires again on a second trip after reset
+    input_series:
+      - series: 'parallax_circuit_breaker_tripped_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x20 1+0x20 2+0x20'
+    alert_rule_test:
+      - eval_time: 49m
+        alertname: CircuitBreakerTripped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+            exp_annotations:
+              summary: Dual-read circuit breaker tripped
+              description: |
+                The dual-read circuit breaker has tripped within the last 10 minutes.
+                Investigate Aphelion availability and run POST /admin/circuit_breaker/reset
+                once the underlying issue is resolved.
+
+  # -------------------------------------------------------------------------
+  # 15. DRAIN TIMEOUT FIRES within the 1h window. Counter steps at 61m,
+  #     evaluated at 90m — 29 minutes later, so the step is inside [1h] but far
+  #     outside the breaker's [10m]. Mutate the range down to [10m] and this
+  #     stops firing.
+  #
+  #     The wide window is not a copy-paste slip: the drain timeout increments
+  #     as the LAST act of a dying process, so the alert needs a window wide
+  #     enough that a scrape lands after the increment and the alert is still
+  #     firing when a human looks.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: drain timeout fires within the 1h window
+    input_series:
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x60 1+0x60'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: DrainTimeoutDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+            exp_annotations:
+              summary: Graceful drain timeout occurred
+              description: |
+                Lifespan drain handler hit the 15-minute timeout — in-flight requests
+                were force-cut. Investigate stuck connections or upstream blocks.
+                KNOWN LATENT (#102 review): the increment happens during lifespan
+                shutdown, after the listening socket has closed, so Prometheus
+                never scrapes the post-increment value and this alert is expected
+                to stay silent even on a real timeout. Its absence is NOT evidence
+                of a clean drain — grep the service log for
+                "parallax.lifespan: drain timeout after".
+
+  # -------------------------------------------------------------------------
+  # 16. SILENT when every drain completed cleanly. Kills the >= 0 mutant, as
+  #     case 10 does for the breaker.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: drain timeout silent when drains complete cleanly
+    input_series:
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x120'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 17. SILENT once the timeout has aged out of the 1h window. Kills the
+  #     window-widening mutant and the drop-increase()-for-a-level-test mutant,
+  #     as case 11 does for the breaker.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: drain timeout silent once the event ages out of the window
+    input_series:
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x60 1+0x60'
+    alert_rule_test:
+      - eval_time: 121m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 18. Drain-timeout half of the exposition contract — same demonstration as
+  #     case 12. Absent until the first timeout, and the CRITICAL alert stays
+  #     silent straight through it.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: absent-until-first-increment counter cannot fire the drain alert
+    input_series:
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '_x60 1+0x60'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+      - eval_time: 115m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+
+  # -------------------------------------------------------------------------
+  # 19. PER-INSTANCE, as case 13. A drain timeout on one replica must not be
+  #     diluted by peers that shut down cleanly, and the firing alert has to
+  #     name the replica whose connections were force-cut.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: drain timeout names the affected replica and spares healthy peers
+    input_series:
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x60 1+0x60'
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.2:8765"}'
+        values: '0+0x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: DrainTimeoutDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+            exp_annotations:
+              summary: Graceful drain timeout occurred
+              description: |
+                Lifespan drain handler hit the 15-minute timeout — in-flight requests
+                were force-cut. Investigate stuck connections or upstream blocks.
+                KNOWN LATENT (#102 review): the increment happens during lifespan
+                shutdown, after the listening socket has closed, so Prometheus
+                never scrapes the post-increment value and this alert is expected
+                to stay silent even on a real timeout. Its absence is NOT evidence
+                of a clean drain — grep the service log for
+                "parallax.lifespan: drain timeout after".
+
+  # -------------------------------------------------------------------------
+  # 20. THE PRODUCTION SHAPE — and it is SILENT. (#102 review P1-2.)
+  #
+  #     Cases 15 and 19 above prove the rule's LOGIC is right: given a series
+  #     that steps 0 -> 1 and keeps being scraped, the alert fires. Production
+  #     cannot produce that series, and this case is the honest model.
+  #
+  #     Measured on uvicorn 0.52.1 against a real server: during lifespan
+  #     shutdown -- where _drain_inflight runs and where drain_timeout_total is
+  #     incremented -- the listening socket is already closed. Scrapes from
+  #     inside that window returned ConnectTimeout, and a bare TCP connect to
+  #     the port timed out. The process then exits.
+  #
+  #     So what Prometheus actually records is: 0 for the whole life of the
+  #     process, then the target disappears. The increment is real and is
+  #     never exported. `_` here is exactly that -- no sample, because there is
+  #     no longer a server to scrape.
+  #
+  #     increase() over that sees no step, and DrainTimeoutDetected stays
+  #     silent through the very event it exists for. This case asserts that
+  #     silence so the gap is pinned in CI rather than described in a comment
+  #     someone may not read. It should start FAILING the day a durable
+  #     producer is added -- that is the signal the fix landed.
+  #
+  #     Note what this rules OUT: moving the increment earlier in the drain
+  #     does not help, because the entire drain runs inside the same
+  #     already-unserved window. A counter owned by the terminating exporter
+  #     cannot report its own termination.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: production shape (increment never scraped) leaves the alert silent
+    input_series:
+      # 0 for the life of the process, then the exporter is gone. The drain
+      # timeout increments somewhere in the gap and is never sampled.
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x60 _x60'
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+    promql_expr_test:
+      # A flat zero while the target was up, then nothing at all. Neither is a
+      # signal that a drain timed out.
+      - expr: increase(parallax_drain_timeout_total[1h])
+        eval_time: 55m
+        exp_samples:
+          - labels: '{instance="10.0.0.1:8765", job="parallax"}'
+            value: 0

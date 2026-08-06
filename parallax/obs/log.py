@@ -192,12 +192,42 @@ _MESSAGE_SAFE_EXC_TYPES: dict[str, tuple[str, frozenset[str]]] = {
 
 # The event name reaches the sink twice — as the record's ``msg`` and as its
 # ``event`` field — and on neither route does it pass through the extras
-# policy. So it gets its own: the dotted-snake vocabulary every call site in
-# this repo already uses (``secondary_unexpected_exception``,
-# ``dual_read_decision_log.append_failed``), and nothing else.
+# policy. So it gets its own check, and by membership rather than shape, for the
+# same reason the exception tags above do: a dotted-snake pattern accepts
+# ``sk_live_4eb2a91c8f`` exactly as readily as ``shadow_query_error``, so it
+# cannot tell a vocabulary from a secret that happens to look like one.
+#
+# This is the closed vocabulary — every event name emitted anywhere in
+# ``parallax/``. ``safe_log_warning`` is exported, so a caller outside these
+# call sites (or a future one inside them) gets the redaction path rather than a
+# free channel to stderr. Kept in step with the code by
+# ``test_event_name_enum_matches_the_call_sites``, which asserts both directions.
+_KNOWN_EVENT_NAMES = frozenset(
+    {
+        # parallax/router/dual_read.py
+        "breaker_is_tripped_check_failed",
+        "breaker_record_failed",
+        "conflict_event_write_failed",
+        "decision_log_append_failed",
+        "dual_read_override_missing_with_tripped_breaker",
+        "live_counter_record_failed",
+        "record_dual_read_outcome_failed",
+        "secondary_hits_equal_failed",
+        "secondary_unexpected_exception",
+        # parallax/router/dual_read_decision_log.py
+        "dual_read_decision_log.append_failed",
+        # parallax/router/shadow.py
+        "shadow_log_write_failed",
+        "shadow_query_error",
+    }
+)
+
+# Retained as a sanity rule on the vocabulary itself, not as the gate: every
+# member above must look like an event name, so a typo'd or pasted entry fails
+# review rather than silently widening what may be emitted.
 _EVENT_NAME_PATTERN = re.compile(r"^[a-z0-9_.]{1,64}$")
 
-#: Substituted for any event name that fails :data:`_EVENT_NAME_PATTERN`.
+#: Substituted for any event name outside :data:`_KNOWN_EVENT_NAMES`.
 UNSAFE_EVENT_NAME = "unsafe_event_name"
 
 
@@ -301,7 +331,7 @@ def sanitize_log_extras(extras: Mapping[str, object]) -> dict[str, object]:
 
 
 def _safe_event_name(event: object) -> tuple[str, dict[str, object]]:
-    """Constrain the event name to this module's dotted-snake vocabulary.
+    """Constrain the event name to :data:`_KNOWN_EVENT_NAMES`.
 
     Returns ``(name_to_emit, extra_fields)``.
 
@@ -311,12 +341,18 @@ def _safe_event_name(event: object) -> tuple[str, dict[str, object]]:
     straight around the whole guard, which is precisely the call-site
     dependence this module exists to remove.
 
+    Membership, not shape. A dotted-snake pattern accepts ``mysecrettoken123``
+    as readily as ``shadow_query_error``: it describes the *form* of a name and
+    a secret can wear that form. Only the closed vocabulary distinguishes them,
+    and since ``safe_log_warning`` is exported, "all current call sites pass
+    literals" is not a property that protects the next caller.
+
     Rejection does not cost the record. The emit becomes
     :data:`UNSAFE_EVENT_NAME` and the offending value survives as a digest
     under ``unsafe_event``, so the line stays findable, the miswiring is
     obvious to whoever reads the log, and the value itself never lands.
     """
-    if isinstance(event, str) and _EVENT_NAME_PATTERN.match(event):
+    if isinstance(event, str) and event in _KNOWN_EVENT_NAMES:
         return event, {}
     return UNSAFE_EVENT_NAME, {"unsafe_event": _redact(event)}
 
@@ -342,12 +378,12 @@ def safe_log_warning(
       gets it redacted here — the guard does not depend on call-site discipline,
       which is the property that makes it hold for call sites not yet written.
 
-    ``event`` is held to that same standard rather than trusted: it must match
-    the dotted-snake vocabulary (``^[a-z0-9_.]{1,64}$``), because it reaches the
-    sink as both ``msg`` and the ``event`` field without passing through the
-    extras policy. Anything else is emitted as :data:`UNSAFE_EVENT_NAME` with
-    the original reduced to a digest under ``unsafe_event`` — see
-    :func:`_safe_event_name`. Nothing is dropped; only the value is withheld.
+    ``event`` is held to that same standard rather than trusted: it must be a
+    member of :data:`_KNOWN_EVENT_NAMES`, because it reaches the sink as both
+    ``msg`` and the ``event`` field without passing through the extras policy.
+    Anything else is emitted as :data:`UNSAFE_EVENT_NAME` with the original
+    reduced to a digest under ``unsafe_event`` — see :func:`_safe_event_name`.
+    Nothing is dropped; only the value is withheld.
 
     Known trade, inherited from the shape this replaces: because the emit is
     swallowed, "no warnings in the log" is not evidence that no warnings

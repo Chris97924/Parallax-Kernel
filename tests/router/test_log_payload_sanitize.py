@@ -234,6 +234,58 @@ def test_shadow_query_error_does_not_log_payload(
     assert result.hits[0]["id"] == "id0"
 
 
+def test_shadow_injected_port_cannot_leak_through_the_allowlist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """REGRESSION (gate r1, driver-carried) — the reachable route, end to end.
+
+    ``dual_read`` classifies ``AphelionUnreachableError`` by tag without logging,
+    so it is not the vector. ``shadow.py`` is: bare ``except Exception`` with no
+    carve-out, fed by a factory-injected port. A port implemented outside this
+    repo can raise the allowlisted type with any reason it likes, and the AST
+    pin over ``parallax/`` cannot see that raise site.
+    """
+    from parallax.router.aphelion_adapter import AphelionUnreachableError
+
+    monkeypatch.setenv("SHADOW_MODE", "true")
+    monkeypatch.setenv("SHADOW_USER_ALLOWLIST", "u1")
+    monkeypatch.setenv("SHADOW_LOG_DIR", str(tmp_path))
+
+    class _ExternalPort:
+        """Stands in for an implementation this repo does not own."""
+
+        def query(self, request: QueryRequest) -> RetrievalEvidence:
+            raise AphelionUnreachableError(f"lookup failed for {NEEDLE}")
+
+    interceptor = ShadowInterceptor(
+        canonical=_StubPort(_evidence("id0")),
+        shadow_factory=lambda: _ExternalPort(),
+    )
+    with _CaptureLog("parallax.router.shadow") as cap:
+        result = interceptor.query(_request())
+
+    assert NEEDLE not in cap.raw, f"injected port leaked through the allowlist: {cap.raw!r}"
+    record = cap.event("shadow_query_error")
+    assert record["exc_class"] == "AphelionUnreachableError"
+    assert "exc_tag" not in record, "a non-enum reason is not a tag"
+    assert record["exc_digest"]
+
+    # A legitimate tag from the same injected port still reads normally.
+    class _WellBehavedPort:
+        def query(self, request: QueryRequest) -> RetrievalEvidence:
+            raise AphelionUnreachableError("timeout")
+
+    interceptor_ok = ShadowInterceptor(
+        canonical=_StubPort(_evidence("id0")),
+        shadow_factory=lambda: _WellBehavedPort(),
+    )
+    with _CaptureLog("parallax.router.shadow") as cap_ok:
+        interceptor_ok.query(_request())
+    assert cap_ok.event("shadow_query_error")["exc_tag"] == "timeout"
+
+    assert result.hits[0]["id"] == "id0"
+
+
 def test_shadow_log_write_failure_does_not_log_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

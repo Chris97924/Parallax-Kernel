@@ -121,22 +121,29 @@ _SAFE_STR_KEYS = frozenset(
 # the decision explicitly instead of leaving it implicit in the allowlist above.
 _IDENTIFIER_STR_KEYS = frozenset({"user_id"})
 
-# Exception types whose ``str()`` is provably value-free, referenced by dotted
-# name so ``parallax.obs`` keeps no dependency on ``parallax.router``. Matching
-# is on the EXACT type: a subclass may override ``__init__`` and put anything in
-# the message, so it does not inherit the allowance.
+# Exception types carrying an enum-like tag that may be emitted, mapped to the
+# attribute holding it. Referenced by dotted name so ``parallax.obs`` keeps no
+# dependency on ``parallax.router``. Matching is on the EXACT type: a subclass
+# may override ``__init__``, so it does not inherit the allowance.
 #
-# Adding an entry is a security decision — the type's message must be built from
-# a fixed template plus bounded, enum-like data:
+#   * ``AphelionUnreachableError`` carries ``reason``, which
+#     ``m5-entry-spec.md`` §3.1a ("Error reason sanitisation") binds to an enum
+#     — never a response body, URL or token.
 #
-#   * ``AphelionUnreachableError`` builds ``f"Aphelion unreachable: {reason}"``
-#     from its own tag, and ``m5-entry-spec.md`` §3.1a ("Error reason
-#     sanitisation") binds ``reason`` to an enum, never a response body or URL.
-_MESSAGE_SAFE_EXC_TYPES = frozenset(
-    {
-        "parallax.router.aphelion_adapter.AphelionUnreachableError",
-    }
-)
+# Only the tag is emitted, never ``str(exc)``. The exception is raisable by an
+# injected ``QueryPort`` implemented outside this repo, so neither the message
+# template nor the tag's contents can be assumed: ``shadow.py``'s bare-``except
+# Exception`` handler will hand us whatever that implementation constructed.
+# The tag is therefore validated on the way out, and a tag that does not look
+# like an enum member falls back to the digest like any other exception.
+_MESSAGE_SAFE_EXC_TYPES = {
+    "parallax.router.aphelion_adapter.AphelionUnreachableError": "reason",
+}
+
+#: Shape an allowlisted exception's tag must have to be emitted verbatim.
+#: Covers every tag in the documented vocabulary (``timeout``, ``http_5xx``,
+#: ``claim_schema_error``, ``envelope_checksum_mismatch``, …).
+_SAFE_TAG_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
 
 # The event name reaches the sink twice — as the record's ``msg`` and as its
 # ``event`` field — and on neither route does it pass through the extras
@@ -183,10 +190,18 @@ def _type_name(obj_type: type) -> str:
 def exc_fields(exc: BaseException) -> dict[str, object]:
     """Value-free description of an exception, safe to emit to a log sink.
 
-    Always yields ``exc_class``. The message is rendered as ``exc_str`` only for
-    the exact types in :data:`_MESSAGE_SAFE_EXC_TYPES`; for everything else it is
-    replaced by a ``sha256`` digest plus a length, so repeated identical failures
-    stay correlatable and greppable without their content reaching stderr.
+    Always yields ``exc_class``. For the exact types in
+    :data:`_MESSAGE_SAFE_EXC_TYPES` whose tag passes :data:`_SAFE_TAG_PATTERN`,
+    yields that validated tag as ``exc_tag``. Everything else — including an
+    allowlisted type carrying a tag that does not look like an enum member —
+    yields a ``sha256`` digest plus a length, so repeated identical failures stay
+    correlatable and greppable without their content reaching stderr.
+
+    ``str(exc)`` is never emitted, not even for allowlisted types. The allowlist
+    describes the *tag*, not the message: the exception is raisable by an
+    injected port implemented outside this repo, so the message template is not
+    ours to assume and neither is ``args``. Emitting only the validated
+    attribute makes the guarantee independent of both.
 
     Dropping the traceback is *not* sanitisation, which is the premise the old
     call sites got wrong: a traceback leaks frame locals, but ``str(exc)`` is
@@ -200,12 +215,15 @@ def exc_fields(exc: BaseException) -> dict[str, object]:
     # Bare name, not the dotted one: this is what the call sites emitted before
     # and what existing log consumers grep for.
     fields: dict[str, object] = {"exc_class": exc_type.__name__}
+    tag_attr = _MESSAGE_SAFE_EXC_TYPES.get(_type_name(exc_type))
+    if tag_attr is not None:
+        tag = getattr(exc, tag_attr, None)
+        if isinstance(tag, str) and _SAFE_TAG_PATTERN.match(tag):
+            fields["exc_tag"] = tag
+            return fields
     message = _render(exc)
-    if _type_name(exc_type) in _MESSAGE_SAFE_EXC_TYPES:
-        fields["exc_str"] = message[:_MAX_SAFE_STR_LEN]
-    else:
-        fields["exc_digest"] = _digest(message)
-        fields["exc_len"] = len(message)
+    fields["exc_digest"] = _digest(message)
+    fields["exc_len"] = len(message)
     return fields
 
 

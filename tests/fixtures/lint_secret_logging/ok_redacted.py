@@ -40,6 +40,13 @@ def emit_redacted(token: str, headers: dict[str, str], url: str) -> None:
     _log.info("aphelion.auth", extra={"auth": "bearer" if token else "none"})
     _log.debug("aphelion.auth", extra={"configured": token != "", "missing": not token})
 
+    # A credential-*labelled* slot is legal when what fills it is bounded. The
+    # label says "a secret belongs here"; these say "and it was handled".
+    _log.info("aphelion.request", extra={"Authorization": "<REDACTED>"})
+    _log.info("aphelion.request", extra={"authorization": token_hash})
+    _log.debug("aphelion.request", extra={"bearer_token": bool(token)})
+    audit_log.write(event="aphelion.read", authorization="<REDACTED>")
+
     # Non-credential values are untouched by the rule.
     _log.info("aphelion.request", extra={"url": url, "header_count": len(headers)})
 

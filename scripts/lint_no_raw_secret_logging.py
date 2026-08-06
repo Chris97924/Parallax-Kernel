@@ -166,31 +166,103 @@ def _secret_subexpressions(node: ast.AST) -> list[str]:
     return found
 
 
+def _is_bounded_value(node: ast.AST) -> bool:
+    """True when this expression provably cannot carry a credential.
+
+    Used only to decide whether a value sitting under a *credential-named label*
+    is acceptable. The label already says "this slot holds a secret", so the bar
+    is that the expression is a literal placeholder, a one-way reduction, a
+    boolean, or an explicitly derived identifier.
+    """
+    if isinstance(node, ast.Constant):
+        # A placeholder such as "<REDACTED>", or a number. An inlined literal
+        # credential in source is the secret-scanner's job, not this rule's.
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return node.func.id in _REDUCING_CALLS
+    if isinstance(node, ast.Compare) or (
+        isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not)
+    ):
+        return True
+    if isinstance(node, ast.IfExp):
+        return _is_bounded_value(node.body) and _is_bounded_value(node.orelse)
+    if isinstance(node, ast.Name | ast.Attribute | ast.Subscript):
+        rendered = _render(node)
+        # `authorization=token_hash` is the mitigation; `authorization=value` is
+        # the flow the spec rule exists to stop.
+        return bool(rendered) and bool(_SAFE_SUFFIX_PATTERN.search(rendered.split(".")[-1]))
+    return False
+
+
+def _labelled_entries(call: ast.Call) -> list[tuple[str, ast.AST]]:
+    """``(label, value)`` pairs where a caller names the slot it is filling.
+
+    Two shapes, both of which put the credential's *name* somewhere the
+    expression walker cannot see it — the whole point of this finding:
+
+    * ``logger.info("req", extra={"Authorization": value})`` — the label is a
+      mapping key, the value an unmarked local.
+    * ``audit_log.write(authorization=value)`` — the label is a keyword name.
+
+    Dict literals are collected recursively so a nested ``extra={"h": {...}}``
+    is covered. Standalone string literals are deliberately NOT collected: log
+    prose mentioning a bearer token is not a leak.
+    """
+    entries: list[tuple[str, ast.AST]] = [(kw.arg, kw.value) for kw in call.keywords if kw.arg]
+    for argument in [*call.args, *(kw.value for kw in call.keywords)]:
+        for node in ast.walk(argument):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, value in zip(node.keys, node.values, strict=True):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    entries.append((key.value, value))
+    return entries
+
+
 class _Checker(ast.NodeVisitor):
     def __init__(self, path: Path, source_lines: list[str]) -> None:
         self.path = path
         self.lines = source_lines
         self.violations: list[tuple[int, int, str]] = []
 
+    def _record(self, node: ast.AST, fallback: ast.Call, detail: str, seen: set[str]) -> None:
+        line = getattr(node, "lineno", fallback.lineno)
+        if SUPPRESSION in self.lines[line - 1] or detail in seen:
+            return
+        seen.add(detail)
+        self.violations.append(
+            (line, getattr(node, "col_offset", fallback.col_offset) + 1, detail)
+        )
+
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802 — ast.NodeVisitor API
         sink = _is_sink(node)
         if sink is not None:
+            seen: set[str] = set()
+            # (a) the expression itself names a credential.
             arguments: list[ast.AST] = list(node.args)
             arguments += [kw.value for kw in node.keywords]
-            seen: set[str] = set()
             for argument in arguments:
                 for rendered in _secret_subexpressions(argument):
-                    line = getattr(argument, "lineno", node.lineno)
-                    if SUPPRESSION in self.lines[line - 1] or rendered in seen:
-                        continue
-                    seen.add(rendered)
-                    self.violations.append(
-                        (
-                            line,
-                            getattr(argument, "col_offset", node.col_offset) + 1,
-                            f"raw credential {rendered!r} passed to {sink}",
-                        )
+                    self._record(
+                        argument, node, f"raw credential {rendered!r} passed to {sink}", seen
                     )
+            # (b) the expression is anonymous but the *label* names a credential
+            # — `extra={"Authorization": value}` is the exact raw-header flow the
+            # spec rule prohibits, and (a) cannot see it.
+            for label, value in _labelled_entries(node):
+                if not _is_raw_credential(label) or _is_bounded_value(value):
+                    continue
+                if _secret_subexpressions(value):
+                    # The value already names itself, so (a) reported it.
+                    # Reporting one leak twice under two rules is noise.
+                    continue
+                self._record(
+                    value,
+                    node,
+                    f"credential-labelled entry {label!r} carries "
+                    f"{_render(value)!r} into {sink}",
+                    seen,
+                )
         self.generic_visit(node)
 
 
@@ -218,12 +290,20 @@ def iter_python_files(targets: list[Path]) -> list[Path]:
     return files
 
 
+#: Scanned when the CLI is invoked with no arguments.
+DEFAULT_TARGETS = [Path("parallax")]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("paths", nargs="*", default=["parallax"], type=Path)
+    # The default must already hold ``Path`` objects: argparse applies ``type``
+    # to command-line strings only, never to a list default, so a plain
+    # ``["parallax"]`` reaches ``iter_python_files`` as ``str`` and dies on
+    # ``.is_file()`` — i.e. the documented no-argument invocation crashed.
+    parser.add_argument("paths", nargs="*", default=DEFAULT_TARGETS, type=Path)
     args = parser.parse_args(argv)
 
-    targets = args.paths or [Path("parallax")]
+    targets: list[Path] = args.paths or DEFAULT_TARGETS
     violations: list[str] = []
     for path in iter_python_files(list(targets)):
         violations.extend(check_file(path))

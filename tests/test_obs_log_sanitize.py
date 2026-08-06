@@ -182,16 +182,73 @@ def test_lc10_filesystem_path_is_not_emitted() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_allowlisted_exception_type_still_renders_its_message() -> None:
-    """``AphelionUnreachableError`` builds its message from a fixed template plus
-    an enum-like tag, so the tag stays readable — the allowlist is not a
-    blanket ban that would cost operators the one message they need."""
+def test_allowlisted_exception_type_emits_its_validated_tag() -> None:
+    """``AphelionUnreachableError`` carries an enum-like tag, so the tag stays
+    readable — the allowlist is not a blanket ban that would cost operators the
+    one signal they need. Only the tag is emitted, never ``str(exc)``."""
     raw, payload = _emit(
         "parallax.test.allow", "allow", exc=AphelionUnreachableError("claim_schema_error")
     )
-    assert payload["exc_str"] == "Aphelion unreachable: claim_schema_error"
+    assert payload["exc_tag"] == "claim_schema_error"
+    assert "exc_str" not in payload, "the message itself must never be rendered"
     assert "exc_digest" not in payload
     assert "<redacted:" not in raw
+
+
+def test_allowlisted_type_with_a_dynamic_tag_falls_back_to_digest() -> None:
+    """REGRESSION (gate r1, driver-carried): the allowlist rested on every
+    ``AphelionUnreachableError`` raise site being in this repo with a literal
+    tag. It is not — the exception is raisable by an injected ``QueryPort``
+    implemented anywhere, and ``shadow.py``'s bare ``except Exception`` hands
+    whatever it constructed straight to the logger. The AST pin cannot see
+    those raise sites, so the tag is validated at runtime instead.
+    """
+    exc = AphelionUnreachableError(f"lookup failed for {NEEDLE}")
+    assert NEEDLE in str(exc), "premise check: the dynamic reason is in the message"
+    raw, payload = _emit("parallax.test.allow_bad", "allow_bad", exc=exc)
+    assert NEEDLE not in raw, f"dynamic tag reached the log record: {raw!r}"
+    assert "exc_tag" not in payload
+    _assert_scrubbed(raw, payload)
+
+
+@pytest.mark.parametrize(
+    ("label", "reason"),
+    [
+        ("uppercase", "Timeout"),
+        ("whitespace", "connection refused"),
+        ("punctuation", "http_5xx: https://aphelion.internal/v1"),
+        ("too_long", "e" * 65),
+        ("empty", ""),
+        ("non_str", 42),
+    ],
+)
+def test_only_enum_shaped_tags_are_emitted(label: str, reason: object) -> None:
+    """The tag vocabulary is documented as enum-like; anything outside that
+    shape is not a tag and is treated as unbounded content."""
+    exc = AphelionUnreachableError("placeholder")
+    exc.reason = reason  # type: ignore[assignment]
+    _, payload = _emit("parallax.test.tagshape", "tagshape", exc=exc)
+    assert "exc_tag" not in payload, label
+    assert payload["exc_digest"], label
+
+
+def test_documented_tag_vocabulary_still_passes() -> None:
+    """The validator must not have broken the real tags — every reason the
+    adapter documents has to keep rendering, or operators lose the breaker
+    signal the allowlist exists to preserve."""
+    for reason in (
+        "timeout",
+        "connection_error",
+        "claim_loader_error",
+        "claim_schema_error",
+        "envelope_checksum_mismatch",
+        "audit_db_write_failed",
+        "unsafe_archive",
+        "http_5xx",
+        "package_dir_inaccessible",
+    ):
+        _, payload = _emit("parallax.test.tagok", "tagok", exc=AphelionUnreachableError(reason))
+        assert payload["exc_tag"] == reason
 
 
 def test_allowlist_does_not_extend_to_subclasses() -> None:
@@ -388,14 +445,17 @@ def test_every_call_site_passes_a_literal_event() -> None:
 
 
 def test_allowlisted_exception_reasons_stay_literals() -> None:
-    """Guard the one assumption the allowlist rests on.
+    """Keep in-repo raise sites honest — defence in depth, not the guard.
 
-    ``AphelionUnreachableError`` is allowed to render its message because its
-    ``reason`` is an enum-like tag. That is a property of the *raise sites*, not
-    of the class — an ``AphelionUnreachableError(f"failed on {user_query}")``
-    added later would leak through the allowlist silently. So assert every raise
-    site in the tree passes a string literal or a classifier call (which returns
-    from a closed set of literals), and nothing interpolated.
+    This test used to be the allowlist's only protection, and that was wrong:
+    it can only see ``parallax/``, while the exception is raisable by an
+    injected port implemented anywhere, and ``shadow.py`` logs whatever such a
+    port throws. ``exc_fields`` now validates the tag at runtime, which is the
+    real guarantee (see ``test_allowlisted_type_with_a_dynamic_tag_falls_back_to_digest``).
+
+    What this still buys: an in-repo ``AphelionUnreachableError(f"...{user_q}")``
+    fails here, at the line someone writes it, instead of silently degrading to
+    a digest and losing the operator-facing tag.
     """
     import ast
     from pathlib import Path

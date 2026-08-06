@@ -76,3 +76,15 @@ def leak_masked_by_safe_suffix(cfg: _Config) -> None:
     # launder the raw one beside it. `_hash` is genuinely safe; `.raw_token`
     # is genuinely not, and it is the one that gets logged.
     _log.info("aphelion.auth", extra={"t": cfg.token_hash.raw_token})
+
+
+def leak_labelled_mapping_entry(value: str) -> None:
+    # 10 — gate r1 P1: the expression is anonymous, but the LABEL names the
+    # credential. This is the exact raw-Authorization flow §3.1a prohibits, and
+    # expression-name matching alone cannot see it.
+    _log.info("request", extra={"Authorization": value})
+
+
+def leak_labelled_keyword(value: str) -> None:
+    # 11 — same shape via a keyword name rather than a mapping key.
+    audit_log.write(event="aphelion.read", authorization=value)

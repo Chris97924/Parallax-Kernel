@@ -64,3 +64,15 @@ def leak_audit_write(auth_header: str) -> None:
 def leak_nested(secret_value: str) -> None:
     # 8 — buried in a nested literal.
     _log.warning("cfg", extra={"outer": {"inner": [secret_value]}})
+
+
+class _Config:
+    token_hash: _Config
+    raw_token: str
+
+
+def leak_masked_by_safe_suffix(cfg: _Config) -> None:
+    # 9 — W6 Tier-B: a derived value earlier in the dotted chain must not
+    # launder the raw one beside it. `_hash` is genuinely safe; `.raw_token`
+    # is genuinely not, and it is the one that gets logged.
+    _log.info("aphelion.auth", extra={"t": cfg.token_hash.raw_token})

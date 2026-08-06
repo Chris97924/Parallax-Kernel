@@ -46,13 +46,23 @@ _SECRET_PATTERN = re.compile(
     r"|secret|password|passwd|credential)"
 )
 
-# ...except when the fragment is provably a non-secret derived value. A hash or
-# a redacted placeholder is the mitigation this rule exists to encourage, so
+# ...except when the identifier is provably a non-secret derived value. A hash
+# or a redacted placeholder is the mitigation this rule exists to encourage, so
 # flagging it would push authors the wrong way.
+#
+# Applied per *identifier*, never to the whole rendered expression. Testing the
+# whole render inverts the rule: in `cfg.token_hash.raw_token` the safe `_hash`
+# fragment would suppress the raw `.raw_token` sitting right beside it, so one
+# derived value anywhere in a dotted chain would launder every credential in it.
 _SAFE_SUFFIX_PATTERN = re.compile(
     r"(?i)(_hash|_digest|_sha256|_fingerprint|_redacted|_present|_configured"
-    r"|_env|_name|_len|_length|_count|_expiry|_expires_at)\b"
+    r"|_env|_name|_len|_length|_count|_expiry|_expires_at)$"
 )
+
+# Identifier-ish words inside a rendered expression. Subscript string literals
+# are included by construction: `self.headers['Authorization']` renders with the
+# quoted text, so `Authorization` is one of the words this finds.
+_WORD_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 _REDUCING_CALLS = frozenset({"len", "bool"})
 
@@ -86,6 +96,21 @@ def _is_sink(call: ast.Call) -> str | None:
         if func.attr == "write" and "audit_log" in receiver.lower():
             return f"{receiver}.write()"
     return None
+
+
+def _is_raw_credential(rendered: str) -> bool:
+    """True when any single identifier in ``rendered`` names an undisguised secret.
+
+    Word-by-word, deliberately. The suppression list describes *one identifier*
+    being a derived value, so applying it to the whole expression would let a
+    single safe word launder its neighbours — ``cfg.token_hash.raw_token`` is
+    the shape that motivated this: the ``_hash`` suffix is real, and the raw
+    token beside it is real too, and only the second one matters here.
+    """
+    for word in _WORD_PATTERN.findall(rendered):
+        if _SECRET_PATTERN.search(word) and not _SAFE_SUFFIX_PATTERN.search(word):
+            return True
+    return False
 
 
 def _secret_subexpressions(node: ast.AST) -> list[str]:
@@ -129,9 +154,8 @@ def _secret_subexpressions(node: ast.AST) -> list[str]:
             return
         if isinstance(current, ast.Name | ast.Attribute | ast.Subscript):
             rendered = _render(current)
-            if rendered and _SECRET_PATTERN.search(rendered):
-                if not _SAFE_SUFFIX_PATTERN.search(rendered):
-                    found.append(rendered)
+            if rendered and _is_raw_credential(rendered):
+                found.append(rendered)
             # ``ast.unparse`` of an attribute/subscript already includes every
             # component, so its children cannot hold a match this missed.
             return

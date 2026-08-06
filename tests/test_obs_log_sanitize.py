@@ -260,6 +260,133 @@ def test_unrenderable_value_does_not_lose_the_log_line() -> None:
     assert str(payload["thing"]).startswith("<redacted:")
 
 
+# ---------------------------------------------------------------------------
+# Event-name validation (W6 Tier-A: the event string bypassed the sanitiser)
+# ---------------------------------------------------------------------------
+
+
+def test_legal_event_name_passes_through_unchanged() -> None:
+    """The vocabulary every existing call site already uses must stay untouched,
+    including the dotted form — a validator that broke those would just get
+    reverted."""
+    for event in ("secondary_unexpected_exception", "dual_read_decision_log.append_failed"):
+        raw, payload = _emit("parallax.test.evt_ok", event)
+        assert payload["event"] == event
+        assert payload["msg"] == event
+        assert "unsafe_event" not in raw
+
+
+def test_dynamic_event_name_is_digested_not_emitted() -> None:
+    """REGRESSION (W6 Tier-A): ``event`` reaches the record on two routes —
+    ``msg`` and the ``event`` field — and neither passed through the extras
+    policy. A caller interpolating user content into it bypassed the whole
+    guard, contradicting this module's stated no-call-site-discipline property.
+    """
+    raw, payload = _emit("parallax.test.evt_bad", f"query failed: {NEEDLE}")
+    assert NEEDLE not in raw, f"event name reached the log record: {raw!r}"
+    # Both routes are covered, not just the field.
+    assert payload["event"] == "unsafe_event_name"
+    assert payload["msg"] == "unsafe_event_name"
+    # The line stays findable and the miswiring stays visible.
+    assert str(payload["unsafe_event"]).startswith("<redacted:")
+
+
+@pytest.mark.parametrize(
+    ("label", "event"),
+    [
+        ("uppercase", "Secondary_Unexpected"),
+        ("whitespace", "secondary unexpected"),
+        ("too_long", "e" * 65),
+        ("empty", ""),
+        ("punctuation", "failed: 'key'"),
+        ("newline_injection", "ok_event\nlevel=CRITICAL forged=1"),
+        ("non_str", 12345),
+    ],
+)
+def test_illegal_event_names_are_rejected_without_losing_the_record(
+    label: str, event: object
+) -> None:
+    """Rejection must never cost the log line — dropping it would trade a leak
+    for a blind spot — and a non-``str`` must not raise inside the swallowing
+    wrapper either, since a raise there loses the record silently.
+
+    ``_emit`` asserts exactly one record came out, so the "not lost" half is
+    covered there. Newline injection is included because ``msg`` lands in a
+    line-oriented sink; it is doubly contained (rejected here, and JSON-escaped
+    by the formatter even if it were not).
+    """
+    raw, payload = _emit("parallax.test.evt_reject", event)  # type: ignore[arg-type]
+    assert payload["event"] == "unsafe_event_name", label
+    assert payload["msg"] == "unsafe_event_name", label
+    assert str(payload["unsafe_event"]).startswith("<redacted:"), label
+    rendered = str(event)
+    if rendered:  # the empty-string case has nothing to look for
+        assert rendered not in raw, f"[{label}] illegal event name reached the record"
+
+
+def test_event_name_digest_is_stable() -> None:
+    """Two occurrences of the same miswiring group together, so an operator can
+    tell one bad call site from many."""
+    _, first = _emit("parallax.test.evt_d1", f"boom {NEEDLE}")
+    _, second = _emit("parallax.test.evt_d2", f"boom {NEEDLE}")
+    _, other = _emit("parallax.test.evt_d3", "boom something-else")
+    assert first["unsafe_event"] == second["unsafe_event"]
+    assert first["unsafe_event"] != other["unsafe_event"]
+
+
+def test_every_call_site_passes_a_literal_event() -> None:
+    """Pin 'all call sites use constants' as a property rather than a claim.
+
+    The runtime validator above is the real guard; this makes the *obvious*
+    leak shape — an f-string or a concatenation as the event name — fail in CI
+    at the point someone writes it, with the offending file and line named.
+
+    A bare parameter name is allowed: ``dual_read._safe_log_warning`` forwards
+    its own ``event`` argument, and that wrapper is the reason the module-local
+    binding exists at all.
+    """
+    import ast
+    from pathlib import Path
+
+    # Index of the event argument in each helper's positional signature.
+    event_arg_index = {"safe_log_warning": 1, "_safe_log_warning": 0}
+    repo_root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+
+    def visit(node: ast.AST, params: frozenset[str], path: Path) -> None:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            spec = node.args
+            names = {a.arg for a in (*spec.posonlyargs, *spec.args, *spec.kwonlyargs)}
+            if spec.vararg:
+                names.add(spec.vararg.arg)
+            if spec.kwarg:
+                names.add(spec.kwarg.arg)
+            params = frozenset(names)
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            index = event_arg_index.get(name)
+            if index is not None and len(node.args) > index:
+                argument = node.args[index]
+                literal = isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                forwarded = isinstance(argument, ast.Name) and argument.id in params
+                if not (literal or forwarded):
+                    offenders.append(
+                        f"{path.relative_to(repo_root)}:{node.lineno}: "
+                        f"{name}(... {ast.unparse(argument)} ...)"
+                    )
+        for child in ast.iter_child_nodes(node):
+            visit(child, params, path)
+
+    for path in sorted((repo_root / "parallax").rglob("*.py")):
+        visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)), frozenset(), path)
+
+    assert offenders == [], (
+        "event names must be string literals (or a forwarded parameter); these are built:\n"
+        + "\n".join(offenders)
+    )
+
+
 def test_allowlisted_exception_reasons_stay_literals() -> None:
     """Guard the one assumption the allowlist rests on.
 

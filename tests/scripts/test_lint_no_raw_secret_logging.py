@@ -45,7 +45,7 @@ def test_positive_fixture_passes() -> None:
 def test_violating_fixture_is_blocked() -> None:
     """Every credential route in the negative fixture is caught."""
     violations = lint.check_file(_FIXTURES / "bad_authorization.py")
-    assert len(violations) == 8, "\n".join(violations)
+    assert len(violations) == 9, "\n".join(violations)
     joined = "\n".join(violations)
     for expected in (
         "self._token",           # attribute, positional arg
@@ -56,9 +56,25 @@ def test_violating_fixture_is_blocked() -> None:
         "password",              # %-formatting arg
         "auth_header",           # audit_log.write() — the ledger half
         "secret_value",          # nested inside a dict/list literal
+        "cfg.token_hash.raw_token",  # safe suffix must not launder its neighbour
     ):
         assert expected in joined, f"{expected!r} not flagged:\n{joined}"
     assert "audit_log.write()" in joined
+
+
+def test_safe_suffix_suppression_is_per_identifier() -> None:
+    """W6 Tier-B regression.
+
+    The suppression list describes *one identifier* being a derived value. Applied
+    to a whole rendered expression it inverts: a single safe word launders every
+    credential beside it. Assert the discrimination directly, both directions.
+    """
+    assert not lint._is_raw_credential("token_hash")
+    assert not lint._is_raw_credential("cfg.api_key_fingerprint")
+    assert lint._is_raw_credential("cfg.token_hash.raw_token")
+    assert lint._is_raw_credential("creds.password_len.password")
+    # A suffix must anchor to the end of its own identifier, not appear mid-word.
+    assert lint._is_raw_credential("token_hash_backup")
 
 
 def test_suppression_comment_is_honoured() -> None:

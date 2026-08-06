@@ -12,6 +12,7 @@ import datetime as _dt
 import hashlib
 import json
 import logging
+import re
 import sys
 from collections.abc import Mapping
 from typing import Any
@@ -20,6 +21,7 @@ __all__ = [
     "get_logger",
     "JSONFormatter",
     "REDACTED_PREFIX",
+    "UNSAFE_EVENT_NAME",
     "exc_fields",
     "safe_log_warning",
     "sanitize_log_extras",
@@ -136,6 +138,16 @@ _MESSAGE_SAFE_EXC_TYPES = frozenset(
     }
 )
 
+# The event name reaches the sink twice — as the record's ``msg`` and as its
+# ``event`` field — and on neither route does it pass through the extras
+# policy. So it gets its own: the dotted-snake vocabulary every call site in
+# this repo already uses (``secondary_unexpected_exception``,
+# ``dual_read_decision_log.append_failed``), and nothing else.
+_EVENT_NAME_PATTERN = re.compile(r"^[a-z0-9_.]{1,64}$")
+
+#: Substituted for any event name that fails :data:`_EVENT_NAME_PATTERN`.
+UNSAFE_EVENT_NAME = "unsafe_event_name"
+
 
 def _render(value: object) -> str:
     """``str(value)`` that cannot raise — a hostile ``__str__`` must not cost us
@@ -220,6 +232,27 @@ def sanitize_log_extras(extras: Mapping[str, object]) -> dict[str, object]:
     return clean
 
 
+def _safe_event_name(event: object) -> tuple[str, dict[str, object]]:
+    """Constrain the event name to this module's dotted-snake vocabulary.
+
+    Returns ``(name_to_emit, extra_fields)``.
+
+    ``event`` is the one value that used to reach stderr untouched, on both of
+    its routes — the record's ``msg`` and its ``event`` field. A caller writing
+    ``safe_log_warning(logger, f"failed: {user_query}")`` would therefore route
+    straight around the whole guard, which is precisely the call-site
+    dependence this module exists to remove.
+
+    Rejection does not cost the record. The emit becomes
+    :data:`UNSAFE_EVENT_NAME` and the offending value survives as a digest
+    under ``unsafe_event``, so the line stays findable, the miswiring is
+    obvious to whoever reads the log, and the value itself never lands.
+    """
+    if isinstance(event, str) and _EVENT_NAME_PATTERN.match(event):
+        return event, {}
+    return UNSAFE_EVENT_NAME, {"unsafe_event": _redact(event)}
+
+
 def safe_log_warning(
     logger: logging.Logger,
     event: str,
@@ -241,16 +274,27 @@ def safe_log_warning(
       gets it redacted here — the guard does not depend on call-site discipline,
       which is the property that makes it hold for call sites not yet written.
 
+    ``event`` is held to that same standard rather than trusted: it must match
+    the dotted-snake vocabulary (``^[a-z0-9_.]{1,64}$``), because it reaches the
+    sink as both ``msg`` and the ``event`` field without passing through the
+    extras policy. Anything else is emitted as :data:`UNSAFE_EVENT_NAME` with
+    the original reduced to a digest under ``unsafe_event`` — see
+    :func:`_safe_event_name`. Nothing is dropped; only the value is withheld.
+
     Known trade, inherited from the shape this replaces: because the emit is
     swallowed, "no warnings in the log" is not evidence that no warnings
     occurred. A broken logging pipeline stays invisible here by design.
     """
     try:
+        # First, because ``event`` is the only argument that reaches the record
+        # on two routes and the rest of the policy never sees it.
+        event_name, event_fields = _safe_event_name(event)
         fields = sanitize_log_extras(extras)
+        # Both updates land after sanitisation, not through it: their values are
+        # bounded by construction and must win over any hand-passed key.
+        fields.update(event_fields)
         if exc is not None:
-            # After sanitisation, not through it: ``exc_fields`` output is
-            # bounded by construction and must win over any hand-passed key.
             fields.update(exc_fields(exc))
-        logger.warning(event, extra={"event": event, **fields})
+        logger.warning(event_name, extra={"event": event_name, **fields})
     except Exception:  # noqa: BLE001 — last-resort: even the logger may be broken
         pass

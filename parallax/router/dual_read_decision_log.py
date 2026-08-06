@@ -56,6 +56,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from parallax.obs.log import safe_log_warning
+
 __all__ = [
     "SCHEMA_VERSION",
     "DUAL_READ_LOG_ENABLED_ENV",
@@ -231,15 +233,9 @@ def append_decision(
             fh.write(line)
         return path
     except Exception as exc:  # noqa: BLE001 — fail-closed: never crash the request
-        try:
-            _log.warning(
-                "dual_read_decision_log.append_failed",
-                extra={
-                    "event": "dual_read_decision_log.append_failed",
-                    "exc_class": type(exc).__name__,
-                    "exc_str": str(exc),
-                },
-            )
-        except Exception:  # noqa: BLE001 — last-resort
-            pass
+        # This used to be a hand-rolled copy of ``dual_read._safe_log_warning``:
+        # it cannot import that one, because ``dual_read`` imports from *this*
+        # module and sharing would close an import cycle. Hosting the helper in
+        # ``parallax.obs.log`` removes the cycle and the duplicate together.
+        safe_log_warning(_log, "dual_read_decision_log.append_failed", exc=exc)
         return None

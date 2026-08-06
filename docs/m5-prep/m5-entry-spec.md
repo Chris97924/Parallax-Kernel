@@ -60,7 +60,7 @@ Per security review 2026-05-06 — these are not negotiable and must be enforced
 | Audit `response_body` PII | Cap size at 16 KB; PII-tagged retrievals MUST be redacted before audit-log write; SQLite audit DB file mode `0600` on creation |
 | Audit-write failure observability | Wire `parallax_audit_write_failures_total` Prom counter; alert on > 0 / 5 min (closes audit-evasion vector identified in security review) |
 | **Invalidate event session isolation** | Cache invalidate events triggered by R-8 must not leak across `session_id` boundaries. A given session's invalidate may not reveal another session's existence (timing-side-channel) or cached keys (event-payload). |
-| **Aphelion auth header redaction** | The bearer token in Aphelion HTTP request headers MUST be redacted (replaced with `<REDACTED>`) before any audit-ledger write or log line. Lint rule: forbid passing raw `Authorization` value to `audit_log.write()` or `logger.*()`. |
+| **Aphelion auth header redaction** | The bearer token in Aphelion HTTP request headers MUST be redacted (replaced with `<REDACTED>`) before any audit-ledger write or log line. Lint rule: forbid passing raw `Authorization` value to `audit_log.write()` or `logger.*()`. **Implemented** as `PLX-SECRET-LOG` — `scripts/lint_no_raw_secret_logging.py`, run over `parallax/` and `scripts/` by the `secret-logging` job in `.github/workflows/lint.yml`; fixtures + rule regression tests in `tests/scripts/test_lint_no_raw_secret_logging.py`. |
 
 ### 3.1b Upstream Assumptions (deferred — non-blocking for M5)
 

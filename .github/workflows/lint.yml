@@ -19,3 +19,18 @@ jobs:
         run: python -m pip install --upgrade pip "ruff==0.15.20"
       - name: Ruff lint (parallax)
         run: ruff check parallax
+
+  secret-logging:
+    # Enforces the m5-entry-spec.md §3.1a row "Aphelion auth header redaction",
+    # which mandates a lint rule forbidding the raw Authorization value from
+    # reaching audit_log.write() or logger.*(). The 2026-08-05 safelog audit
+    # found the invariant documented but unenforced; this job is the gate.
+    # Stdlib-only, so it needs no install step.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: No raw credentials in log / audit-write calls
+        run: python scripts/lint_no_raw_secret_logging.py parallax scripts

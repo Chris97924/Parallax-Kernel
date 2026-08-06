@@ -26,7 +26,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING
 
 from parallax.events.conflict_writer import write_conflict_event
-from parallax.obs.log import get_logger
+from parallax.obs.log import get_logger, safe_log_warning
 from parallax.router.aphelion_adapter import AphelionUnreachableError
 from parallax.router.circuit_breaker import get_breaker_state
 from parallax.router.config import is_dual_read_enabled
@@ -57,19 +57,21 @@ __all__ = ["DualReadRouter"]
 _log = get_logger("parallax.router.dual_read")
 
 
-def _safe_log_warning(event: str, **extras: object) -> None:
-    """Emit a structured WARNING that never propagates a logger exception.
+def _safe_log_warning(event: str, *, exc: BaseException | None = None, **extras: object) -> None:
+    """Module-local binding of :func:`parallax.obs.log.safe_log_warning`.
 
-    The fail-closed invariant requires observability code to never crash
-    the request path.  ``_log.warning`` itself can raise if the logger
-    handler is closed or misconfigured (rare but possible during process
-    shutdown), so every call site through this module routes through
-    here so the request path is fully insulated.
+    "Safe" now covers both halves of the word, which it previously did not:
+
+    * *crash-safe* — the fail-closed invariant requires observability code to
+      never kill the request path, and ``_log.warning`` can itself raise when a
+      handler is closed or misconfigured (rare, but reachable during process
+      shutdown).
+    * *payload-safe* — nothing reaches stderr unless the shared policy in
+      ``parallax.obs.log`` permits it. Pass exceptions as ``exc=`` rather than
+      formatting them into an extra; the helper decides whether the message may
+      be rendered or has to be reduced to a digest.
     """
-    try:
-        _log.warning(event, extra={"event": event, **extras})
-    except Exception:  # noqa: BLE001 — last-resort: even the logger may be broken
-        pass
+    safe_log_warning(_log, event, exc=exc, **extras)
 
 
 class DualReadRouter:
@@ -163,13 +165,15 @@ class DualReadRouter:
             except Exception as exc:  # noqa: BLE001 — observability never crashes the request
                 # Surface the swallowed exception so an operator can tell
                 # "breaker fine" apart from "breaker check exploded".
-                _safe_log_warning(
-                    "breaker_is_tripped_check_failed",
-                    exc_class=type(exc).__name__,
-                    exc_str=str(exc),
-                )
+                _safe_log_warning("breaker_is_tripped_check_failed", exc=exc)
                 breaker_tripped = False
             if breaker_tripped:
+                # ``user_id`` goes out verbatim, deliberately: it is already a
+                # Prometheus label on the dual-read outcome counters and a field
+                # in every shadow decision record, so scrubbing it here alone
+                # would hide it from nobody. Reclassifying it is a data ruling
+                # that has to land here and on the metrics side together —
+                # ``parallax.obs.log._IDENTIFIER_STR_KEYS`` holds the decision.
                 _safe_log_warning(
                     "dual_read_override_missing_with_tripped_breaker",
                     user_id=request.user_id,
@@ -309,11 +313,7 @@ class DualReadRouter:
                 try:
                     hits_equal = _hits_equal(primary_result, secondary_result)  # type: ignore[arg-type]
                 except (AttributeError, TypeError) as cmp_exc:
-                    _safe_log_warning(
-                        "secondary_hits_equal_failed",
-                        exc_class=type(cmp_exc).__name__,
-                        exc_str=str(cmp_exc),
-                    )
+                    _safe_log_warning("secondary_hits_equal_failed", exc=cmp_exc)
                     outcome = "primary_only"
                     secondary_result = None
                 else:
@@ -323,12 +323,19 @@ class DualReadRouter:
                 unreachable_reason = exc.reason
             else:
                 # Unexpected exception — logic bug, not infra unavailability.
-                # Log only class name + str, NO stack trace (avoids PII in logs).
-                _safe_log_warning(
-                    "secondary_unexpected_exception",
-                    exc_class=type(exc).__name__,
-                    exc_str=str(exc),
-                )
+                # The class name alone serves that distinction, which is the
+                # whole stated purpose of this handler.
+                #
+                # The message deliberately does NOT go out verbatim. ``secondary``
+                # is an injected ``QueryPort``, so ``str(exc)`` here is an
+                # unbounded sink fed by a content-handling boundary: the adapter
+                # holds the raw user query (via the ``subject`` fallback) and full
+                # claim frontmatter including the markdown body, and several of
+                # its windows are unwrapped. Omitting the traceback — which this
+                # site used to rely on — removes frame locals but not the value,
+                # because ``str(exc)`` is exactly where CPython puts it. See
+                # ``parallax.obs.log.exc_fields``.
+                _safe_log_warning("secondary_unexpected_exception", exc=exc)
                 outcome = "primary_only"
                 secondary_result = None
 
@@ -371,11 +378,7 @@ class DualReadRouter:
                     # JSONL decision log records the write-error path.
                     write_error_observed = True
             except Exception as exc:  # noqa: BLE001 — fail-closed
-                _safe_log_warning(
-                    "conflict_event_write_failed",
-                    exc_class=type(exc).__name__,
-                    exc_str=str(exc),
-                )
+                _safe_log_warning("conflict_event_write_failed", exc=exc)
                 write_error_observed = True
 
         result = DualReadResult(
@@ -450,11 +453,7 @@ class DualReadRouter:
                 }
             )
         except Exception as exc:  # noqa: BLE001 — observability never crashes
-            _safe_log_warning(
-                "decision_log_append_failed",
-                exc_class=type(exc).__name__,
-                exc_str=str(exc),
-            )
+            _safe_log_warning("decision_log_append_failed", exc=exc)
 
     def _record(
         self,
@@ -478,11 +477,12 @@ class DualReadRouter:
                 traffic_source=traffic_source,
             )
         except Exception as exc:  # noqa: BLE001 — observability must not crash query path
-            _safe_log_warning(
-                "record_dual_read_outcome_failed",
-                exc_class=type(exc).__name__,
-                exc_str=str(exc),
-            )
+            # ``user_id`` is live in this frame and is the value being recorded,
+            # so a future dict-index on the ``(user_id, source)`` key would raise
+            # a ``KeyError`` whose message IS that tuple. Nothing about the
+            # message shape is under this repo's control either — it originates
+            # in ``prometheus_client``. Class + digest is all that goes out.
+            _safe_log_warning("record_dual_read_outcome_failed", exc=exc)
         if self._live_counter is not None:
             try:
                 self._live_counter.record(
@@ -491,11 +491,11 @@ class DualReadRouter:
                     traffic_source=traffic_source,
                 )
             except Exception as exc:  # noqa: BLE001 — same rationale as above
-                _safe_log_warning(
-                    "live_counter_record_failed",
-                    exc_class=type(exc).__name__,
-                    exc_str=str(exc),
-                )
+                # Weaker still than the site above: ``_live_counter`` is
+                # constructor-injected and the type hint is not enforced, so a
+                # test double or a decorated counter can raise anything with any
+                # message while ``user_id`` is in scope.
+                _safe_log_warning("live_counter_record_failed", exc=exc)
         # T1.5: feed the rolling-window circuit breaker. Only count outcomes
         # where the secondary was actually attempted (not "skipped").
         if outcome != "skipped":
@@ -504,8 +504,4 @@ class DualReadRouter:
                     observed_unreachable=(outcome == "aphelion_unreachable")
                 )
             except Exception as exc:  # noqa: BLE001 — same rationale as above
-                _safe_log_warning(
-                    "breaker_record_failed",
-                    exc_class=type(exc).__name__,
-                    exc_str=str(exc),
-                )
+                _safe_log_warning("breaker_record_failed", exc=exc)

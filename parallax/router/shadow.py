@@ -23,7 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
-from parallax.obs.log import get_logger
+from parallax.obs.log import get_logger, safe_log_warning
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.contracts import QueryRequest
 
@@ -147,10 +147,7 @@ class ShadowInterceptor:
             with self._today_log_path().open("a", encoding="utf-8") as fh:
                 fh.write(entry.to_jsonl() + "\n")
         except OSError as exc:
-            _log.warning(
-                "shadow_log_write_failed",
-                extra={"event": "shadow_log_write_failed", "error": str(exc)},
-            )
+            safe_log_warning(_log, "shadow_log_write_failed", exc=exc)
 
     def query(
         self,
@@ -174,10 +171,12 @@ class ShadowInterceptor:
             outcome = "match" if _hits_equal(canonical_result, shadow_result) else "diverge"
             crosswalk = "ok"
         except Exception as exc:  # noqa: BLE001 — shadow failures must never break canonical
-            _log.warning(
-                "shadow_query_error",
-                extra={"event": "shadow_query_error", "error": str(exc)},
-            )
+            # Structurally the same sink as ``dual_read.py``'s unexpected-exception
+            # handler and strictly weaker: this clause is bare ``Exception`` with
+            # no unreachable-error carve-out, so EVERY shadow failure lands here,
+            # not just the unforeseen ones — and ``shadow`` comes from an injected
+            # factory, so the message is not a bounded set. Class + digest only.
+            safe_log_warning(_log, "shadow_query_error", exc=exc)
             outcome = "shadow_only"
             crosswalk = "skipped"
 

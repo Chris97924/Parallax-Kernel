@@ -65,6 +65,30 @@ groups:
             See runbook docs/lane-c/m3-dual-read-runbook.md §Failure-Modes.
             48h SLO observation window must restart if this fires during pre-flip phase.
 
+      # LIVE SINCE #102, AND ONLY SINCE #102. The expression below never
+      # changed and never needed to: parallax_circuit_breaker_tripped_total was
+      # registered into the default registry (circuit_breaker.py:61) and
+      # incremented on every real trip, but /metrics rendered a fresh
+      # CollectorRegistry and never plucked it out, so this severity=critical
+      # alert evaluated against no-data from the day it was written. The fix
+      # was exposition, not logic.
+      #
+      # THE COUNTER MUST BE EXPORTED FROM ZERO, and that is the one place the
+      # absent-not-zero rule the DoD gauges follow is deliberately inverted.
+      # increase() needs a pre-trip baseline sample to see a step. A counter
+      # that only appeared on its first increment would arrive already at 1.0,
+      # every sample in the window would be 1.0, and increase() would report
+      # 0 — the alert would stay silent through the very first trip and read as
+      # "measured, and healthy". prometheus/tests/parallax-dual-read.test.yml
+      # demonstrates exactly that against this rule
+      # ("absent-until-first-increment"), so the property is pinned rather than
+      # asserted in prose.
+      #
+      # [10m] with for: 0m — the range IS the smoothing. A trip is a discrete,
+      # non-self-resolving event (the breaker is manual-reset only), so there
+      # is nothing to wait out; a `for:` would only delay the page. The window
+      # is what bounds how long after a trip the alert keeps firing, not how
+      # long it takes to fire.
       - alert: CircuitBreakerTripped
         expr: increase(parallax_circuit_breaker_tripped_total[10m]) > 0
         for: 0m
@@ -78,6 +102,26 @@ groups:
             Investigate Aphelion availability and run POST /admin/circuit_breaker/reset
             once the underlying issue is resolved.
 
+      # LIVE SINCE #102, same defect and same fix as CircuitBreakerTripped
+      # above: registered at lifespan.py:50, incremented by the drain loop,
+      # never rendered by /metrics. Read that rule's comment for why the
+      # counter is exported from zero — it applies here identically.
+      #
+      # [1h] rather than the breaker's [10m] because of how rare and how
+      # narrow the event is. The drain timeout fires at most once per process
+      # lifetime, during shutdown, and the increment is the LAST thing that
+      # process does before exiting — the exporting server is gone moments
+      # later. The window has to be wide enough that a scrape lands after the
+      # increment and the alert is still firing when a human looks, which a
+      # 10-minute window cannot promise for an event that terminates its own
+      # exporter.
+      #
+      # Corollary worth knowing: this alert depends on at least two scrapes
+      # straddling the increment. A process killed hard enough that the final
+      # value is never scraped reports nothing at all — absence of this alert
+      # is not proof of a clean drain. The drain log line
+      # ("parallax.lifespan: drain timeout after ...") is the durable record;
+      # this is the page.
       - alert: DrainTimeoutDetected
         expr: increase(parallax_drain_timeout_total[1h]) > 0
         for: 0m
@@ -240,8 +284,29 @@ groups:
       # Consequence worth knowing before deploy: while the burn-in loader runs,
       # this alert reports on loader traffic too. If it fires immediately on
       # deploy that is a TRUE POSITIVE about breaker state, not noise to be
-      # filtered — and it is currently the only way to see it, because #102
-      # leaves CircuitBreakerTripped unable to fire at all.
+      # filtered.
+      #
+      # It is no longer the ONLY way to see a trip — #102 put
+      # parallax_circuit_breaker_tripped_total on the wire, so
+      # CircuitBreakerTripped can finally fire. The two are not redundant:
+      # this one LEADS (it watches the same ratio the breaker is accumulating,
+      # so it crosses while the breaker is still deciding), CircuitBreakerTripped
+      # CONFIRMS the trip transition itself. Losing this one to a
+      # "CircuitBreakerTripped covers it" cleanup would give up the warning
+      # that arrives before the degradation.
+      #
+      # NEITHER ONE CLEARING MEANS THE BREAKER RE-ARMED, and they go quiet for
+      # different reasons — which is why the manual reset is the only thing
+      # that actually recovers the replica:
+      #   this alert            stops firing because the breaker OPENED and
+      #                         fallback stopped producing aphelion_unreachable
+      #                         outcomes, i.e. it resolves BECAUSE the
+      #                         degradation took hold;
+      #   CircuitBreakerTripped stops firing ~10m after the trip, when the
+      #                         increment ages out of its range window
+      #                         (pinned by the "silent once the trip ages out"
+      #                         case in prometheus/tests/).
+      # The breaker itself stays tripped through both.
       #
       # PER-INSTANCE, NOT FLEET-WIDE (#103 review P2-b). BreakerState is
       # process-local (circuit_breaker.py — a singleton deque per process), so
@@ -312,8 +377,10 @@ groups:
             RESOLVES on its own once the breaker opens — fallback stops
             producing aphelion_unreachable outcomes — so resolution here does
             NOT mean the breaker re-armed.
-            CircuitBreakerTripped is the signal for the trip itself (and per
-            #102 that alert's metric is itself never-on-the-wire).
+            CircuitBreakerTripped is the signal for the trip itself; since #102
+            put its counter on the wire, that alert fires too. It clears ~10m
+            after the trip when the increment ages out of its window, so
+            neither alert going quiet means the breaker re-armed.
             Runbook: docs/m3-runbooks/observability-cookbook.md §5.
 
       # Selecting {traffic_source="natural"} means the three DoD alerts go

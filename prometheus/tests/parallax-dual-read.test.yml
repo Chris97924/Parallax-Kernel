@@ -676,6 +676,12 @@ tests:
               description: |
                 Lifespan drain handler hit the 15-minute timeout — in-flight requests
                 were force-cut. Investigate stuck connections or upstream blocks.
+                KNOWN LATENT (#102 review): the increment happens during lifespan
+                shutdown, after the listening socket has closed, so Prometheus
+                never scrapes the post-increment value and this alert is expected
+                to stay silent even on a real timeout. Its absence is NOT evidence
+                of a clean drain — grep the service log for
+                "parallax.lifespan: drain timeout after".
 
   # -------------------------------------------------------------------------
   # 16. SILENT when every drain completed cleanly. Kills the >= 0 mutant, as
@@ -753,3 +759,64 @@ tests:
               description: |
                 Lifespan drain handler hit the 15-minute timeout — in-flight requests
                 were force-cut. Investigate stuck connections or upstream blocks.
+                KNOWN LATENT (#102 review): the increment happens during lifespan
+                shutdown, after the listening socket has closed, so Prometheus
+                never scrapes the post-increment value and this alert is expected
+                to stay silent even on a real timeout. Its absence is NOT evidence
+                of a clean drain — grep the service log for
+                "parallax.lifespan: drain timeout after".
+
+  # -------------------------------------------------------------------------
+  # 20. THE PRODUCTION SHAPE — and it is SILENT. (#102 review P1-2.)
+  #
+  #     Cases 15 and 19 above prove the rule's LOGIC is right: given a series
+  #     that steps 0 -> 1 and keeps being scraped, the alert fires. Production
+  #     cannot produce that series, and this case is the honest model.
+  #
+  #     Measured on uvicorn 0.52.1 against a real server: during lifespan
+  #     shutdown -- where _drain_inflight runs and where drain_timeout_total is
+  #     incremented -- the listening socket is already closed. Scrapes from
+  #     inside that window returned ConnectTimeout, and a bare TCP connect to
+  #     the port timed out. The process then exits.
+  #
+  #     So what Prometheus actually records is: 0 for the whole life of the
+  #     process, then the target disappears. The increment is real and is
+  #     never exported. `_` here is exactly that -- no sample, because there is
+  #     no longer a server to scrape.
+  #
+  #     increase() over that sees no step, and DrainTimeoutDetected stays
+  #     silent through the very event it exists for. This case asserts that
+  #     silence so the gap is pinned in CI rather than described in a comment
+  #     someone may not read. It should start FAILING the day a durable
+  #     producer is added -- that is the signal the fix landed.
+  #
+  #     Note what this rules OUT: moving the increment earlier in the drain
+  #     does not help, because the entire drain runs inside the same
+  #     already-unserved window. A counter owned by the terminating exporter
+  #     cannot report its own termination.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: production shape (increment never scraped) leaves the alert silent
+    input_series:
+      # 0 for the life of the process, then the exporter is gone. The drain
+      # timeout increments somewhere in the gap and is never sampled.
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x60 _x60'
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+    promql_expr_test:
+      # A flat zero while the target was up, then nothing at all. Neither is a
+      # signal that a drain timed out.
+      - expr: increase(parallax_drain_timeout_total[1h])
+        eval_time: 55m
+        exp_samples:
+          - labels: '{instance="10.0.0.1:8765", job="parallax"}'
+            value: 0

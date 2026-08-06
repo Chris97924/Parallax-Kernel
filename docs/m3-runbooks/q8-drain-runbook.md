@@ -42,13 +42,44 @@
 2. **請求進入 / 完成**：`InflightTracker` context manager 在 handler enter 時 `inc()`，exit 時 `dec()`（即使 raise 也會 dec，見 `parallax/router/inflight.py`）。
 3. **收到 SIGTERM**：FastAPI lifespan 進入 shutdown 分支，呼叫 `_drain_inflight()`，**進程自動進入 graceful drain**（**不需要 oncall 手動介入**）。
 4. **drain loop**：每 0.5s 讀取 `get_inflight_count()`，若 ≤ 0 立即 return（log INFO `drain complete in {elapsed}s`）；若 deadline 到（900s），增 `parallax_drain_timeout_total` counter + log WARNING + return（讓 process 收尾）。
-5. **觀察方式**：oncall **僅作觀察**（透過 `parallax_inflight_requests` gauge + `parallax_drain_timeout_total` counter），**勿在 drain 自然完成前強制 SIGKILL**（會吃掉本來會 drain 完的 in-flight）。
+5. **觀察方式**：oncall **僅作觀察**（透過 `parallax_inflight_requests` gauge + 下方 ⚠️ 指定的 log 行），**勿在 drain 自然完成前強制 SIGKILL**（會吃掉本來會 drain 完的 in-flight）。
+
+> ⚠️ **`parallax_drain_timeout_total` 在生產環境觀測不到（#102 review 實測，uvicorn 0.52.1）**
+>
+> 該 counter 在 lifespan shutdown 期間、`_drain_inflight()` 尾端才 `inc()`，
+> 而**那個時間點 listening socket 已經關閉**：從 shutdown 視窗內發出的 3 次
+> scrape 全部 ConnectTimeout，連裸 TCP connect 都 timeout。所以 Prometheus
+> 拿到的最後一個樣本永遠是 increment 前的 0，`increase()` 看不到跳變，
+> `DrainTimeoutDetected` alert **在真的 drain timeout 時也不會響**。
+>
+> 把 increment 提早到 timeout 偵測當下**也不能解**——整個 drain 都在同一個
+> 「已不服務」的視窗內；由「即將終止的 exporter 自己」持有的 counter 無法
+> 回報自己的終止。要修需要 durable/external 路徑（audit-db 落一筆，或對
+> log 行做 log-based alert），屬 producer 工作。
+>
+> 另有實測發現：**uvicorn 會先自己等 in-flight 請求結束才進 lifespan
+> shutdown**（SIGTERM 當下仍在跑的請求正常回 200，隨後 `_drain_inflight`
+> 看到的 inflight 已是 0），所以 timeout 分支在 uvicorn 下幾乎不可達。
+>
+> **oncall 實務**：判斷 drain 有沒有 timeout，一律抓 log 行
+> `parallax.lifespan: drain timeout after`。**alert 沒響不代表 drain 乾淨。**
 
 > **設計重點**：`_drain_inflight` 用 `asyncio.sleep`（不是 `time.sleep`），所以 drain loop 跟其他 coroutine（包含正在 drain 的 in-flight 請求）可以並行進度。
 
 ---
 
 ## 觀察指標：parallax_inflight_requests 何時降到 0
+
+> **Gauge 語義（#102 起 gauge 才真的上線，2026-08-06）**：
+> `parallax_inflight_requests` 只計「drain 必須等的應用請求」。
+> `/metrics` 與 `/healthz` **不計入**（`INFLIGHT_EXCLUDED_PATHS`，
+> `parallax/server/middleware/dual_read_snapshot.py`）。
+> 這是必要的：gauge 是在「服務該次 scrape 的當下」被讀取的，若把 `/metrics`
+> 算進去，每次 scrape 都至少回報 1，**idle 實例永遠不可能回報 0**——本文
+> 下面所有 `> 0`（挑出卡住的實例）與 `sum(...) == 0`（deploy gate）的查詢
+> 就會把每台健康實例判成卡住，deploy gate 每次都空跑滿 960s。
+> 因此本文的 `== 0` 判準在修正後才成立；`/healthz` 一併排除，否則同一個
+> gate 會變成間歇性 flaky（更難查）。
 
 | 條件 | 預期 drain 時間 |
 |------|----------------|
@@ -143,7 +174,7 @@ EOF
 
 | 原因 | 診斷 | 處置 |
 |------|------|------|
-| 請求 hang（外部服務無回應） | 觀察 `parallax_inflight_requests` 是否長時間不降；交叉看 `parallax_drain_timeout_total` 是否已增（drain timeout 出現 = 真的卡住） | 設定上游 timeout（建議 30s），或強制 kill |
+| 請求 hang（外部服務無回應） | 觀察 `parallax_inflight_requests` 是否長時間不降。**不要**指望 `parallax_drain_timeout_total`——見下方 ⚠️，該 counter 在生產環境觀測不到；改抓 log 行 `parallax.lifespan: drain timeout after` | 設定上游 timeout（建議 30s），或強制 kill |
 | Gauge 計數 bug（inc/dec 不配對） | 查 code review，grep `inflight.inc` vs `inflight.dec` | Hotfix：確保所有 exit path 都有 dec |
 | 連線池洩漏 | `ss -tnp` 檢查 ESTABLISHED 連線數 | 重啟進程 + 排查 connection leak |
 | 死鎖 | `kill -SIGQUIT <pid>` 取 thread dump | 分析 thread dump，修復後 redeploy |

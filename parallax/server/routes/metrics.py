@@ -762,19 +762,22 @@ def _build_payload() -> str:
     #     reports its zeros. A drain runbook needs to tell "0 in flight, safe
     #     to stop" from "no data, cannot tell".
     #
-    # READING THE GAUGE: THE SCRAPE COUNTS ITSELF. DualReadSnapshotMiddleware
-    # wraps every request in the inflight gauge (middleware/dual_read_snapshot
-    # .py:68) and does not exclude any path, so this scrape has already
-    # incremented it before we read it here. An IDLE SERVER REPORTS 1, NOT 0 —
-    # true inflight is the scraped value minus one. This was unobservable until
-    # now (the gauge never reached the wire), so it is a first look rather than
-    # a regression, and it is left uncorrected on purpose: an exporter must
-    # report what the collector holds. Subtracting here would fabricate a
-    # reading and would put this series permanently out of step with
-    # get_inflight_count(), which the drain loop polls in-process where no such
-    # offset exists. Pinned by test_inflight_gauge_on_the_wire_counts_the_
-    # scrape_itself so a future middleware path-exclusion has to move the
-    # threshold deliberately instead of silently.
+    # THE SCRAPE DOES NOT COUNT ITSELF, and that took a fix to be true.
+    # DualReadSnapshotMiddleware reads this gauge WHILE SERVING the scrape, so
+    # while it tracked every path the exported value was always >= 1 and an
+    # idle instance could never report 0 — which breaks
+    # docs/m3-runbooks/q8-drain-runbook.md, whose deploy gate waits for
+    # ``sum(parallax_inflight_requests) == 0`` and would have burned its full
+    # 960s timeout on every deploy. Fixed at the source rather than here:
+    # ``INFLIGHT_EXCLUDED_PATHS`` in middleware/dual_read_snapshot.py drops
+    # /metrics and /healthz from the gauge entirely.
+    #
+    # Fixing it in the middleware rather than subtracting a fudge factor here
+    # is what keeps this series honest: the exporter still reports exactly what
+    # the collector holds, so the wire and ``get_inflight_count()`` — which the
+    # drain loop polls in-process — agree by construction instead of differing
+    # by an offset nobody would remember. Pinned by
+    # test_metrics_scrape_is_not_counted_as_inflight_work.
     #
     # All three collectors are in a running server's default registry
     # unconditionally: app.py imports lifespan (drain_timeout_total, and it

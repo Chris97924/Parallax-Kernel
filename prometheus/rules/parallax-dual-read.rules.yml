@@ -102,26 +102,49 @@ groups:
             Investigate Aphelion availability and run POST /admin/circuit_breaker/reset
             once the underlying issue is resolved.
 
-      # LIVE SINCE #102, same defect and same fix as CircuitBreakerTripped
-      # above: registered at lifespan.py:50, incremented by the drain loop,
-      # never rendered by /metrics. Read that rule's comment for why the
-      # counter is exported from zero — it applies here identically.
+      # STILL LATENT AFTER #102 — DO NOT READ THIS RULE AS LIVE.
       #
-      # [1h] rather than the breaker's [10m] because of how rare and how
-      # narrow the event is. The drain timeout fires at most once per process
-      # lifetime, during shutdown, and the increment is the LAST thing that
-      # process does before exiting — the exporting server is gone moments
-      # later. The window has to be wide enough that a scrape lands after the
-      # increment and the alert is still firing when a human looks, which a
-      # 10-minute window cannot promise for an event that terminates its own
-      # exporter.
+      # #102 fixed this rule's EXPOSITION half (the counter is registered at
+      # lifespan.py:50 and was never rendered by /metrics, so the alert
+      # matched nothing at all). That was necessary and is done. It is not
+      # sufficient, and the #102 review caught why: the counter can be
+      # exported, but the ONE VALUE THAT MATTERS never can be.
       #
-      # Corollary worth knowing: this alert depends on at least two scrapes
-      # straddling the increment. A process killed hard enough that the final
-      # value is never scraped reports nothing at all — absence of this alert
-      # is not proof of a clean drain. The drain log line
-      # ("parallax.lifespan: drain timeout after ...") is the durable record;
-      # this is the page.
+      # Measured on uvicorn 0.52.1 against a real server, not reasoned about:
+      #
+      #   during lifespan shutdown -- where _drain_inflight runs and where the
+      #   increment happens -- the listening socket is ALREADY CLOSED. Three
+      #   scrape attempts from inside the shutdown window returned
+      #   ConnectTimeout, and a bare TCP connect to the port timed out too.
+      #
+      # So the increment lands after the last scrape this process will ever
+      # serve. Prometheus's final sample is the pre-increment 0; increase()
+      # sees no step; this alert stays silent through the exact event it
+      # exists for. Case "production shape" in prometheus/tests/ models that
+      # series and asserts the silence, so the gap is pinned rather than
+      # described.
+      #
+      # Moving the increment earlier does NOT fix it — the whole drain runs
+      # inside that already-unserved window, so there is no earlier point that
+      # is scrapeable. A counter owned by the terminating exporter cannot
+      # report its own termination; the fix has to be a durable or external
+      # path (audit-db row, or an alert on the log line), which is producer
+      # work and deliberately out of scope for an exposition change.
+      #
+      # SECOND, INDEPENDENT REASON, same measurement: uvicorn waits for
+      # in-flight requests ITSELF before invoking lifespan shutdown. A request
+      # still running at SIGTERM completed (200) and _drain_inflight then
+      # observed inflight == 0. So under uvicorn the timeout branch is not
+      # merely unscrapeable, it is close to unreachable — by the time the
+      # drain loop runs, uvicorn has already drained.
+      #
+      # WHAT TO ACTUALLY USE until that is fixed: the WARNING log line
+      # "parallax.lifespan: drain timeout after ..." is the durable record of
+      # this event. Absence of this alert is NOT evidence of a clean drain.
+      #
+      # The rule is kept rather than deleted so the intent stays visible and
+      # so it starts working the moment a durable producer exists. [1h] is
+      # sized for how rare the event is — at most once per process lifetime.
       - alert: DrainTimeoutDetected
         expr: increase(parallax_drain_timeout_total[1h]) > 0
         for: 0m
@@ -133,6 +156,12 @@ groups:
           description: |
             Lifespan drain handler hit the 15-minute timeout — in-flight requests
             were force-cut. Investigate stuck connections or upstream blocks.
+            KNOWN LATENT (#102 review): the increment happens during lifespan
+            shutdown, after the listening socket has closed, so Prometheus
+            never scrapes the post-increment value and this alert is expected
+            to stay silent even on a real timeout. Its absence is NOT evidence
+            of a clean drain — grep the service log for
+            "parallax.lifespan: drain timeout after".
 
       # The three dual-read DoD gauges below are exposed by
       # parallax/server/routes/metrics.py partitioned by `traffic_source`

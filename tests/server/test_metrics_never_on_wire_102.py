@@ -51,21 +51,6 @@ _DRAIN = "parallax_drain_timeout_total"
 _INFLIGHT = "parallax_inflight_requests"
 _ALL_THREE = (_TRIPPED, _DRAIN, _INFLIGHT)
 
-# THE SCRAPE COUNTS ITSELF. DualReadSnapshotMiddleware wraps every request in
-# the inflight gauge (middleware/dual_read_snapshot.py:68) with no path
-# exclusion, and ``GET /metrics`` is a request like any other — so the gauge
-# has already been incremented for the scrape by the time ``_build_payload``
-# reads it. An idle server therefore reports 1, never 0, and the true inflight
-# count is the scraped value minus one.
-#
-# This was unobservable before #102 (the gauge never reached the wire at all),
-# so it is not a regression — it is the first look at what the series actually
-# says. It is asserted rather than corrected because the exporter must report
-# what the collector holds; subtracting here would be fabricating a reading,
-# and would make the gauge disagree with ``get_inflight_count()``, which the
-# drain loop polls in-process where no such offset exists.
-_SCRAPE_COUNTS_ITSELF = 1.0
-
 
 @pytest.fixture()
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
@@ -175,40 +160,88 @@ def test_inflight_requests_gauge_reaches_the_wire(client: TestClient) -> None:
     A gauge, not a counter: the drain runbook reads it to decide whether it is
     safe to stop the process, so the descent is as load-bearing as the climb
     and both directions are asserted.
-
-    Both expectations carry ``_SCRAPE_COUNTS_ITSELF`` — see its comment.
     """
     inflight_gauge.set(7)
     body = client.get("/metrics").text
-    assert _wire_value(body, _INFLIGHT) == pytest.approx(7.0 + _SCRAPE_COUNTS_ITSELF), body[-3000:]
+    assert _wire_value(body, _INFLIGHT) == pytest.approx(7.0), body[-3000:]
 
     inflight_gauge.set(0)
     body = client.get("/metrics").text
-    assert _wire_value(body, _INFLIGHT) == pytest.approx(0.0 + _SCRAPE_COUNTS_ITSELF), body[-3000:]
+    assert _wire_value(body, _INFLIGHT) == pytest.approx(0.0), body[-3000:]
 
 
-def test_inflight_gauge_on_the_wire_counts_the_scrape_itself(client: TestClient) -> None:
-    """An idle server reports 1 in flight, not 0 — pin the offset explicitly.
+def test_metrics_scrape_is_not_counted_as_inflight_work(client: TestClient) -> None:
+    """An idle instance must report exactly 0 — the drain gate depends on it.
 
-    Stated as its own test because it is an operational contract, not an
-    incidental off-by-one: anyone reading this series to decide "is the process
-    drained?" must compare against 1. A future change that excludes ``/metrics``
-    from ``DualReadSnapshotMiddleware`` would make an idle server read 0, which
-    is arguably nicer — but it would silently move the threshold every drain
-    runbook and dashboard is written against, so it should fail here and be
-    decided deliberately rather than land as a side effect.
+    The middleware reads this gauge WHILE SERVING the scrape, so without
+    ``INFLIGHT_EXCLUDED_PATHS`` the exported value is always at least 1 and an
+    idle instance can never report 0. That is not cosmetic:
+    docs/m3-runbooks/q8-drain-runbook.md selects stuck instances with
+    ``parallax_inflight_requests > 0`` and gates deploys on
+    ``sum(parallax_inflight_requests) == 0``, so a self-counting scrape marks
+    every healthy instance as stuck and burns the gate's 960s timeout on every
+    deploy.
+
+    Asserted on the WIRE, not on the in-process gauge: in-process it reads 0
+    either way, because the middleware has already decremented by the time the
+    response is handed back. Only the scrape can see the difference, which is
+    exactly why the bug survived until the gauge was first exported.
     """
     inflight_gauge.set(0)
-    assert inflight_gauge._value.get() == 0.0  # noqa: SLF001 — in-process truth before the scrape
 
-    wire = _wire_value(client.get("/metrics").text, _INFLIGHT)
-
-    assert wire == pytest.approx(_SCRAPE_COUNTS_ITSELF), (
-        "an idle server's scrape should report exactly the scrape request itself"
+    assert _wire_value(client.get("/metrics").text, _INFLIGHT) == pytest.approx(0.0), (
+        "the scrape counted itself — /metrics is missing from INFLIGHT_EXCLUDED_PATHS"
     )
-    # And the in-process reading the drain loop polls is back to 0 afterwards,
-    # i.e. the offset is an artefact of observation, not a leak.
-    assert inflight_gauge._value.get() == 0.0  # noqa: SLF001
+
+
+def test_healthz_probe_is_not_counted_as_inflight_work(client: TestClient) -> None:
+    """A liveness probe in flight must not make an idle instance look busy.
+
+    Same drain gate, subtler failure: probes are short and periodic, so
+    counting them makes ``sum(...) == 0`` flake intermittently rather than fail
+    outright — strictly harder to diagnose than the /metrics case.
+
+    Observed from inside the handler, since a probe is only in flight while it
+    is being served.
+    """
+    from parallax.server.middleware.dual_read_snapshot import INFLIGHT_EXCLUDED_PATHS
+
+    assert "/healthz" in INFLIGHT_EXCLUDED_PATHS
+
+    inflight_gauge.set(0)
+    assert client.get("/healthz").status_code == 200
+    # The scrape that follows sees no residue from the probe either.
+    assert _wire_value(client.get("/metrics").text, _INFLIGHT) == pytest.approx(0.0)
+
+
+def test_real_work_is_still_counted(client: TestClient) -> None:
+    """The exclusion must not disarm the gauge for actual application work.
+
+    The failure mode of an over-broad exclusion is silent and severe: a gauge
+    stuck at 0 makes the drain gate pass instantly and every deploy cut live
+    requests. Asserted from INSIDE a handler on a non-excluded path, which is
+    the only moment the increment is observable.
+    """
+    from parallax.router.inflight import get_inflight_count
+    from parallax.server.middleware.dual_read_snapshot import INFLIGHT_EXCLUDED_PATHS
+
+    observed: list[int] = []
+
+    def probe() -> dict[str, bool]:
+        observed.append(get_inflight_count())
+        return {"ok": True}
+
+    app = client.app
+    app.add_api_route("/__inflight_probe__", probe, methods=["GET"])
+
+    inflight_gauge.set(0)
+    assert TestClient(app).get("/__inflight_probe__").status_code == 200
+
+    assert observed and observed[0] >= 1, (
+        f"a non-excluded route must be counted while in flight; saw {observed}. "
+        f"INFLIGHT_EXCLUDED_PATHS={sorted(INFLIGHT_EXCLUDED_PATHS)}"
+    )
+    assert get_inflight_count() == 0, "gauge must return to zero after the request"
 
 
 # ---------------------------------------------------------------------------
@@ -239,12 +272,12 @@ def test_exposed_values_match_the_default_registry(client: TestClient) -> None:
             f"{name}: wire disagrees with the default registry"
         )
 
-    # Gauge: the registry is read here AFTER the response completed and the
-    # middleware's ``finally`` decremented, so it holds 3 while the payload was
-    # rendered mid-request at 4.
+    # Gauge: exact parity too, now that the scrape is excluded from its own
+    # measurement. Before that fix this line needed a +1 fudge, which was the
+    # tell that the exported series and the in-process reading had diverged.
     gauge_value = REGISTRY.get_sample_value(_INFLIGHT)
     assert gauge_value == pytest.approx(3.0)
-    assert _wire_value(body, _INFLIGHT) == pytest.approx(gauge_value + _SCRAPE_COUNTS_ITSELF)
+    assert _wire_value(body, _INFLIGHT) == pytest.approx(gauge_value)
 
 
 def test_series_carry_no_labels_beyond_scrape_identity(client: TestClient) -> None:
@@ -405,10 +438,9 @@ def test_cold_start_exports_all_three_before_any_observation(tmp_path: Path) -> 
     assert found == {
         _TRIPPED: 0.0,
         _DRAIN: 0.0,
-        # Not 0.0: the scrape counts itself. See _SCRAPE_COUNTS_ITSELF.
-        _INFLIGHT: _SCRAPE_COUNTS_ITSELF,
+        _INFLIGHT: 0.0,
     }, (
-        "a never-observed process must still export all three — "
+        "a never-observed process must still export all three at 0.0 — "
         "absent-until-first-increment silences CircuitBreakerTripped and "
         f"DrainTimeoutDetected. Got: {found}"
     )

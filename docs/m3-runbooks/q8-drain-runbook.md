@@ -106,7 +106,11 @@ shutdown**（SIGTERM 當下仍在跑的請求正常回 200，隨後 `_drain_infl
 | SIGTERM 前還有多少請求在飛 | — | `parallax_inflight_requests`（PromQL，步驟 1） |
 | 舊進程 drain 完了沒 | `sum(parallax_inflight_requests) == 0` | systemd/編排層 lifecycle：舊 MainPID 是否退出（步驟 2） |
 | drain 有沒有被 900s 硬斷 | `increase(parallax_drain_timeout_total[...])`、`DrainTimeoutDetected` alert | journalctl 抓 `parallax.lifespan: drain ` log 行（步驟 2b） |
+| 撈 drain log 時怎麼鎖定「這一輪」 | `--since "-20 min"` 時間窗（會撈到別輪，別輪的成功會變成這一輪的通行證） | `_SYSTEMD_INVOCATION_ID=<觸發前捕捉的 InvocationID>`，退回用 `_PID=<舊 MainPID>`（步驟 2b） |
 | 查不到上述訊號時 | 當作沒問題放行 | **fail closed**：明確回報「無法確認」並擋住 |
+
+> **貫穿全流程的順序硬要求**：`捕捉舊 MainPID + InvocationID` → `觸發 shutdown（非阻塞）` → `觀察`。
+> 捕捉晚於觸發，錨點就換成新進程了，步驟 2 與 2b 的判準同時失效。
 
 > **設計重點**：`_drain_inflight` 用 `asyncio.sleep`（不是 `time.sleep`），所以 drain loop 跟其他 coroutine（包含正在 drain 的 in-flight 請求）可以並行進度。
 
@@ -177,18 +181,53 @@ echo "SIGTERM 前尚有 inflight 的實例：${INSTANCES:-（無）}"
 >
 > **重點不變**：drain 由 `parallax_lifespan` 在進程內自動跑（最長 `DRAIN_TIMEOUT_SECONDS=900`）。oncall 的角色是**外部觀察 + 異常時介入**，**不是**外部超時關閉。`OBSERVE_TIMEOUT` 必須 ≥ 900s，給 buffer 取 960s。
 
+> **順序是硬要求**：`捕捉身分` → `觸發 shutdown` → `觀察`。捕捉一定要在觸發**之前**——一旦觸發，MainPID / InvocationID 就會換成新進程的，你就再也拿不到「要觀察的是哪一個」的錨點了。
+
 ```bash
 UNIT=parallax-dual-read
 OBSERVE_TIMEOUT=960   # 900s server drain + 60s buffer
 ELAPSED=0
 
-# 送 SIGTERM 前先記下舊進程 PID —— 這是「舊進程真的走了」的判準錨點。
+# ---------------------------------------------------------------------------
+# (1) 捕捉「這一輪」的身分 —— 必須在觸發 shutdown 之前
+# ---------------------------------------------------------------------------
+# MainPID      : 等它消失 = drain 結束（本步驟的判準）
+# InvocationID : systemd 給「這一次 unit 執行」的唯一 id，用來把 journal 收斂到
+#                這一輪（步驟 2b）。PID 會被回收、時間窗會撈到別輪，invocation id 不會。
 OLD_PID=$(systemctl show -p MainPID --value "$UNIT")
+OLD_INVOCATION_ID=$(systemctl show -p InvocationID --value "$UNIT")
+
 if [ -z "$OLD_PID" ] || [ "$OLD_PID" = "0" ]; then
   echo "❌ 取不到 $UNIT 的 MainPID —— 無法確認 drain 狀態（fail closed）"; exit 1
 fi
-echo "舊進程 PID=$OLD_PID，開始等待其退出（上限 ${OBSERVE_TIMEOUT}s）"
+if [ -z "$OLD_INVOCATION_ID" ]; then
+  echo "⚠️ 取不到 InvocationID（systemd < 232？）—— 步驟 2b 將退回用 _PID=$OLD_PID 收斂"
+fi
+echo "要觀察的舊進程：PID=$OLD_PID InvocationID=${OLD_INVOCATION_ID:-（無）}"
 
+# 這兩個變數步驟 2b 與 post-deploy probe 都要用，記得在同一個 shell 內往下跑，
+# 或先 export 出去：
+export OLD_PID OLD_INVOCATION_ID
+
+# ---------------------------------------------------------------------------
+# (2) 觸發 shutdown —— 一定要非阻塞
+# ---------------------------------------------------------------------------
+# 沒有這一步，下面的迴圈會空等 960s 然後報失敗：本 runbook 到這裡為止只跑過
+# 唯讀的 `systemctl show`，沒有任何東西叫進程停下來。
+#
+# `--no-block` 是必要的，不是保險：`systemctl restart` 預設會**阻塞**到 unit
+# 重啟完成（最長 TimeoutStopSec，我們建議設 960s），等待會發生在 systemctl 內部，
+# 下面的觀察迴圈根本不會執行，也就沒有進度輸出、沒有 failed 早退、沒有分階段判定。
+systemctl --no-block restart "$UNIT"
+# 只停不啟用 `systemctl --no-block stop "$UNIT"`。
+
+# ⚠️ 若 shutdown 是「別人」觸發的（k8s rolling deploy、CI/CD job、手動 restart），
+#    就不要跑上面那行 —— 但**交接點不變**：必須在那個外部動作發生之前先做完 (1)，
+#    再從 (3) 開始觀察。捕捉晚於觸發 = 這整套判準失效。
+
+# ---------------------------------------------------------------------------
+# (3) 觀察舊 PID 消失
+# ---------------------------------------------------------------------------
 while [ $ELAPSED -lt $OBSERVE_TIMEOUT ]; do
   ACTIVE=$(systemctl show -p ActiveState --value "$UNIT")
   SUB=$(systemctl show -p SubState --value "$UNIT")
@@ -215,32 +254,67 @@ echo "❌ 外部觀察超時（${OBSERVE_TIMEOUT}s），舊進程 $OLD_PID 仍�
 exit 1
 ```
 
-**非 systemd 環境（k8s / pm2）用等價的 lifecycle 訊號**，原則一樣——問**編排層**、不要問正在死掉的 HTTP server：
+**非 systemd 環境（k8s / pm2）用等價的 lifecycle 訊號**，原則一樣——問**編排層**、不要問正在死掉的 HTTP server。**同樣的三段順序也適用**：先捕捉身分 → 再觸發 → 才觀察；log 也要綁到那個身分，不要用時間窗。
 
 ```bash
-# k8s：等舊 Pod 真的不見（Terminating -> 消失）
-kubectl wait --for=delete pod/<old-pod> -n parallax --timeout=960s
+# --- k8s ---
+# (1) 觸發前先記下舊 Pod 名（這是 k8s 的身分錨點，等同 systemd 的 InvocationID）
+OLD_POD=$(kubectl get pod -n parallax -l app=m3-dual-read \
+  -o jsonpath='{.items[0].metadata.name}')
+: "${OLD_POD:?取不到舊 Pod 名 —— fail closed}"
 
-# pm2：等該 process 的 pm_id 重啟計數變動 / 狀態離開 stopping
-pm2 jlist | jq -r '.[] | select(.name=="parallax-dual-read") | .pm2_env.status'
+# (2) 觸發（rollout restart 本身就是非阻塞的；不要加 kubectl rollout status 擋在這裡）
+kubectl rollout restart deployment/m3-dual-read -n parallax
+
+# (3) 等舊 Pod 真的不見（Terminating -> 消失）
+kubectl wait --for=delete "pod/$OLD_POD" -n parallax --timeout=960s
+
+# (2b) drain log 綁到那個 Pod，不用時間窗
+kubectl logs "pod/$OLD_POD" -n parallax --previous 2>/dev/null \
+  | grep -F "parallax.lifespan: drain " || echo "❓ 查無證據 → fail closed"
+
+# --- pm2 ---
+# (1) 觸發前記下該 process 的 pm_id + restart 次數當錨點
+OLD_RESTARTS=$(pm2 jlist | jq -r '.[] | select(.name=="parallax-dual-read") | .pm2_env.restart_time')
+# (2) 觸發：pm2 restart 預設會等，要非阻塞請用 --no-daemon 之外的方式或背景執行
+# (3) 觀察：restart_time 遞增 = 舊 process 已被換掉
+pm2 jlist | jq -r '.[] | select(.name=="parallax-dual-read") | "\(.pm2_env.status) restarts=\(.pm2_env.restart_time)"'
 ```
 
 ### 步驟 2b：drain 有沒有被 900s 切斷（**看 log，不看 counter**）
 
 舊進程退出**不等於** drain 乾淨——它可能是 hit 了 900s timeout 才收尾。判斷唯一可靠訊號是 WARNING log 行（限制 2）：
 
+> **證據必須綁定到「你正在觀察的那一個進程」，不能只靠時間窗。**
+> `journalctl --since` 的語意是「不早於某時間的所有 entry」，20 分鐘內若有第二次
+> restart，這個查詢會同時撈到**別輪**的 drain 行。後果是雙向的：舊的一筆
+> `drain complete` 會蓋掉「這一輪沒留下證據」而讓 fail-closed 失效（放行一個未確認的
+> shutdown），舊的一筆 `drain timeout` 也會誤判一次乾淨的 drain。
+> 所以下面用步驟 2 捕捉的 `OLD_INVOCATION_ID`（拿不到才退回 `_PID`）收斂。
+
 ```bash
 UNIT=parallax-dual-read
+# OLD_PID / OLD_INVOCATION_ID 來自步驟 2（觸發 shutdown 之前捕捉）。
+: "${OLD_PID:?步驟 2 沒帶下來；請回步驟 2 先捕捉身分再觸發 shutdown}"
 
-# 只看這次 drain 的時間窗；--since 用你送 SIGTERM 的時間
-DRAIN_LOG=$(journalctl -u "$UNIT" --since "-20 min" --no-pager 2>/dev/null \
+# 用 systemd 的 journal 欄位收斂到「這一輪 unit 執行」，不是時間窗。
+if [ -n "${OLD_INVOCATION_ID:-}" ]; then
+  SCOPE=(_SYSTEMD_INVOCATION_ID="$OLD_INVOCATION_ID")
+else
+  # systemd < 232 沒有 InvocationID；退回綁 PID（仍然比時間窗準）
+  SCOPE=(_PID="$OLD_PID")
+fi
+echo "journal scope: ${SCOPE[*]}"
+
+DRAIN_LOG=$(journalctl "${SCOPE[@]}" --no-pager 2>/dev/null \
   | grep -F "parallax.lifespan: drain " || true)
 
 if [ -z "$DRAIN_LOG" ]; then
   # fail closed：查無證據 = 無法確認，絕不報 clean
-  echo "❓ 無法確認 drain 結果：時間窗內找不到 'parallax.lifespan: drain ' log 行。"
-  echo "   可能是 log 收集沒到位、--since 窗口不對，或進程被 SIGKILL 沒來得及寫。"
-  echo "   請擴大時間窗 / 換 log 來源後重查；**不要**當成 clean drain。"
+  echo "❓ 無法確認 drain 結果：這一輪（${SCOPE[*]}）沒有 'parallax.lifespan: drain ' log 行。"
+  echo "   可能是 log 收集沒到位、身分捕捉晚於 shutdown 觸發，或進程被 SIGKILL 沒來得及寫。"
+  echo "   注意：**不要**改用 --since 時間窗來「找找看」——那會撈到別輪的 drain 行，"
+  echo "   讓別輪的成功變成這一輪的通行證。請修正身分捕捉時機後重跑。"
   exit 1
 fi
 
@@ -279,7 +353,14 @@ systemctl kill -s KILL "$UNIT"
 # SIGTERM 後的 PromQL 查詢，而那個值必定是 stale 的 SIGTERM 前樣本（限制 1），
 # 記進 postmortem 只會誤導。要知道被硬斷時還剩多少，看 drain timeout 那行
 # WARNING log —— 它印的是進程自己數的 final_count，是唯一真值。
-DRAIN_LOG_LINE=$(journalctl -u "$UNIT" --since "-20 min" --no-pager 2>/dev/null \
+#
+# 同樣綁 invocation（不用時間窗）：postmortem 記錯輪的 log 比沒記還糟。
+if [ -n "${OLD_INVOCATION_ID:-}" ]; then
+  SCOPE=(_SYSTEMD_INVOCATION_ID="$OLD_INVOCATION_ID")
+else
+  SCOPE=(_PID="$OLD_PID")
+fi
+DRAIN_LOG_LINE=$(journalctl "${SCOPE[@]}" --no-pager 2>/dev/null \
   | grep -F "parallax.lifespan: drain timeout after" | tail -1)
 
 cat >> /var/log/parallax/drain-events.jsonl <<EOF
@@ -346,13 +427,23 @@ fi
 #    用 // "0" 湊成 0。那個 counter 在生產環境永遠掃不到（限制 2），所以舊版
 #    在「真的 timeout」時會印 ✅ 過去 10 min 無 drain timeout —— 正好報反。
 #    改用 durable log 訊號，查無證據時 fail closed。
+#
+#    ⚠️ 而且必須綁到「被觀察的那一輪」，不能用 --since 時間窗：deploy 前後常常
+#    不只一次 restart，時間窗會撈到別輪，讓別輪的 drain complete 變成這一輪的
+#    通行證（fail-closed 失效）。沿用步驟 2 在觸發前捕捉的身分。
 UNIT=parallax-dual-read
-DRAIN_LOG=$(journalctl -u "$UNIT" --since "-20 min" --no-pager 2>/dev/null \
+: "${OLD_PID:?步驟 2 沒帶下來；post-deploy 驗證必須沿用同一輪的身分}"
+if [ -n "${OLD_INVOCATION_ID:-}" ]; then
+  SCOPE=(_SYSTEMD_INVOCATION_ID="$OLD_INVOCATION_ID")
+else
+  SCOPE=(_PID="$OLD_PID")
+fi
+DRAIN_LOG=$(journalctl "${SCOPE[@]}" --no-pager 2>/dev/null \
   | grep -F "parallax.lifespan: drain " || true)
 
 if [ -z "$DRAIN_LOG" ]; then
-  echo "❓ 無法確認 drain 結果：時間窗內查無 'parallax.lifespan: drain ' log 行。"
-  echo "   這是「不知道」，不是「沒問題」——請擴大時間窗或換 log 來源後重查。"; exit 1
+  echo "❓ 無法確認 drain 結果：這一輪（${SCOPE[*]}）查無 'parallax.lifespan: drain ' log 行。"
+  echo "   這是「不知道」，不是「沒問題」——修正身分捕捉時機後重查，別改用時間窗。"; exit 1
 elif printf '%s\n' "$DRAIN_LOG" | grep -qF "drain timeout after"; then
   echo "❌ 舊實例 drain 被 900s timeout 切斷（in-flight 被硬斷）"
   printf '%s\n' "$DRAIN_LOG"; exit 1
@@ -431,6 +522,11 @@ echo "dual_read_discrepancy_rate natural=$DISCREPANCY_NATURAL synthetic=$DISCREP
 >
 > 舊版這裡寫的是「deploy job 等待 `parallax_inflight_requests == 0`」，那個 gate **不可能通過**：SIGTERM 後 socket 先關，Prometheus 讀到的是 stale 正值然後 empty，兩者都不是 0（限制 1）。實作請直接用步驟 2 的迴圈（`systemctl show -p MainPID` + `kill -0` 等舊 PID 消失；k8s 用 `kubectl wait --for=delete pod/<old-pod>`），observe timeout 960s（對齊 server-side `DRAIN_TIMEOUT_SECONDS=900` + buffer），並在 gate 後接步驟 2b 的 log 檢查確認不是被硬斷的。
 >
+> **pipeline 實作三個順序要求**（照步驟 2）：
+> 1. deploy job 要在**自己觸發 restart 之前**先跑 `systemctl show -p MainPID,InvocationID`，把兩個值存成 job 變數；
+> 2. 觸發用 `systemctl --no-block restart`（阻塞版會把等待藏在 systemctl 裡，gate 的觀察與逾時邏輯就形同虛設）；
+> 3. 步驟 2b 的 log 檢查用存下來的 `InvocationID` 收斂，**不要**用 `--since` 時間窗——CI 環境常常短時間內多次 restart，時間窗會把別輪的 `drain complete` 當成這一輪的通行證。
+>
 > gate 取不到 lifecycle 訊號時**一律 fail closed**（當作未完成），不要因為查不到就放行。
 
 ---
@@ -493,18 +589,23 @@ Deploy / Restart 觸發
   ├─ [步驟 1] SIGTERM 前：PromQL 看 parallax_inflight_requests（平衡檢查）
   │            ⚠️ 這是 PromQL 唯一有效的時機
   │
-  ├─ SIGTERM 發送 → 舊版本停止接受新請求
+  ├─ [步驟 2-(1)] **觸發前**捕捉身分：MainPID + InvocationID
+  │            ⚠️ 順序硬要求：捕捉晚於觸發 → 錨點變成新進程，2 與 2b 同時失效
+  │            取不到 MainPID → ❓ fail closed
+  │
+  ├─ [步驟 2-(2)] 觸發 shutdown：systemctl --no-block restart（或外部 actor）
+  │            ⚠️ 一定要非阻塞，否則等待藏在 systemctl 裡，下面的迴圈不會跑
   │            ⚠️ 從這一刻起 Prometheus 掃不到該進程（socket 已關）
   │            ⚠️ inflight 的下降過程與 drain_timeout counter 都看不到
   │
-  ├─ [步驟 2] 等 lifecycle 訊號：舊 MainPID 是否退出（systemd / k8s / pm2）
-  │     │      取不到訊號 → ❓ fail closed，當作未完成
+  ├─ [步驟 2-(3)] 等 lifecycle 訊號：舊 MainPID 是否退出（systemd / k8s / pm2）
   │     │
   │     ├─ ≤ 960s 舊進程退出 → 進入步驟 2b（退出 ≠ 乾淨）
   │     │
   │     └─ 逾時仍未退出 / unit failed → ❌ 進入步驟 3
   │
-  ├─ [步驟 2b] journalctl 抓 "parallax.lifespan: drain " log 行
+  ├─ [步驟 2b] journalctl 綁 _SYSTEMD_INVOCATION_ID（退回 _PID）抓 drain log 行
+  │            ⚠️ 不可用 --since 時間窗：會撈到別輪，讓別輪的成功放行這一輪
   │     │
   │     ├─ "drain complete"      → ✅ drain 自然完成
   │     ├─ "drain timeout after" → ❌ 被 900s 切斷 → 記錄事件 + postmortem

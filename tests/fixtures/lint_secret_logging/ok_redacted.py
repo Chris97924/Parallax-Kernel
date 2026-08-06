@@ -47,6 +47,14 @@ def emit_redacted(token: str, headers: dict[str, str], url: str) -> None:
     _log.debug("aphelion.request", extra={"bearer_token": bool(token)})
     audit_log.write(event="aphelion.read", authorization="<REDACTED>")
 
+    # Named mappings are followed now, so the bounded forms have to stay legal
+    # there too — otherwise following the binding would just relocate the
+    # false positives instead of finding real leaks.
+    safe_extra = {"Authorization": "<REDACTED>", "token_present": bool(token)}
+    _log.info("aphelion.request", extra=safe_extra)
+    derived_extra = {"authorization": token_hash}
+    audit_log.write(event="aphelion.read", **derived_extra)
+
     # Non-credential values are untouched by the rule.
     _log.info("aphelion.request", extra={"url": url, "header_count": len(headers)})
 

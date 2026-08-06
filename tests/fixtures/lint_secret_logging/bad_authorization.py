@@ -88,3 +88,11 @@ def leak_labelled_mapping_entry(value: str) -> None:
 def leak_labelled_keyword(value: str) -> None:
     # 11 — same shape via a keyword name rather than a mapping key.
     audit_log.write(event="aphelion.read", authorization=value)
+
+
+def leak_named_mapping(value: str) -> None:
+    # 12 — gate r2 P1: the ordinary two-step form. Only `Name('extra')` reaches
+    # the call, so a check that walks dict literals *inside* the sink sees
+    # nothing at all — while the credential is one line up in plain sight.
+    extra = {"Authorization": value}
+    _log.info("request", extra=extra)

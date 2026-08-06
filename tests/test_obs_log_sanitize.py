@@ -220,16 +220,88 @@ def test_allowlisted_type_with_a_dynamic_tag_falls_back_to_digest() -> None:
         ("too_long", "e" * 65),
         ("empty", ""),
         ("non_str", 42),
+        # REGRESSION (gate r2): a shape rule does not discriminate. Both of
+        # these satisfy ^[a-z0-9_]{1,64}$ — which is exactly what an API key
+        # looks like — so only closed-set membership rejects them.
+        ("secret_shaped_lowercase", "mysecrettoken123"),
+        ("secret_shaped_api_key", "sk_live_4eb2a91c8f"),
     ],
 )
-def test_only_enum_shaped_tags_are_emitted(label: str, reason: object) -> None:
-    """The tag vocabulary is documented as enum-like; anything outside that
-    shape is not a tag and is treated as unbounded content."""
+def test_only_known_reasons_are_emitted(label: str, reason: object) -> None:
+    """The tag must be a *member* of the documented vocabulary, not merely look
+    like one. Anything else is unbounded content and gets digested."""
     exc = AphelionUnreachableError("placeholder")
     exc.reason = reason  # type: ignore[assignment]
     _, payload = _emit("parallax.test.tagshape", "tagshape", exc=exc)
     assert "exc_tag" not in payload, label
     assert payload["exc_digest"], label
+
+
+def test_aphelion_reason_enum_matches_the_raise_sites() -> None:
+    """Keep the closed set and the code that feeds it in step, both directions.
+
+    The set lives in ``parallax.obs.log`` while the vocabulary it describes
+    lives in ``parallax.router`` — a deliberate duplication, because ``obs`` must
+    not import ``router``. This test is what makes the duplication safe:
+
+    * a reason raised in-repo but absent from the set fails here, rather than
+      silently degrading to a digest and costing operators the tag;
+    * a set member no longer produced anywhere fails here too, so the vocabulary
+      cannot quietly rot into a wider allowlist than the code justifies.
+    """
+    import ast
+    from pathlib import Path
+
+    from parallax.obs.log import _APHELION_UNREACHABLE_REASONS, _RESERVED_APHELION_REASONS
+
+    # The single documented indirect producer: its return literals are raised
+    # via ``AphelionUnreachableError(reason)`` at parallax/apex/router.py.
+    indirect_producers = {"classify_package_exception"}
+
+    repo_root = Path(__file__).resolve().parents[1]
+    harvested: set[str] = set()
+    indirect_sites: set[tuple[str, str]] = set()
+
+    for path in sorted((repo_root / "parallax").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        relative = path.relative_to(repo_root).as_posix()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in indirect_producers:
+                harvested |= {
+                    child.value.value
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Return)
+                    and isinstance(child.value, ast.Constant)
+                    and isinstance(child.value.value, str)
+                }
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if name != "AphelionUnreachableError":
+                continue
+            for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                    harvested.add(argument.value)
+                else:
+                    indirect_sites.add((relative, ast.unparse(argument)))
+
+    known = _APHELION_UNREACHABLE_REASONS | _RESERVED_APHELION_REASONS
+    assert harvested - known == set(), (
+        "these reasons are raised in parallax/ but are not in the closed set, so "
+        "they would be digested instead of shown:\n" + "\n".join(sorted(harvested - known))
+    )
+    assert _APHELION_UNREACHABLE_REASONS - harvested == set(), (
+        "these set members are no longer raised anywhere in parallax/ — remove them "
+        "or move them to the reserved set:\n"
+        + "\n".join(sorted(_APHELION_UNREACHABLE_REASONS - harvested))
+    )
+    # If a NEW indirect producer appears, the harvest above silently stops being
+    # complete. Pin the one that exists so that shows up as a failure here.
+    assert indirect_sites == {("parallax/apex/router.py", "reason")}, (
+        "unexpected indirect AphelionUnreachableError argument(s); the reason harvest "
+        f"must be taught about them: {sorted(indirect_sites)}"
+    )
 
 
 def test_documented_tag_vocabulary_still_passes() -> None:

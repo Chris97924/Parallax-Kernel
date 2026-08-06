@@ -21,6 +21,29 @@ NO. Payload safety for those is enforced at runtime instead, by
 ``parallax.obs.log.safe_log_warning``. Widening this rule is a deliberate
 decision, not an oversight.
 
+Known limitations — stated rather than papered over
+---------------------------------------------------
+
+This is a name-and-label heuristic over the AST, not taint analysis. It resolves
+**one** level of local dataflow: a mapping bound by simple assignment to a name
+in the same scope, then passed to a sink. Everything below is out of reach, and
+listing it is the point — a gate whose edges are documented is worth more than
+one that implies completeness it does not have:
+
+* mappings built or returned by another function, or reached through an
+  attribute or subscript (``self.headers``, ``cfg["hdrs"]``);
+* mappings built dynamically — ``dict(...)``, comprehensions, ``{**a, **b}``;
+* mutation after binding — ``extra["Authorization"] = v``, ``extra.update(...)``;
+* non-literal keys (``{HEADER_CONST: v}``), since the label is what it reads;
+* credentials in a value whose *name* says nothing and whose *label* says
+  nothing either.
+
+The consequence is bounded, and that is why the boundary is acceptable: payload
+safety at runtime is enforced by ``parallax.obs.log.safe_log_warning``, which
+default-denies every extra it is handed regardless of how the value got there.
+This gate exists to fail the build at the line someone writes the obvious form,
+not to be the last line of defence.
+
 Usage::
 
     python scripts/lint_no_raw_secret_logging.py [PATH ...]
@@ -36,6 +59,7 @@ import argparse
 import ast
 import re
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 # Identifier fragments that mark an expression as credential-bearing. Matched
@@ -194,22 +218,23 @@ def _is_bounded_value(node: ast.AST) -> bool:
     return False
 
 
-def _labelled_entries(call: ast.Call) -> list[tuple[str, ast.AST]]:
+def _labelled_entries(call: ast.Call, arguments: Sequence[ast.AST]) -> list[tuple[str, ast.AST]]:
     """``(label, value)`` pairs where a caller names the slot it is filling.
 
     Two shapes, both of which put the credential's *name* somewhere the
-    expression walker cannot see it — the whole point of this finding:
+    expression walker cannot see it:
 
     * ``logger.info("req", extra={"Authorization": value})`` — the label is a
       mapping key, the value an unmarked local.
     * ``audit_log.write(authorization=value)`` — the label is a keyword name.
 
-    Dict literals are collected recursively so a nested ``extra={"h": {...}}``
-    is covered. Standalone string literals are deliberately NOT collected: log
-    prose mentioning a bearer token is not a leak.
+    ``arguments`` is the resolved argument list, so a mapping bound to a name
+    one line earlier is included. Dict literals are collected recursively, so a
+    nested ``extra={"h": {...}}`` is covered too. Standalone string literals are
+    deliberately NOT collected: log prose mentioning a bearer token is not a leak.
     """
     entries: list[tuple[str, ast.AST]] = [(kw.arg, kw.value) for kw in call.keywords if kw.arg]
-    for argument in [*call.args, *(kw.value for kw in call.keywords)]:
+    for argument in arguments:
         for node in ast.walk(argument):
             if not isinstance(node, ast.Dict):
                 continue
@@ -219,11 +244,77 @@ def _labelled_entries(call: ast.Call) -> list[tuple[str, ast.AST]]:
     return entries
 
 
+def _mapping_bindings(scope: ast.AST) -> dict[str, list[ast.Dict]]:
+    """``name -> dict literals`` bound to it by simple assignment in one scope.
+
+    One level of dataflow, which is what closes the ordinary two-step form::
+
+        extra = {"Authorization": value}
+        logger.info("request", extra=extra)
+
+    Nested functions, lambdas and classes are not descended into — they are
+    separate scopes, and pretending otherwise would report bindings that never
+    reach the sink. A name assigned more than once contributes every mapping it
+    was ever bound to: over-approximating is the safe direction for a gate whose
+    false negatives are silent and whose false positives are one comment away.
+    """
+    bindings: dict[str, list[ast.Dict]] = {}
+
+    def walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                continue  # its own scope
+            if isinstance(child, ast.Assign) and isinstance(child.value, ast.Dict):
+                for target in child.targets:
+                    if isinstance(target, ast.Name):
+                        bindings.setdefault(target.id, []).append(child.value)
+            elif (
+                isinstance(child, ast.AnnAssign)
+                and isinstance(child.value, ast.Dict)
+                and isinstance(child.target, ast.Name)
+            ):
+                bindings.setdefault(child.target.id, []).append(child.value)
+            walk(child)
+
+    walk(scope)
+    return bindings
+
+
 class _Checker(ast.NodeVisitor):
     def __init__(self, path: Path, source_lines: list[str]) -> None:
         self.path = path
         self.lines = source_lines
         self.violations: list[tuple[int, int, str]] = []
+        self.bindings: dict[str, list[ast.Dict]] = {}
+
+    def _enter_scope(self, node: ast.AST) -> None:
+        outer = self.bindings
+        self.bindings = _mapping_bindings(node)
+        self.generic_visit(node)
+        self.bindings = outer
+
+    def visit_Module(self, node: ast.Module) -> None:  # noqa: N802 — ast.NodeVisitor API
+        self._enter_scope(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        self._enter_scope(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+        self._enter_scope(node)
+
+    def _resolved_arguments(self, call: ast.Call) -> list[ast.AST]:
+        """Call arguments, with names substituted by the mappings they hold.
+
+        The bound literal is *added*, not swapped in, so a violation is reported
+        at the line where the credential entered the mapping — which is where a
+        reader has to go to fix it — while the message still names the sink.
+        """
+        resolved: list[ast.AST] = []
+        for argument in [*call.args, *(kw.value for kw in call.keywords)]:
+            resolved.append(argument)
+            if isinstance(argument, ast.Name):
+                resolved.extend(self.bindings.get(argument.id, ()))
+        return resolved
 
     def _record(self, node: ast.AST, fallback: ast.Call, detail: str, seen: set[str]) -> None:
         line = getattr(node, "lineno", fallback.lineno)
@@ -239,8 +330,7 @@ class _Checker(ast.NodeVisitor):
         if sink is not None:
             seen: set[str] = set()
             # (a) the expression itself names a credential.
-            arguments: list[ast.AST] = list(node.args)
-            arguments += [kw.value for kw in node.keywords]
+            arguments = self._resolved_arguments(node)
             for argument in arguments:
                 for rendered in _secret_subexpressions(argument):
                     self._record(
@@ -249,7 +339,7 @@ class _Checker(ast.NodeVisitor):
             # (b) the expression is anonymous but the *label* names a credential
             # — `extra={"Authorization": value}` is the exact raw-header flow the
             # spec rule prohibits, and (a) cannot see it.
-            for label, value in _labelled_entries(node):
+            for label, value in _labelled_entries(node, arguments):
                 if not _is_raw_credential(label) or _is_bounded_value(value):
                     continue
                 if _secret_subexpressions(value):

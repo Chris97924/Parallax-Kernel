@@ -121,29 +121,74 @@ _SAFE_STR_KEYS = frozenset(
 # the decision explicitly instead of leaving it implicit in the allowlist above.
 _IDENTIFIER_STR_KEYS = frozenset({"user_id"})
 
-# Exception types carrying an enum-like tag that may be emitted, mapped to the
-# attribute holding it. Referenced by dotted name so ``parallax.obs`` keeps no
-# dependency on ``parallax.router``. Matching is on the EXACT type: a subclass
-# may override ``__init__``, so it does not inherit the allowance.
+# ---------------------------------------------------------------------------
+# Exception-tag allowlist
+# ---------------------------------------------------------------------------
+# ``AphelionUnreachableError`` is raisable by an injected ``QueryPort``
+# implemented outside this repo, and ``shadow.py``'s bare ``except Exception``
+# hands whatever it constructed straight to the logger. So neither the message
+# template, nor ``args``, nor the tag's contents can be assumed to be ours.
 #
-#   * ``AphelionUnreachableError`` carries ``reason``, which
-#     ``m5-entry-spec.md`` §3.1a ("Error reason sanitisation") binds to an enum
-#     — never a response body, URL or token.
+# Membership, not shape. A shape rule (``^[a-z0-9_]{1,64}$``) reads as tight but
+# is not: ``sk_live_4eb2a91c8f`` and ``mysecrettoken123`` both satisfy it, and a
+# lowercase-alphanumeric run is exactly what an API key looks like. The tag is
+# therefore checked against a closed set, and anything outside it — including a
+# perfectly tag-shaped string — falls back to the digest.
 #
-# Only the tag is emitted, never ``str(exc)``. The exception is raisable by an
-# injected ``QueryPort`` implemented outside this repo, so neither the message
-# template nor the tag's contents can be assumed: ``shadow.py``'s bare-``except
-# Exception`` handler will hand us whatever that implementation constructed.
-# The tag is therefore validated on the way out, and a tag that does not look
-# like an enum member falls back to the digest like any other exception.
-_MESSAGE_SAFE_EXC_TYPES = {
-    "parallax.router.aphelion_adapter.AphelionUnreachableError": "reason",
-}
+# Kept honest by ``test_aphelion_reason_enum_matches_the_raise_sites``, which
+# harvests the literals actually raised in ``parallax/`` and asserts this set
+# matches: a new reason that never reaches here fails the test rather than
+# silently degrading to a digest, and a member that no longer corresponds to
+# any raise site fails it too.
+_APHELION_UNREACHABLE_REASONS = frozenset(
+    {
+        # Raised directly — parallax/router/aphelion_adapter.py, parallax/apex/router.py.
+        "audit_db_integrity_error",
+        "audit_db_usage_error",
+        "audit_db_write_failed",
+        "audit_row_invalid",
+        "audit_write_order_violation",
+        "claim_loader_error",
+        "claim_schema_error",
+        "envelope_checksum_mismatch",
+        "package_corrupt",
+        "package_dir_inaccessible",
+        # Returned by parallax.apex.router.classify_package_exception, which is
+        # raised indirectly at parallax/apex/router.py (the one non-literal site).
+        "lib_error",
+        "package_missing",
+        "signer_untrusted",
+        "unsigned_package",
+    }
+)
 
-#: Shape an allowlisted exception's tag must have to be emitted verbatim.
-#: Covers every tag in the documented vocabulary (``timeout``, ``http_5xx``,
-#: ``claim_schema_error``, ``envelope_checksum_mismatch``, …).
-_SAFE_TAG_PATTERN = re.compile(r"^[a-z0-9_]{1,64}$")
+# Documented in the ``AphelionUnreachableError`` docstring and ``m5-entry-spec.md``
+# §3.1a but not raised anywhere in-repo yet. They are still legal on the wire —
+# an injected port may raise ``timeout`` today, and the HTTP-era tags land with
+# M6/M7 — so they are allowed, and exempted from the "no stale members" half of
+# the consistency test.
+_RESERVED_APHELION_REASONS = frozenset(
+    {
+        "timeout",
+        "connection_error",
+        "unsafe_archive",
+        "http_5xx",
+        "tls_fail",
+    }
+)
+
+# Exception types carrying an enum-like tag that may be emitted, mapped to
+# ``(attribute holding the tag, closed set of legal values)``. Referenced by
+# dotted name so ``parallax.obs`` keeps no dependency on ``parallax.router``;
+# the consistency test is what keeps the two in step. Matching is on the EXACT
+# type: a subclass may override ``__init__``, so it does not inherit the
+# allowance. Only the tag is ever emitted, never ``str(exc)``.
+_MESSAGE_SAFE_EXC_TYPES: dict[str, tuple[str, frozenset[str]]] = {
+    "parallax.router.aphelion_adapter.AphelionUnreachableError": (
+        "reason",
+        _APHELION_UNREACHABLE_REASONS | _RESERVED_APHELION_REASONS,
+    ),
+}
 
 # The event name reaches the sink twice — as the record's ``msg`` and as its
 # ``event`` field — and on neither route does it pass through the extras
@@ -191,11 +236,15 @@ def exc_fields(exc: BaseException) -> dict[str, object]:
     """Value-free description of an exception, safe to emit to a log sink.
 
     Always yields ``exc_class``. For the exact types in
-    :data:`_MESSAGE_SAFE_EXC_TYPES` whose tag passes :data:`_SAFE_TAG_PATTERN`,
-    yields that validated tag as ``exc_tag``. Everything else — including an
-    allowlisted type carrying a tag that does not look like an enum member —
-    yields a ``sha256`` digest plus a length, so repeated identical failures stay
+    :data:`_MESSAGE_SAFE_EXC_TYPES` whose tag is a *member of that type's closed
+    set*, yields the tag as ``exc_tag``. Everything else — including an
+    allowlisted type carrying an unrecognised tag, however well-shaped — yields a
+    ``sha256`` digest plus a length, so repeated identical failures stay
     correlatable and greppable without their content reaching stderr.
+
+    Membership rather than shape, because shape does not discriminate: a tag
+    rule like ``^[a-z0-9_]{1,64}$`` accepts ``sk_live_4eb2a91c8f`` just as
+    happily as ``timeout``.
 
     ``str(exc)`` is never emitted, not even for allowlisted types. The allowlist
     describes the *tag*, not the message: the exception is raisable by an
@@ -215,10 +264,11 @@ def exc_fields(exc: BaseException) -> dict[str, object]:
     # Bare name, not the dotted one: this is what the call sites emitted before
     # and what existing log consumers grep for.
     fields: dict[str, object] = {"exc_class": exc_type.__name__}
-    tag_attr = _MESSAGE_SAFE_EXC_TYPES.get(_type_name(exc_type))
-    if tag_attr is not None:
+    spec = _MESSAGE_SAFE_EXC_TYPES.get(_type_name(exc_type))
+    if spec is not None:
+        tag_attr, allowed = spec
         tag = getattr(exc, tag_attr, None)
-        if isinstance(tag, str) and _SAFE_TAG_PATTERN.match(tag):
+        if isinstance(tag, str) and tag in allowed:
             fields["exc_tag"] = tag
             return fields
     message = _render(exc)

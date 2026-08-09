@@ -110,14 +110,25 @@ async def _drain_inflight(
             final_count = get_inflight_count()
             drain_timeout_total.inc()
             # Sentence for a human reading the log, structured fields for
-            # whatever alerts on it. Both, because the two audiences read
-            # different renderings: the stdlib default formatter emits only the
-            # message, a JSON sink emits the extras.
+            # whatever alerts on it — and the key=value tail below repeats the
+            # same fields IN THE MESSAGE ITSELF, not only in extra. Both
+            # audiences need to find them in the same rendering: ``parallax
+            # serve`` (parallax.cli._cmd_serve) hands uvicorn no custom
+            # log_config, so under the canonical launcher this is a plain
+            # logging.getLogger with the stdlib default formatter, which
+            # renders only record.getMessage() and never touches extra — a
+            # JSON sink is not guaranteed to be attached (codex #107 review).
+            # The tail is what stays alert-matchable there; extra stays for
+            # sinks that do parse it.
             _log.warning(
                 "parallax.lifespan: drain timeout after %.1fs — %d request(s) still "
-                "in flight; proceeding with shutdown",
+                "in flight; proceeding with shutdown "
+                "(event=%s inflight_count=%d timeout_seconds=%.1f)",
                 timeout_seconds,
                 final_count,
+                DRAIN_TIMEOUT_EVENT,
+                final_count,
+                timeout_seconds,
                 extra={
                     "event": DRAIN_TIMEOUT_EVENT,
                     "inflight_count": final_count,

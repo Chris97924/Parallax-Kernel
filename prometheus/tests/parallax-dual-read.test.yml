@@ -676,12 +676,17 @@ tests:
               description: |
                 Lifespan drain handler hit the 15-minute timeout — in-flight requests
                 were force-cut. Investigate stuck connections or upstream blocks.
-                KNOWN LATENT (#102 review): the increment happens during lifespan
-                shutdown, after the listening socket has closed, so Prometheus
-                never scrapes the post-increment value and this alert is expected
-                to stay silent even on a real timeout. Its absence is NOT evidence
-                of a clean drain — grep the service log for
-                "parallax.lifespan: drain timeout after".
+                KNOWN LATENT (#102 review, re-measured in #106): the increment
+                happens during lifespan shutdown, after the listening socket has
+                closed, so Prometheus never scrapes the post-increment value and
+                this alert is expected to stay silent even on a real timeout. Its
+                absence is NOT evidence of a clean drain.
+                USE THE LOG INSTEAD: the producer emits a structured WARNING keyed
+                event="drain_timeout" (parallax.server.lifespan.DRAIN_TIMEOUT_EVENT)
+                carrying inflight_count and timeout_seconds. That key is the
+                supported match target — match on it rather than on the message
+                prose, which is free to change. Wiring it to a destination is
+                deliberately left open (#106 policy deferral).
 
   # -------------------------------------------------------------------------
   # 16. SILENT when every drain completed cleanly. Kills the >= 0 mutant, as
@@ -759,12 +764,17 @@ tests:
               description: |
                 Lifespan drain handler hit the 15-minute timeout — in-flight requests
                 were force-cut. Investigate stuck connections or upstream blocks.
-                KNOWN LATENT (#102 review): the increment happens during lifespan
-                shutdown, after the listening socket has closed, so Prometheus
-                never scrapes the post-increment value and this alert is expected
-                to stay silent even on a real timeout. Its absence is NOT evidence
-                of a clean drain — grep the service log for
-                "parallax.lifespan: drain timeout after".
+                KNOWN LATENT (#102 review, re-measured in #106): the increment
+                happens during lifespan shutdown, after the listening socket has
+                closed, so Prometheus never scrapes the post-increment value and
+                this alert is expected to stay silent even on a real timeout. Its
+                absence is NOT evidence of a clean drain.
+                USE THE LOG INSTEAD: the producer emits a structured WARNING keyed
+                event="drain_timeout" (parallax.server.lifespan.DRAIN_TIMEOUT_EVENT)
+                carrying inflight_count and timeout_seconds. That key is the
+                supported match target — match on it rather than on the message
+                prose, which is free to change. Wiring it to a destination is
+                deliberately left open (#106 policy deferral).
 
   # -------------------------------------------------------------------------
   # 20. THE PRODUCTION SHAPE — and it is SILENT. (#102 review P1-2.)

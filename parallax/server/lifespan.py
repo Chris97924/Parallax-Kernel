@@ -33,6 +33,7 @@ from parallax.apex.audit_db import open_audit_db, resolve_audit_db_path
 from parallax.router.inflight import get_inflight_count
 
 __all__ = [
+    "DRAIN_TIMEOUT_EVENT",
     "DRAIN_TIMEOUT_SECONDS",
     "DRAIN_POLL_INTERVAL_SECONDS",
     "drain_timeout_total",
@@ -43,6 +44,20 @@ _log = logging.getLogger("parallax.server.lifespan")
 
 DRAIN_TIMEOUT_SECONDS: Final[float] = 900.0  # 15 minutes
 DRAIN_POLL_INTERVAL_SECONDS: Final[float] = 0.5
+
+#: Structured key on the drain-timeout log record — the one producer-side signal
+#: for this event that survives the process (#106.3).
+#:
+#: ``drain_timeout_total`` cannot carry it: uvicorn closes the listening socket
+#: before running lifespan shutdown, so the increment below happens when no
+#: scrape can still reach this process, and ``DrainTimeoutDetected`` evaluates
+#: against a series whose last sample predates the event it is meant to catch.
+#: The log stream is what outlives the process, so the event gets a key an alert
+#: can match exactly, instead of a prose fragment that stops matching the day
+#: the sentence is reworded. Named here rather than inlined so the rule
+#: annotation, the alert, and this producer can be pinned to one another by
+#: ``tests/server/test_drain_timeout_durable_signal_106.py``.
+DRAIN_TIMEOUT_EVENT: Final[str] = "drain_timeout"
 
 
 # prometheus_client raises ValueError on duplicate registration.
@@ -94,11 +109,20 @@ async def _drain_inflight(
         if remaining <= 0:
             final_count = get_inflight_count()
             drain_timeout_total.inc()
+            # Sentence for a human reading the log, structured fields for
+            # whatever alerts on it. Both, because the two audiences read
+            # different renderings: the stdlib default formatter emits only the
+            # message, a JSON sink emits the extras.
             _log.warning(
                 "parallax.lifespan: drain timeout after %.1fs — %d request(s) still "
                 "in flight; proceeding with shutdown",
                 timeout_seconds,
                 final_count,
+                extra={
+                    "event": DRAIN_TIMEOUT_EVENT,
+                    "inflight_count": final_count,
+                    "timeout_seconds": timeout_seconds,
+                },
             )
             return
 

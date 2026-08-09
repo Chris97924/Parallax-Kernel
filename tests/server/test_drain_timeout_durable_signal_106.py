@@ -118,6 +118,43 @@ def test_the_event_stays_a_warning_and_still_increments_the_counter(
     assert _timeout_records(caplog)[0].levelno == logging.WARNING
 
 
+def test_the_rendered_line_carries_the_key_and_numbers_not_just_the_extra(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The key has to survive ``record.getMessage()`` alone, not only ``extra``.
+
+    Codex review on #107: ``parallax serve`` (parallax.cli._cmd_serve) hands
+    uvicorn no custom ``log_config``, so under the canonical launcher this
+    logger has no JSON formatter attached — a plain ``StreamHandler`` there
+    would call the stdlib default formatter, which renders only
+    ``record.getMessage()`` and never touches ``extra``. Every other test in
+    this file reads the LogRecord's attributes directly (``getattr(record,
+    "inflight_count", ...)``), so a regression that moved the key back into
+    ``extra``-only would pass all of them while the alert's match target
+    silently stopped reaching stderr in that environment. This formats
+    through the same stdlib-default shape a bare handler would use.
+    """
+    inflight_gauge.set(0)
+    inflight_gauge.inc()
+    inflight_gauge.inc()
+
+    with caplog.at_level(logging.WARNING, logger=_LIFESPAN_LOGGER):
+        asyncio.run(_drain_inflight(timeout_seconds=2.5, poll_interval_seconds=0.05))
+
+    record = _timeout_records(caplog)[0]
+    rendered = logging.Formatter("%(levelname)s: %(message)s").format(record)
+
+    assert f"event={DRAIN_TIMEOUT_EVENT}" in rendered, (
+        f"rendered line is missing the structured key. Got: {rendered!r}"
+    )
+    assert "inflight_count=2" in rendered, (
+        f"rendered line is missing the inflight count. Got: {rendered!r}"
+    )
+    assert "timeout_seconds=2.5" in rendered, (
+        f"rendered line is missing the timeout. Got: {rendered!r}"
+    )
+
+
 def test_a_clean_drain_emits_no_timeout_event(caplog: pytest.LogCaptureFixture) -> None:
     """Negative control — an always-on key would make the alert fire forever."""
     inflight_gauge.set(0)
@@ -127,6 +164,15 @@ def test_a_clean_drain_emits_no_timeout_event(caplog: pytest.LogCaptureFixture) 
         asyncio.run(_drain_inflight(timeout_seconds=1.0, poll_interval_seconds=0.05))
 
     assert _timeout_records(caplog) == []
+    # Render-path half of the same control: the key=value tail lives only on
+    # the timeout WARNING, so the clean-drain INFO line must not carry it
+    # either once rendered through a plain formatter — not just absent from
+    # the LogRecord's ``extra``.
+    formatter = logging.Formatter("%(levelname)s: %(message)s")
+    rendered_lines = [formatter.format(r) for r in caplog.records if r.name == _LIFESPAN_LOGGER]
+    assert not any(f"event={DRAIN_TIMEOUT_EVENT}" in line for line in rendered_lines), (
+        f"clean drain must not render the timeout event key. Saw: {rendered_lines}"
+    )
 
 
 def test_the_alert_rule_documents_the_key_it_must_be_replaced_by() -> None:

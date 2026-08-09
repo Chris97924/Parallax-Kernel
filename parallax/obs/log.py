@@ -23,6 +23,7 @@ __all__ = [
     "REDACTED_PREFIX",
     "UNSAFE_EVENT_NAME",
     "exc_fields",
+    "safe_log_error",
     "safe_log_warning",
     "sanitize_log_extras",
 ]
@@ -99,6 +100,10 @@ _SAFE_STR_KEYS = frozenset(
         "conflict_event_id",
         "correlation_id",
         "crosswalk_status",
+        # Generated per envelope (uuid4) — the correlation handle between an
+        # audit-write failure log and the envelope that was abandoned. Same
+        # class as ``conflict_event_id``: machine-minted, no caller input.
+        "envelope_message_id",
         "event",
         "exc_class",
         "outcome",
@@ -204,6 +209,16 @@ _MESSAGE_SAFE_EXC_TYPES: dict[str, tuple[str, frozenset[str]]] = {
 # ``test_event_name_enum_matches_the_call_sites``, which asserts both directions.
 _KNOWN_EVENT_NAMES = frozenset(
     {
+        # parallax/router/aphelion_adapter.py — the audit-DB write path (#106.5).
+        # These were the five ``_log.error(..., exc_info=True)`` sites: a full
+        # traceback, plus ``str(exc)`` interpolated into the message, on a write
+        # where ``session_id = request.user_id`` is live. The names double as the
+        # ``AphelionUnreachableError`` reasons raised alongside them, so a log
+        # search and an ``exc_tag`` search land on the same vocabulary.
+        "audit_db_integrity_error",
+        "audit_db_usage_error",
+        "audit_db_write_failed",
+        "audit_write_order_violation",
         # parallax/router/dual_read.py
         "breaker_is_tripped_check_failed",
         "breaker_record_failed",
@@ -357,6 +372,68 @@ def _safe_event_name(event: object) -> tuple[str, dict[str, object]]:
     return UNSAFE_EVENT_NAME, {"unsafe_event": _redact(event)}
 
 
+def _safe_log(
+    logger: logging.Logger,
+    method: str,
+    event: str,
+    *,
+    exc: BaseException | None = None,
+    **extras: object,
+) -> None:
+    """Shared body of :func:`safe_log_warning` and :func:`safe_log_error`.
+
+    Severity is the only difference between them. It is a parameter rather than
+    two copies because the policy — event-name membership, extras sanitisation,
+    value-free exception fields, and the swallowing outer fence — must not be
+    able to drift between the two levels: a caller escaping the guard by
+    choosing ERROR would defeat the point of having it.
+
+    Dispatched by *method name* through the level-specific ``logger.warning`` /
+    ``logger.error`` rather than through ``logger.log(level, ...)``. Those
+    attributes are the seam tests patch to observe an emit
+    (``test_warning_logged_when_override_none_and_breaker_tripped`` does), and
+    ``logger.log`` slips past a patched ``logger.warning`` — the record still
+    lands, so the miss shows up as a silently unobserved emit rather than an
+    error. Resolved inside the fence so a broken logger object cannot escape.
+    """
+    try:
+        # First, because ``event`` is the only argument that reaches the record
+        # on two routes and the rest of the policy never sees it.
+        event_name, event_fields = _safe_event_name(event)
+        fields = sanitize_log_extras(extras)
+        # Both updates land after sanitisation, not through it: their values are
+        # bounded by construction and must win over any hand-passed key.
+        fields.update(event_fields)
+        if exc is not None:
+            fields.update(exc_fields(exc))
+        getattr(logger, method)(event_name, extra={"event": event_name, **fields})
+    except Exception:  # noqa: BLE001 — last-resort: even the logger may be broken
+        pass
+
+
+def safe_log_error(
+    logger: logging.Logger,
+    event: str,
+    *,
+    exc: BaseException | None = None,
+    **extras: object,
+) -> None:
+    """ERROR-severity :func:`safe_log_warning`; identical policy, see its docstring.
+
+    Exists so the #106.5 call sites could drop ``exc_info=True`` without also
+    dropping a severity level. Those are fail-closed audit-write failures that
+    take the secondary store out of the read path — an operator triaging by
+    level has to keep seeing them at ERROR, so redacting the payload must not
+    quietly become a downgrade to WARNING.
+
+    ``exc_info`` is deliberately not offered. A traceback is the widest
+    disclosure on this path (frame locals, not just the exception value), and
+    the whole point of routing through :func:`exc_fields` is that what may be
+    emitted is decided here rather than per call site.
+    """
+    _safe_log(logger, "error", event, exc=exc, **extras)
+
+
 def safe_log_warning(
     logger: logging.Logger,
     event: str,
@@ -389,16 +466,4 @@ def safe_log_warning(
     swallowed, "no warnings in the log" is not evidence that no warnings
     occurred. A broken logging pipeline stays invisible here by design.
     """
-    try:
-        # First, because ``event`` is the only argument that reaches the record
-        # on two routes and the rest of the policy never sees it.
-        event_name, event_fields = _safe_event_name(event)
-        fields = sanitize_log_extras(extras)
-        # Both updates land after sanitisation, not through it: their values are
-        # bounded by construction and must win over any hand-passed key.
-        fields.update(event_fields)
-        if exc is not None:
-            fields.update(exc_fields(exc))
-        logger.warning(event_name, extra={"event": event_name, **fields})
-    except Exception:  # noqa: BLE001 — last-resort: even the logger may be broken
-        pass
+    _safe_log(logger, "warning", event, exc=exc, **extras)

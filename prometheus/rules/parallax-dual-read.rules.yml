@@ -61,6 +61,13 @@ groups:
         annotations:
           summary: Crosswalk miss rate above 5% for 30min
           description: |
+            NO PRODUCER (#101 diagnosis, catalogued by #106) — THIS ALERT
+            CANNOT FIRE. The numerator parallax_crosswalk_miss_orphan_total is
+            registered in parallax/router/crosswalk_backfill.py, a module
+            nothing imports, and its only incrementer record_orphan_miss() has
+            no production call site. Evaluates no-data, not a healthy 0. See
+            the comment above the expression for the full history.
+
             crosswalk_miss_rate has exceeded 5% for over 30 minutes.
             See runbook docs/lane-c/m3-dual-read-runbook.md §Failure-Modes.
             48h SLO observation window must restart if this fires during pre-flip phase.
@@ -156,12 +163,17 @@ groups:
           description: |
             Lifespan drain handler hit the 15-minute timeout — in-flight requests
             were force-cut. Investigate stuck connections or upstream blocks.
-            KNOWN LATENT (#102 review): the increment happens during lifespan
-            shutdown, after the listening socket has closed, so Prometheus
-            never scrapes the post-increment value and this alert is expected
-            to stay silent even on a real timeout. Its absence is NOT evidence
-            of a clean drain — grep the service log for
-            "parallax.lifespan: drain timeout after".
+            KNOWN LATENT (#102 review, re-measured in #106): the increment
+            happens during lifespan shutdown, after the listening socket has
+            closed, so Prometheus never scrapes the post-increment value and
+            this alert is expected to stay silent even on a real timeout. Its
+            absence is NOT evidence of a clean drain.
+            USE THE LOG INSTEAD: the producer emits a structured WARNING keyed
+            event="drain_timeout" (parallax.server.lifespan.DRAIN_TIMEOUT_EVENT)
+            carrying inflight_count and timeout_seconds. That key is the
+            supported match target — match on it rather than on the message
+            prose, which is free to change. Wiring it to a destination is
+            deliberately left open (#106 policy deferral).
 
       # The three dual-read DoD gauges below are exposed by
       # parallax/server/routes/metrics.py partitioned by `traffic_source`

@@ -24,7 +24,6 @@ Spec anchors:
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 import uuid
 from collections.abc import Callable, Iterable, Mapping
@@ -51,12 +50,21 @@ from parallax.apex.envelope import (
     compute_checksum,
     parse_envelope,
 )
+from parallax.obs.log import get_logger, safe_log_error
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.contracts import QueryRequest
 
 __all__ = ["CLAIM_CONTENT_KEY", "AphelionReadAdapter", "AphelionUnreachableError"]
 
-_log = logging.getLogger(__name__)
+# JSON logger, matching ``dual_read.py`` / ``shadow.py`` — the other modules that
+# emit through ``parallax.obs.log``'s helpers. The choice is load-bearing rather
+# than cosmetic: those helpers put everything an operator needs (``exc_class``,
+# ``exc_digest``, ``envelope_message_id``) in the record's *extras*, and the
+# stdlib default formatter renders only ``msg``. Under a plain logger the
+# redacted call sites below would therefore print a bare event name and the
+# #106.5 fix would read as "the detail was deleted" rather than "the detail was
+# made value-free". ``JSONFormatter`` emits every field.
+_log = get_logger(__name__)
 
 ENVELOPE_VERSION_LITERAL = "0.1"
 ENVELOPE_SCHEMA_VERSION = 1
@@ -383,41 +391,36 @@ class AphelionReadAdapter:
             write_audit_row(self._audit_conn_provider(), audit_row)
             committed = True
         except sqlite3.IntegrityError as exc:
-            _log.error(
-                "audit_db_integrity_error: audit row INSERT hit a UNIQUE/CHECK "
-                "constraint (envelope_message_id=%s); secondary unreachable",
-                envelope_message_id,
-                exc_info=True,
+            safe_log_error(
+                _log,
+                "audit_db_integrity_error",
+                exc=exc,
+                envelope_message_id=envelope_message_id,
             )
             raise AphelionUnreachableError("audit_db_integrity_error") from exc
         except AuditDbUsageError as exc:
-            _log.error(
-                "audit_db_usage_error: write_audit_row caller-contract "
-                "violation (%s); secondary unreachable",
-                exc,
-                exc_info=True,
-            )
+            safe_log_error(_log, "audit_db_usage_error", exc=exc)
             raise AphelionUnreachableError("audit_db_usage_error") from exc
         except (AuditDbWriteError, sqlite3.Error) as exc:
             # AuditDbWriteError = BEGIN/COMMIT failures write_audit_row wraps;
             # a bare sqlite3.Error = an INSERT-step failure it re-raises
             # un-wrapped (e.g. OperationalError on disk-full mid-statement).
-            _log.error(
-                "audit_db_write_failed: audit row write failed (%s); "
-                "secondary unreachable",
-                exc,
-                exc_info=True,
+            safe_log_error(
+                _log,
+                "audit_db_write_failed",
+                exc=exc,
+                envelope_message_id=envelope_message_id,
             )
             raise AphelionUnreachableError("audit_db_write_failed") from exc
         except Exception as exc:  # noqa: BLE001 — see the fence rationale above
             # The audit-conn provider raising (e.g. open_audit_db hitting
             # AuditDbConfigError on a worker thread), or any other unforeseen
             # failure. Must NOT escape as "primary_only".
-            _log.error(
-                "audit_db_write_failed: unexpected audit write error (%s); "
-                "secondary unreachable",
-                exc,
-                exc_info=True,
+            safe_log_error(
+                _log,
+                "audit_db_write_failed",
+                exc=exc,
+                envelope_message_id=envelope_message_id,
             )
             raise AphelionUnreachableError("audit_db_write_failed") from exc
 
@@ -440,12 +443,12 @@ class AphelionReadAdapter:
         try:
             assert_audit_row_committed(committed)
         except AuditWriteOrderViolation as exc:
-            _log.error(
-                "audit_write_order_violation: assert_audit_row_committed "
-                "tripped — write-order invariant broken (committed=%r); "
-                "secondary unreachable",
-                committed,
-                exc_info=True,
+            safe_log_error(
+                _log,
+                "audit_write_order_violation",
+                exc=exc,
+                committed=committed,
+                envelope_message_id=envelope_message_id,
             )
             raise AphelionUnreachableError("audit_write_order_violation") from exc
 

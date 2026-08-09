@@ -491,7 +491,11 @@ def _harvest_call_site_events() -> tuple[set[str], list[str]]:
     from pathlib import Path
 
     # Index of the event argument in each helper's positional signature.
-    event_arg_index = {"safe_log_warning": 1, "_safe_log_warning": 0}
+    # ``safe_log_error`` shares the vocabulary and the policy with
+    # ``safe_log_warning``, so it has to share the harvest too — a call site that
+    # only the ERROR helper reaches would otherwise be invisible to both
+    # directions of the enum check.
+    event_arg_index = {"safe_log_warning": 1, "safe_log_error": 1, "_safe_log_warning": 0}
     repo_root = Path(__file__).resolve().parents[1]
     literals: set[str] = set()
     offenders: list[str] = []

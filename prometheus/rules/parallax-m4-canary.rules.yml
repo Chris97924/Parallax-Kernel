@@ -22,6 +22,19 @@ groups:
         annotations:
           summary: M4 canary T1 — error rate ≥ 0.5% for 5min (auto-rollback gate)
           description: |
+            NO PRODUCER (#106.1) — THIS ALERT CANNOT FIRE. Nothing in parallax/
+            emits parallax_canary_event_errors_total or
+            parallax_canary_events_total. The T1-T5 machinery
+            (parallax/canary/triggers.py, rollback.py, outcomes.py) is imported
+            only by parallax/canary/cli.py, so it runs inside short-lived
+            `parallax canary` processes that Prometheus never scrapes. This
+            expression evaluates to no-data, NOT to a healthy 0, and its
+            silence is not evidence of a passing canary. Read the T1 verdict
+            from `parallax canary --status` instead.
+            Producing these needs a server-side exporter over the durable
+            OutcomeStore/AuditLog, or these rules should be deleted — decision
+            open, see the #106 PR (policy deferral).
+
             T1 trigger breached: canary event error_rate has stayed at or above
             0.5% for 5 minutes. Per US-009.1 §3.3 / AC-1.9, RollbackController
             should auto-trip and acknowledge within the configured window.
@@ -43,6 +56,13 @@ groups:
         annotations:
           summary: M4 canary T2 — discrepancy rate ≥ 0.5% for 3min (auto-rollback gate)
           description: |
+            NO PRODUCER (#106.1) — THIS ALERT CANNOT FIRE. Neither
+            parallax_canary_discrepancy_total nor parallax_canary_events_total
+            is emitted by anything in parallax/; see the T1 rule above for the
+            full reason. Evaluates no-data, not a healthy 0.
+            For live divergence use parallax_canary_shadow_discrepancy_rate
+            (recorded below), which has a real in-server producer.
+
             T2 trigger breached: canary discrepancy_rate has stayed at or above
             0.5% for 3 minutes. This indicates canonical vs M4 router divergence
             beyond the §3.3 hard ceiling.
@@ -65,6 +85,15 @@ groups:
         annotations:
           summary: M4 canary T3 — p99 latency ≥ 100ms for 5min (auto-rollback gate)
           description: |
+            NO PRODUCER (#106.1) — THIS ALERT CANNOT FIRE.
+            parallax_canary_request_duration_ms_bucket is emitted by nothing;
+            see the T1 rule above. histogram_quantile over an absent histogram
+            returns no-data, not a healthy latency.
+            Note this one is the hardest of the six to produce even with a
+            server-side exporter: the durable OutcomeStore records outcomes,
+            not per-request durations, so T3 would need new instrumentation
+            rather than a read over existing state.
+
             T3 trigger breached: canary p99 request latency has stayed at or
             above 100ms for 5 minutes. Investigate M4 router upstream blocks
             or queue saturation.
@@ -85,6 +114,17 @@ groups:
         annotations:
           summary: M4 canary T4 — data loss event detected (immediate rollback)
           description: |
+            NO PRODUCER (#106.1) — THIS ALERT HAS NEVER BEEN ABLE TO FIRE, AND
+            IT IS THE DATA-LOSS ONE. parallax_canary_data_loss_events_total is
+            emitted by nothing in parallax/ (see the T1 rule above), so this
+            expression has evaluated no-data since the day it was written.
+            increase() over a series Prometheus has never seen is silent in
+            exactly the way it is silent when no data has been lost.
+            DO NOT treat the absence of this alert as evidence that no data
+            loss occurred. Until a producer exists, data-loss detection is
+            `parallax canary --status` / the OutcomeStore (outcome='data_loss'),
+            not this alert. Escalation path in the #106 PR.
+
             T4 trigger breached: at least one data_loss event was recorded in
             the last hour. Per US-009.1 AC-1.13 this is a hard rollback
             condition with no hysteresis — investigate immediately.
@@ -106,6 +146,15 @@ groups:
         annotations:
           summary: M4 canary T5 gate active — sample size < 50 hits / 5min (extend stage)
           description: |
+            NO PRODUCER (#106.1) — THIS ALERT CANNOT FIRE, and it fails in the
+            more dangerous direction than T1-T4. parallax_canary_events_total is
+            emitted by nothing (see the T1 rule above), so `sum(increase(...))`
+            over an absent series yields no-data and the comparison never
+            evaluates — the gate that is supposed to say "the sample is too thin
+            to trust T1-T4" stays quiet, which reads identically to "sample size
+            is fine". Combined with T1-T4 also being inert, every trigger in
+            this group is silent on a canary nobody is measuring.
+
             T5 minimum-hits gate active: canary saw fewer than 50 events in
             the last 5 minutes. T1-T4 verdicts will report `insufficient_data`
             until traffic recovers. Do NOT promote stage on green-from-T1-T4

@@ -49,13 +49,20 @@ def _get_or_create_counter(name: str, doc: str) -> prometheus_client.Counter:
     prometheus_client raises ``ValueError: Duplicated timeseries`` on
     re-import (common in test runs). We catch it and return the existing
     collector via the stable ``REGISTRY._names_to_collectors`` dict.
+
+    Looked up under ``name`` exactly as passed, with no ``_total`` arithmetic.
+    A Counter is indexed in that dict under every name it can be referenced by
+    — the base name plus the ``_total`` and ``_created`` sample names — so the
+    key works whether the caller passes ``parallax_x`` or ``parallax_x_total``.
+    Appending ``_total`` unconditionally was the #106.4 bug: this module passes
+    a name that already ends in ``_total``, so the fallback asked for
+    ``..._total_total``, matched nothing, and turned a recoverable duplicate
+    registration into a KeyError at import time.
     """
     try:
         return prometheus_client.Counter(name, doc)
     except ValueError:
-        return prometheus_client.REGISTRY._names_to_collectors[  # type: ignore[return-value]
-            name + "_total"
-        ]
+        return prometheus_client.REGISTRY._names_to_collectors[name]  # type: ignore[return-value]
 
 
 circuit_breaker_tripped_total = _get_or_create_counter(

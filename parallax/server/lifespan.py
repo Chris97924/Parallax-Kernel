@@ -33,6 +33,7 @@ from parallax.apex.audit_db import open_audit_db, resolve_audit_db_path
 from parallax.router.inflight import get_inflight_count
 
 __all__ = [
+    "DRAIN_TIMEOUT_EVENT",
     "DRAIN_TIMEOUT_SECONDS",
     "DRAIN_POLL_INTERVAL_SECONDS",
     "drain_timeout_total",
@@ -43,6 +44,20 @@ _log = logging.getLogger("parallax.server.lifespan")
 
 DRAIN_TIMEOUT_SECONDS: Final[float] = 900.0  # 15 minutes
 DRAIN_POLL_INTERVAL_SECONDS: Final[float] = 0.5
+
+#: Structured key on the drain-timeout log record — the one producer-side signal
+#: for this event that survives the process (#106.3).
+#:
+#: ``drain_timeout_total`` cannot carry it: uvicorn closes the listening socket
+#: before running lifespan shutdown, so the increment below happens when no
+#: scrape can still reach this process, and ``DrainTimeoutDetected`` evaluates
+#: against a series whose last sample predates the event it is meant to catch.
+#: The log stream is what outlives the process, so the event gets a key an alert
+#: can match exactly, instead of a prose fragment that stops matching the day
+#: the sentence is reworded. Named here rather than inlined so the rule
+#: annotation, the alert, and this producer can be pinned to one another by
+#: ``tests/server/test_drain_timeout_durable_signal_106.py``.
+DRAIN_TIMEOUT_EVENT: Final[str] = "drain_timeout"
 
 
 # prometheus_client raises ValueError on duplicate registration.
@@ -94,11 +109,31 @@ async def _drain_inflight(
         if remaining <= 0:
             final_count = get_inflight_count()
             drain_timeout_total.inc()
+            # Sentence for a human reading the log, structured fields for
+            # whatever alerts on it — and the key=value tail below repeats the
+            # same fields IN THE MESSAGE ITSELF, not only in extra. Both
+            # audiences need to find them in the same rendering: ``parallax
+            # serve`` (parallax.cli._cmd_serve) hands uvicorn no custom
+            # log_config, so under the canonical launcher this is a plain
+            # logging.getLogger with the stdlib default formatter, which
+            # renders only record.getMessage() and never touches extra — a
+            # JSON sink is not guaranteed to be attached (codex #107 review).
+            # The tail is what stays alert-matchable there; extra stays for
+            # sinks that do parse it.
             _log.warning(
                 "parallax.lifespan: drain timeout after %.1fs — %d request(s) still "
-                "in flight; proceeding with shutdown",
+                "in flight; proceeding with shutdown "
+                "(event=%s inflight_count=%d timeout_seconds=%.1f)",
                 timeout_seconds,
                 final_count,
+                DRAIN_TIMEOUT_EVENT,
+                final_count,
+                timeout_seconds,
+                extra={
+                    "event": DRAIN_TIMEOUT_EVENT,
+                    "inflight_count": final_count,
+                    "timeout_seconds": timeout_seconds,
+                },
             )
             return
 

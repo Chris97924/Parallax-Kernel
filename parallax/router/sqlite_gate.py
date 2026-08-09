@@ -69,11 +69,18 @@ def _get_or_create_gauge(name: str, doc: str, labelnames: list[str]) -> promethe
 
 
 def _get_or_create_counter(name: str, doc: str, labelnames: list[str]) -> prometheus_client.Counter:
-    """Return an existing Counter or create a new one (re-import safe)."""
+    """Return an existing Counter or create a new one (re-import safe).
+
+    Looked up under ``name`` as passed — see the #106.4 note on
+    ``parallax.router.circuit_breaker._get_or_create_counter``. The only caller
+    passes ``parallax_sqlite_errors_total``, so the old ``name + "_total"`` key
+    resolved to ``..._total_total`` and raised KeyError instead of returning the
+    live collector.
+    """
     try:
         return prometheus_client.Counter(name, doc, labelnames)
     except ValueError:
-        return prometheus_client.REGISTRY._names_to_collectors[name + "_total"]  # type: ignore[return-value]
+        return prometheus_client.REGISTRY._names_to_collectors[name]  # type: ignore[return-value]
 
 
 _lock_wait_hist = _get_or_create_histogram(

@@ -236,6 +236,24 @@ LIB_VERSION_INFO = _get_or_create(
 # "apex_m7"} reports 0.0 until ApexPublicReadRouter is constructed, so a reader
 # can tell a real zero from a subsystem that never ran. The rule annotations
 # name it.
+#
+# KNOWN RESIDUAL — READ BEFORE WIRING M7. Priming one label set does not give
+# every FUTURE label set a zero to step from. When M7 runs and the first
+# `reason="package_missing"` error occurs, that child series is created already
+# at 1.0; increase() over samples that are all 1.0 is 0, and the alerts here
+# aggregate with sum(), so each per-series increase is 0 and the total is too.
+# The first occurrence of each new label value is therefore invisible to these
+# rules; the second onwards are fine.
+#
+# Not fixed here, and deliberately: the fix is to prime the label space, and
+# this one is not closed — `exc_class` is an exception class name and
+# `audit_write_failures.cause` is `type(exc).__name__`, so there is no
+# enumeration to prime. (Contrast parallax/canary/exporter.py, whose stages and
+# outcomes ARE closed and spec-pinned, so it primes the full grid and does not
+# have this hole.) The options when M7 lands are to enumerate the reasons that
+# can be enumerated, or to move these alerts off `increase() > 0` onto the
+# resulting level. Both are decisions for the PR that wires M7 — until then the
+# subsystem does not run and the residual cannot fire.
 ZERO_EXPORT_LABEL_SETS: dict[str, tuple[dict[str, str], ...]] = {
     "parallax_apex_read": ({"result": ""},),
     "parallax_apex_read_latency_ms": ({"result": ""},),

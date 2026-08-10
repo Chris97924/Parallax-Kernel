@@ -57,19 +57,25 @@ it will also not report. This is a property of reading WAL, not of this module.
 
 ZEROS AND WHAT THEY MEAN
 ------------------------
-The families are exported whether or not a store exists, because an
+Every series is exported whether or not the store has a row for it, because an
 ``increase(...) > 0`` alert over a series Prometheus has never seen is silent in
-exactly the way a healthy canary is — the defect this closes. The baseline is a
-single all-empty-label series per family (see
-``parallax.apex.router.prime_zero_series`` for the same rule applied to apex),
-and real stages appear alongside it as data arrives.
+exactly the way a healthy canary is — the defect this closes. The baseline is
+the full ``KNOWN_STAGES × KNOWN_OUTCOMES`` grid rather than one placeholder
+row, and the difference is load-bearing: a series that first appears on its own
+first increment is already at 1.0 and has no 0 sample to step from, so T4 would
+miss the first data-loss event on a stage. See ``_BASELINE_STAGES``.
 
-``parallax_canary_store_present`` is what keeps those zeros honest: 0 means no
-durable store was found and nothing below is a measurement. NOTE FOR OPERATORS:
-with no store the T5 gate (``sum(increase(events_total[5m])) < 50``) evaluates
-true and fires. That is deliberate — "the sample is too thin to promote on" is
-correct when nobody is measuring — but it does mean T5 is a standing warning on
-a server with no canary. Its annotation says so.
+``parallax_canary_store_present`` is what keeps those zeros honest, and it means
+**the outcome ledger was readable**, not "a file opened". An audit-only database
+— what a real-mode drill without ``--stage`` leaves behind — has no
+``canary_outcomes`` table at all, and reporting it as present would hand an
+oncall zeros the annotations tell them to trust.
+
+NOTE FOR OPERATORS: with no store the T5 gate
+(``sum(increase(events_total[5m])) < 50``) evaluates true and fires. That is
+deliberate — "the sample is too thin to promote on" is correct when nobody is
+measuring — but it does mean T5 is a standing warning on a server with no
+canary. Its annotation says so.
 """
 
 from __future__ import annotations
@@ -90,6 +96,7 @@ from prometheus_client.core import (
 )
 
 from parallax.canary.audit_log import AUDIT_DB_ENV, DEFAULT_AUDIT_DB_NAME
+from parallax.canary.outcomes import KNOWN_OUTCOMES, KNOWN_STAGES
 from parallax.canary.rollback_state import STATE_UNKNOWN, STATE_VALUES
 
 __all__ = [
@@ -128,13 +135,29 @@ CANARY_DURATION_BUCKETS_MS: Final[tuple[float, ...]] = (
     1000.0,
 )
 
-#: Label set every family carries at zero so the alerts evaluate on a server
-#: with no canary data. Empty values, matching the #106.2 priming rule: no
-#: canary consumer equality-selects ``stage`` or ``outcome`` (the dashboard
-#: groups by outcome), so priming a real-looking stage would invent a
-#: measurement of a stage that never ran.
-_BASELINE_STAGE: Final[str] = ""
-_BASELINE_OUTCOME: Final[str] = ""
+#: Every stage/outcome pair is exported at zero, whether or not the store has a
+#: row for it, and THIS IS NOT THE #106.2 PRIMING RULE. The apex/sqlite zero
+#: export uses a single all-empty baseline because its label spaces are open
+#: (exception class names) and its alerts wrap `sum()`. Here neither holds.
+#:
+#: The canary alerts are PER-SERIES ``increase(...)``: T4 is
+#: ``increase(parallax_canary_data_loss_events_total[1h]) > 0``. A series that
+#: first appears on its first increment springs into existence already at 1.0
+#: and stays there, and increase() over samples that are all 1.0 is 0 — so the
+#: FIRST data-loss event on a stage, the event the no-hysteresis critical alert
+#: exists for, would evaluate as "measured, and healthy". That is the same
+#: absent-until-first-increment trap the #102 exposition comment in
+#: routes/metrics.py documents for the breaker counters, and the reason those
+#: are exported from zero too. Prometheus needs the 0 sample to see a step.
+#:
+#: Priming the real names costs nothing in honesty because the sets are closed
+#: and spec-pinned: KNOWN_STAGES is the four shipping canary stages (adding one
+#: "requires a council decision per acceptance spec O.3") and KNOWN_OUTCOMES is
+#: the three business outcomes OutcomeStore validates inserts against. These are
+#: not guesses about what might be observed; they are the complete enumeration
+#: of what CAN be.
+_BASELINE_STAGES: Final[tuple[str, ...]] = tuple(sorted(KNOWN_STAGES))
+_BASELINE_OUTCOMES: Final[tuple[str, ...]] = tuple(sorted(KNOWN_OUTCOMES))
 
 _CACHE_TTL_SECONDS: Final[float] = 30.0
 
@@ -184,18 +207,38 @@ class CanarySnapshot:
 
     @property
     def stages(self) -> tuple[str, ...]:
-        """Every stage the store has an event for.
+        """Every stage to export, primed set included.
 
-        The numerator families are zero-filled across this set at render time,
-        and that is not cosmetic. T1 is
-        ``sum(rate(errors)) / (sum(rate(events)) > 0)``: with a denominator
-        series present and the numerator series ABSENT — which is what a healthy
-        stage produces if you only export the stages that had errors — the
+        The union of the four spec-pinned stages and anything the store actually
+        holds. Both halves matter and for different reasons:
+
+        * the primed stages give every series a 0 sample before its first event,
+          without which ``increase()`` cannot see the step (see
+          ``_BASELINE_STAGES``);
+        * a stage present in the store but not in ``KNOWN_STAGES`` — only
+          reachable if the enum changed under a store written by an older build
+          — is still exported, because dropping rows on the floor is a worse
+          failure than exporting an unexpected label.
+
+        Zero-filling the numerator families across this set is not cosmetic
+        either. T1 is ``sum(rate(errors)) / (sum(rate(events)) > 0)``: with a
+        denominator series present and the numerator ABSENT — which is what a
+        healthy stage produces if you only export stages that had errors — the
         division yields an empty vector and the alert goes silent for exactly
-        the same reason the whole #106 class was silent. A healthy stage has to
-        say zero out loud.
+        the reason the whole #106 class was silent. A healthy stage has to say
+        zero out loud.
         """
-        return tuple(sorted({stage for stage, _ in self.events}))
+        return tuple(sorted(set(_BASELINE_STAGES) | {stage for stage, _ in self.events}))
+
+    @property
+    def event_cells(self) -> tuple[tuple[str, str], ...]:
+        """Every ``(stage, outcome)`` pair to export, primed grid included."""
+        return tuple(
+            sorted(
+                {(stage, outcome) for stage in _BASELINE_STAGES for outcome in _BASELINE_OUTCOMES}
+                | set(self.events)
+            )
+        )
 
 
 def resolve_store_path(path: str | os.PathLike[str] | None = None) -> Path:
@@ -268,34 +311,44 @@ def collect_canary_snapshot(path: str | os.PathLike[str] | None = None) -> Canar
     # has not run yet" into an empty snapshot and lose the outcome counts that
     # were sitting right there.
     try:
-        events: dict[tuple[str, str], int] = {}
-        for row in _query(
+        # THE LEDGER QUERY DECIDES ``store_present``, not the file opening.
+        # An audit-only database — which a real-mode drill run WITHOUT --stage
+        # creates, because AuditLog builds its table and OutcomeStore is never
+        # constructed — opens cleanly and has no canary_outcomes at all. Reporting
+        # that as present would export zeros next to ``store_present 1``, which the
+        # alert annotations tell an oncall to read as measurements, and T1-T4 would
+        # be silently trusted over a ledger that was never there.
+        outcome_rows, ledger_readable = _query(
             conn,
             "SELECT stage, outcome, COUNT(*) AS n FROM canary_outcomes GROUP BY stage, outcome",
-        ):
+        )
+        events: dict[tuple[str, str], int] = {}
+        for row in outcome_rows:
             events[(str(row["stage"]), str(row["outcome"]))] = int(row["n"])
 
         errors: dict[str, int] = {}
-        for row in _query(
+        error_rows, _ = _query(
             conn,
             "SELECT o.stage AS stage, COUNT(*) AS n "
             "FROM canary_outcomes o JOIN audit_log a ON a.event_id = o.event_id "
             "WHERE a.response_status >= ? GROUP BY o.stage",
             (ERROR_STATUS_FLOOR,),
-        ):
+        )
+        for row in error_rows:
             errors[str(row["stage"])] = int(row["n"])
 
         durations: dict[str, list[float]] = {}
-        for row in _query(
+        duration_rows, _ = _query(
             conn,
             "SELECT o.stage AS stage, a.latency_ms AS latency_ms "
             "FROM canary_outcomes o JOIN audit_log a ON a.event_id = o.event_id "
             "WHERE a.latency_ms IS NOT NULL",
-        ):
+        )
+        for row in duration_rows:
             durations.setdefault(str(row["stage"]), []).append(float(row["latency_ms"]))
 
         rollback_state = STATE_UNKNOWN
-        state_rows = _query(conn, "SELECT state FROM canary_rollback_state WHERE id = 1")
+        state_rows, _ = _query(conn, "SELECT state FROM canary_rollback_state WHERE id = 1")
         if state_rows:
             rollback_state = STATE_VALUES.get(str(state_rows[0]["state"]), STATE_UNKNOWN)
 
@@ -304,7 +357,7 @@ def collect_canary_snapshot(path: str | os.PathLike[str] | None = None) -> Canar
             errors=errors,
             durations_ms=durations,
             rollback_state=rollback_state,
-            store_present=True,
+            store_present=ledger_readable,
         )
     finally:
         conn.close()
@@ -312,14 +365,19 @@ def collect_canary_snapshot(path: str | os.PathLike[str] | None = None) -> Canar
 
 def _query(
     conn: sqlite3.Connection, sql: str, params: tuple[object, ...] = ()
-) -> list[sqlite3.Row]:
-    """Run one read; an unavailable table or a locked DB yields no rows.
+) -> tuple[list[sqlite3.Row], bool]:
+    """Run one read. Returns ``(rows, ok)``; an unavailable table yields ``([], False)``.
 
-    Logged at WARNING rather than swallowed, so a genuinely broken store is
-    diagnosable from the log instead of only from a suspiciously flat dashboard.
+    The bool is not decoration: callers must be able to tell "this query returned
+    nothing" from "this query could not run", because zero rows is a
+    measurement and a missing table is not. ``store_present`` is derived from
+    it.
+
+    Logged rather than swallowed, so a genuinely broken store is diagnosable
+    from the log instead of only from a suspiciously flat dashboard.
     """
     try:
-        return conn.execute(sql, params).fetchall()
+        return conn.execute(sql, params).fetchall(), True
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc):
             # Normal, not broken: the three tables are created by three writers
@@ -331,7 +389,7 @@ def _query(
                 "canary_exporter.table_absent",
                 extra={"event": "canary_exporter.table_absent", "exc_str": str(exc)},
             )
-            return []
+            return [], False
         _log.warning(
             "canary_exporter.read_failed",
             extra={
@@ -340,7 +398,7 @@ def _query(
                 "exc_str": str(exc),
             },
         )
-        return []
+        return [], False
     except sqlite3.Error as exc:
         _log.warning(
             "canary_exporter.read_failed",
@@ -350,7 +408,7 @@ def _query(
                 "exc_str": str(exc),
             },
         )
-        return []
+        return [], False
 
 
 def cached_canary_snapshot(path: str | os.PathLike[str] | None = None) -> CanarySnapshot:
@@ -418,9 +476,8 @@ class CanaryExporter:
             "outcome. Denominator for T1, T2 and the T5 sample-size gate.",
             labels=["stage", "outcome"],
         )
-        events.add_metric([_BASELINE_STAGE, _BASELINE_OUTCOME], 0.0)
-        for (stage, outcome), count in sorted(snapshot.events.items()):
-            events.add_metric([stage, outcome], float(count))
+        for stage, outcome in snapshot.event_cells:
+            events.add_metric([stage, outcome], float(snapshot.events.get((stage, outcome), 0)))
         yield events
 
         errors = CounterMetricFamily(
@@ -430,7 +487,6 @@ class CanaryExporter:
             "reason to auto-roll-back.",
             labels=["stage"],
         )
-        errors.add_metric([_BASELINE_STAGE], 0.0)
         for stage in snapshot.stages:
             errors.add_metric([stage], float(snapshot.errors.get(stage, 0)))
         yield errors
@@ -440,7 +496,6 @@ class CanaryExporter:
             "Canary events recorded with outcome='discrepancy', by stage. T2 numerator.",
             labels=["stage"],
         )
-        discrepancy.add_metric([_BASELINE_STAGE], 0.0)
         discrepancies = snapshot.discrepancies
         for stage in snapshot.stages:
             discrepancy.add_metric([stage], float(discrepancies.get(stage, 0)))
@@ -452,7 +507,6 @@ class CanaryExporter:
             "no-hysteresis hard-rollback alert on this series.",
             labels=["stage"],
         )
-        data_loss.add_metric([_BASELINE_STAGE], 0.0)
         losses = snapshot.data_loss
         for stage in snapshot.stages:
             data_loss.add_metric([stage], float(losses.get(stage, 0)))
@@ -464,7 +518,6 @@ class CanaryExporter:
             "CLI and persisted to audit_log.latency_ms. T3 reads its p99.",
             labels=["stage"],
         )
-        duration.add_metric([_BASELINE_STAGE], _cumulative_buckets([]), sum_value=0.0)
         for stage in snapshot.stages:
             values = snapshot.durations_ms.get(stage, [])
             duration.add_metric([stage], _cumulative_buckets(values), sum_value=float(sum(values)))
@@ -479,7 +532,9 @@ class CanaryExporter:
 
         yield GaugeMetricFamily(
             "parallax_canary_store_present",
-            "1.0 iff the durable canary store was readable this scrape; else 0.0. Every "
+            "1.0 iff the durable canary OUTCOME LEDGER (canary_outcomes) was readable "
+            "this scrape; else 0.0 — including when the database file opened fine but "
+            "holds no outcome table, as an audit-only drill run leaves it. Every "
             "parallax_canary_* series above is a placeholder zero when this is 0.",
             value=1.0 if snapshot.store_present else 0.0,
         )

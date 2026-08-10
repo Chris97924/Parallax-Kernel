@@ -40,7 +40,7 @@ from parallax.canary.exporter import (
     collect_canary_snapshot,
 )
 from parallax.canary.instrument import CanaryRequestRecorder
-from parallax.canary.outcomes import OutcomeStore
+from parallax.canary.outcomes import KNOWN_OUTCOMES, KNOWN_STAGES, OutcomeStore
 from parallax.canary.rollback_state import RollbackStateStore
 from parallax.server.routes.metrics import _build_payload, _reset_cache_for_tests
 
@@ -143,7 +143,7 @@ def test_a_canary_cli_run_produces_every_t1_t5_family_with_exact_values(
 
     # T1/T2/T5 denominator — five ok events on one stage, and nothing else.
     assert scraped[f"parallax_canary_events_total{{outcome=ok,stage={_STAGE}}}"] == 5.0
-    assert f"parallax_canary_events_total{{outcome=discrepancy,stage={_STAGE}}}" not in scraped
+    assert scraped[f"parallax_canary_events_total{{outcome=discrepancy,stage={_STAGE}}}"] == 0.0
     # T1 numerator — the drill emits 200s, so zero errors.
     assert scraped[f"parallax_canary_event_errors_total{{stage={_STAGE}}}"] == 0.0
     # T2 numerator.
@@ -393,12 +393,88 @@ def test_an_absent_store_still_exports_every_family_at_zero(
     scraped = _scrape()
 
     assert scraped["parallax_canary_store_present"] == 0.0
-    assert scraped["parallax_canary_events_total{outcome=,stage=}"] == 0.0
-    assert scraped["parallax_canary_event_errors_total{stage=}"] == 0.0
-    assert scraped["parallax_canary_discrepancy_total{stage=}"] == 0.0
-    assert scraped["parallax_canary_data_loss_events_total{stage=}"] == 0.0
-    assert scraped["parallax_canary_request_duration_ms_count{stage=}"] == 0.0
+    for stage in KNOWN_STAGES:
+        for outcome in KNOWN_OUTCOMES:
+            key = f"parallax_canary_events_total{{outcome={outcome},stage={stage}}}"
+            assert scraped[key] == 0.0
+        assert scraped[f"parallax_canary_event_errors_total{{stage={stage}}}"] == 0.0
+        assert scraped[f"parallax_canary_discrepancy_total{{stage={stage}}}"] == 0.0
+        assert scraped[f"parallax_canary_data_loss_events_total{{stage={stage}}}"] == 0.0
+        assert scraped[f"parallax_canary_request_duration_ms_count{{stage={stage}}}"] == 0.0
     assert scraped["parallax_canary_rollback_state"] == -1.0
+
+
+def test_an_audit_only_database_is_not_reported_as_a_readable_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``store_present`` means the OUTCOME LEDGER opened, not that a file did.
+
+    A real-mode drill run without ``--stage`` constructs an AuditLog and no
+    OutcomeStore, leaving a database with an ``audit_log`` table and no
+    ``canary_outcomes`` at all. Deriving presence from the file opening would
+    export zeros next to ``store_present 1``, which the alert annotations tell
+    an oncall to read as measurements — so T1-T4 would be trusted over a ledger
+    that was never there.
+    """
+    store = tmp_path / "audit_only.db"
+    monkeypatch.setenv(AUDIT_DB_ENV, str(store))
+    AuditLog(db_path=store).close()
+    _reset_cache_for_tests()
+
+    assert store.exists()
+    assert _scrape()["parallax_canary_store_present"] == 0.0
+    assert collect_canary_snapshot(store).store_present is False
+
+
+def test_every_known_stage_has_a_zero_sample_before_its_first_event(
+    store_path: Path,
+) -> None:
+    """A counter that first appears at 1 has no step for ``increase()`` to find.
+
+    T4 is a per-series ``increase(...[1h]) > 0`` with no hysteresis. If
+    ``parallax_canary_data_loss_events_total{stage="m4_10pct"}`` only came into
+    existence when that stage recorded its first loss, the series would begin at
+    1.0 and stay flat, ``increase()`` would return 0, and the FIRST data-loss
+    event — the one the critical alert exists for — would read as healthy. The
+    fix is a 0 sample for every stage the store can ever hold, from the first
+    scrape.
+
+    Fixture: activity on m4_1pct only. The other three stages must still be
+    exported, at zero, so a later first event on any of them is a visible step.
+    """
+    _record(store_path, outcome="ok", stage="m4_1pct")
+
+    scraped = _scrape()
+
+    for stage in KNOWN_STAGES - {"m4_1pct"}:
+        assert scraped[f"parallax_canary_data_loss_events_total{{stage={stage}}}"] == 0.0, (
+            f"{stage} has no baseline data-loss sample; its first loss would be invisible"
+        )
+        assert scraped[f"parallax_canary_discrepancy_total{{stage={stage}}}"] == 0.0
+        assert scraped[f"parallax_canary_event_errors_total{{stage={stage}}}"] == 0.0
+        for outcome in KNOWN_OUTCOMES:
+            key = f"parallax_canary_events_total{{outcome={outcome},stage={stage}}}"
+            assert scraped[key] == 0.0
+
+
+def test_a_first_data_loss_event_is_a_step_from_an_existing_zero(
+    store_path: Path,
+) -> None:
+    """The same property stated as the transition an alert has to see.
+
+    Scrape once before the event and once after: the series must exist both
+    times, and its value must go 0 -> 1. Equal values, or a series absent from
+    the first scrape, is the silent-T4 bug.
+    """
+    _record(store_path, outcome="ok", stage="m4_10pct")
+    key = "parallax_canary_data_loss_events_total{stage=m4_10pct}"
+
+    before = _scrape()[key]
+    _record(store_path, outcome="data_loss", stage="m4_10pct")
+    after = _scrape()[key]
+
+    assert before == 0.0
+    assert after == 1.0, f"data-loss counter did not step: {before} -> {after}"
 
 
 def test_a_scrape_does_not_create_the_store(

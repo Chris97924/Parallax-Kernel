@@ -41,6 +41,7 @@ from typing import Final
 
 from parallax.canary.audit_log import AuditLog
 from parallax.canary.event_id import uuid7
+from parallax.canary.rollback_state import RollbackStateStore
 from parallax.canary.triggers import (
     T1ErrorRateTrigger,
     T2DiscrepancyRateTrigger,
@@ -105,10 +106,23 @@ class RollbackController:
         audit_log: AuditLog | None = None,
         clock: Callable[[], float] = time.monotonic,
         cooldown_seconds: float = COOLDOWN_SECONDS,
+        state_store: RollbackStateStore | None = None,
     ) -> None:
         self._audit = audit_log
         self._clock = clock
         self._cooldown = cooldown_seconds
+        # #106.1 — the controller's state machine lives in a CLI process
+        # Prometheus never scrapes, so the stage-1 dashboard's "Rollback
+        # controller state" panel had no producer. Every transition below is
+        # mirrored to a single durable row that the server-side exporter reads.
+        #
+        # Derived from the audit log's own path when not supplied, so callers
+        # that already configured one SQLite file do not have to configure a
+        # second one and cannot point the two halves at different databases.
+        if state_store is None and audit_log is not None:
+            state_store = RollbackStateStore(audit_log.db_path)
+        self._state_store = state_store
+        self._persist_state(CanaryState.RUNNING)
 
         self._t1 = T1ErrorRateTrigger()
         self._t2 = T2DiscrepancyRateTrigger()
@@ -196,6 +210,7 @@ class RollbackController:
             elif self._state is CanaryState.TRIPPED:
                 if self._tripped_at is not None and ts - self._tripped_at >= self._cooldown:
                     self._state = CanaryState.AWAITING_ACK
+                    self._persist_state(CanaryState.AWAITING_ACK, tripped_by=self._tripped_by)
             # AWAITING_ACK only exits via :meth:`acknowledge`.
 
             return RollbackSnapshot(
@@ -237,6 +252,18 @@ class RollbackController:
             results.append(ev)
         return results
 
+    def _persist_state(self, state: CanaryState, *, tripped_by: str | None = None) -> None:
+        """Mirror a state transition to the durable store (#106.1).
+
+        Best-effort by design: the store's own ``record`` swallows SQLite
+        failures, and a controller without one (no audit log configured, e.g. a
+        unit test) simply has nowhere to write. Losing the dashboard projection
+        must never stop the rollback machinery, which is the thing actually
+        protecting the canary.
+        """
+        if self._state_store is not None:
+            self._state_store.record(state.value, tripped_by=tripped_by)
+
     def _first_breach(self, evaluations: list[TriggerEvaluation]) -> TriggerEvaluation | None:
         for ev in evaluations:
             if ev.verdict is TriggerVerdict.BREACH:
@@ -247,6 +274,7 @@ class RollbackController:
         self._state = CanaryState.TRIPPED
         self._tripped_at = ts
         self._tripped_by = breach.trigger_id
+        self._persist_state(CanaryState.TRIPPED, tripped_by=breach.trigger_id)
         _log.warning(
             "canary.rollback.tripped",
             extra={
@@ -287,6 +315,7 @@ class RollbackController:
             self._tripped_by = None
             self._last_ack_by = ack_by
             self._last_ack_at = resolved_at
+            self._persist_state(CanaryState.RUNNING)
             for trig in (self._t1, self._t2, self._t3, self._t4):
                 trig.reset()
             # T5 is intentionally NOT reset — sample window survives

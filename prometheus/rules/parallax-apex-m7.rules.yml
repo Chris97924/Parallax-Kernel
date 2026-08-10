@@ -27,17 +27,21 @@ groups:
         annotations:
           summary: Apex public-read p99 latency above the 100ms SLA preview for 10min
           description: |
-            NO PRODUCER (#106.2) — THIS ALERT CANNOT FIRE. The parallax_apex_*
-            collectors are registered by parallax/apex/router.py, which nothing
-            under parallax/ imports: ApexPublicReadRouter is never instantiated
-            outside tests, so M7 public read does not execute in the server and
-            its collectors are absent from a running process entirely. Every
-            expression in this group evaluates to no-data, NOT to a healthy 0.
-            They are deliberately NOT exported as zeros: a zero is a
-            measurement, and would make an `increase(...) > 0` rule read as
-            "checked, and healthy" for a subsystem that never ran. These rules
-            become live when M7 read is wired into the server; until then their
-            silence carries no information. See the #106 PR.
+            ZERO UNTIL WIRED (#106.2). M7 public read still does not execute
+            in the server — ApexPublicReadRouter is instantiated nowhere under
+            parallax/ — but every parallax_apex_* series in this group is now
+            exported at a constant 0 by parallax.apex.router.prime_zero_series(),
+            called from create_app(). So this expression EVALUATES and this
+            alert can fire; before #106 it sat in no-data, which is silent in
+            exactly the same way a healthy system is.
+            READ THE ZERO ALONGSIDE parallax_subsystem_wired{subsystem="apex_m7"}.
+            0 means nothing has run: the zeros are placeholders and this alert's
+            silence carries no information about M7. 1 means the read path is
+            live and the same silence is a real measurement. Quiet-while-unwired
+            is NOT a passing check — that distinction is the whole point of the
+            readiness gauge, because a zero on its own cannot make it.
+            No rule change is needed when M7 lands: the real increments simply
+            take over from the primed zeros.
 
             histogram_quantile(0.99) of parallax_apex_read_latency_ms has exceeded
             the §4.2 p99<100ms SLA preview for 10 minutes. Investigate package count
@@ -60,17 +64,21 @@ groups:
         annotations:
           summary: Apex public-read error rate above 1% for 5min
           description: |
-            NO PRODUCER (#106.2) — THIS ALERT CANNOT FIRE. The parallax_apex_*
-            collectors are registered by parallax/apex/router.py, which nothing
-            under parallax/ imports: ApexPublicReadRouter is never instantiated
-            outside tests, so M7 public read does not execute in the server and
-            its collectors are absent from a running process entirely. Every
-            expression in this group evaluates to no-data, NOT to a healthy 0.
-            They are deliberately NOT exported as zeros: a zero is a
-            measurement, and would make an `increase(...) > 0` rule read as
-            "checked, and healthy" for a subsystem that never ran. These rules
-            become live when M7 read is wired into the server; until then their
-            silence carries no information. See the #106 PR.
+            ZERO UNTIL WIRED (#106.2). M7 public read still does not execute
+            in the server — ApexPublicReadRouter is instantiated nowhere under
+            parallax/ — but every parallax_apex_* series in this group is now
+            exported at a constant 0 by parallax.apex.router.prime_zero_series(),
+            called from create_app(). So this expression EVALUATES and this
+            alert can fire; before #106 it sat in no-data, which is silent in
+            exactly the same way a healthy system is.
+            READ THE ZERO ALONGSIDE parallax_subsystem_wired{subsystem="apex_m7"}.
+            0 means nothing has run: the zeros are placeholders and this alert's
+            silence carries no information about M7. 1 means the read path is
+            live and the same silence is a real measurement. Quiet-while-unwired
+            is NOT a passing check — that distinction is the whole point of the
+            readiness gauge, because a zero on its own cannot make it.
+            No rule change is needed when M7 lands: the real increments simply
+            take over from the primed zeros.
 
             parallax_apex_read_errors_total / parallax_apex_read_total exceeded 1%
             for 5 minutes. Break down by `reason` (package_missing / unsigned_package
@@ -90,17 +98,21 @@ groups:
         annotations:
           summary: Apex PARALLAX_APHELION_PACKAGE_DIR misconfigured
           description: |
-            NO PRODUCER (#106.2) — THIS ALERT CANNOT FIRE. The parallax_apex_*
-            collectors are registered by parallax/apex/router.py, which nothing
-            under parallax/ imports: ApexPublicReadRouter is never instantiated
-            outside tests, so M7 public read does not execute in the server and
-            its collectors are absent from a running process entirely. Every
-            expression in this group evaluates to no-data, NOT to a healthy 0.
-            They are deliberately NOT exported as zeros: a zero is a
-            measurement, and would make an `increase(...) > 0` rule read as
-            "checked, and healthy" for a subsystem that never ran. These rules
-            become live when M7 read is wired into the server; until then their
-            silence carries no information. See the #106 PR.
+            ZERO UNTIL WIRED (#106.2). M7 public read still does not execute
+            in the server — ApexPublicReadRouter is instantiated nowhere under
+            parallax/ — but every parallax_apex_* series in this group is now
+            exported at a constant 0 by parallax.apex.router.prime_zero_series(),
+            called from create_app(). So this expression EVALUATES and this
+            alert can fire; before #106 it sat in no-data, which is silent in
+            exactly the same way a healthy system is.
+            READ THE ZERO ALONGSIDE parallax_subsystem_wired{subsystem="apex_m7"}.
+            0 means nothing has run: the zeros are placeholders and this alert's
+            silence carries no information about M7. 1 means the read path is
+            live and the same silence is a real measurement. Quiet-while-unwired
+            is NOT a passing check — that distinction is the whole point of the
+            readiness gauge, because a zero on its own cannot make it.
+            No rule change is needed when M7 lands: the real increments simply
+            take over from the primed zeros.
 
             parallax_apex_package_dir_errors_total incremented (reason ∈
             relative_path / traversal_segment / broken_symlink / dir_missing /
@@ -125,17 +137,21 @@ groups:
         annotations:
           summary: Apex read-path audit-row write failure (R-10 provenance break)
           description: |
-            NO PRODUCER (#106.2) — THIS ALERT CANNOT FIRE. The parallax_apex_*
-            collectors are registered by parallax/apex/router.py, which nothing
-            under parallax/ imports: ApexPublicReadRouter is never instantiated
-            outside tests, so M7 public read does not execute in the server and
-            its collectors are absent from a running process entirely. Every
-            expression in this group evaluates to no-data, NOT to a healthy 0.
-            They are deliberately NOT exported as zeros: a zero is a
-            measurement, and would make an `increase(...) > 0` rule read as
-            "checked, and healthy" for a subsystem that never ran. These rules
-            become live when M7 read is wired into the server; until then their
-            silence carries no information. See the #106 PR.
+            ZERO UNTIL WIRED (#106.2). M7 public read still does not execute
+            in the server — ApexPublicReadRouter is instantiated nowhere under
+            parallax/ — but every parallax_apex_* series in this group is now
+            exported at a constant 0 by parallax.apex.router.prime_zero_series(),
+            called from create_app(). So this expression EVALUATES and this
+            alert can fire; before #106 it sat in no-data, which is silent in
+            exactly the same way a healthy system is.
+            READ THE ZERO ALONGSIDE parallax_subsystem_wired{subsystem="apex_m7"}.
+            0 means nothing has run: the zeros are placeholders and this alert's
+            silence carries no information about M7. 1 means the read path is
+            live and the same silence is a real measurement. Quiet-while-unwired
+            is NOT a passing check — that distinction is the whole point of the
+            readiness gauge, because a zero on its own cannot make it.
+            No rule change is needed when M7 lands: the real increments simply
+            take over from the primed zeros.
 
             parallax_apex_audit_write_failures_total incremented — a divergence
             telemetry audit row failed to write during a read, and the read was
@@ -158,17 +174,21 @@ groups:
         annotations:
           summary: Apex serving reads against an empty corpus for over 1h
           description: |
-            NO PRODUCER (#106.2) — THIS ALERT CANNOT FIRE. The parallax_apex_*
-            collectors are registered by parallax/apex/router.py, which nothing
-            under parallax/ imports: ApexPublicReadRouter is never instantiated
-            outside tests, so M7 public read does not execute in the server and
-            its collectors are absent from a running process entirely. Every
-            expression in this group evaluates to no-data, NOT to a healthy 0.
-            They are deliberately NOT exported as zeros: a zero is a
-            measurement, and would make an `increase(...) > 0` rule read as
-            "checked, and healthy" for a subsystem that never ran. These rules
-            become live when M7 read is wired into the server; until then their
-            silence carries no information. See the #106 PR.
+            ZERO UNTIL WIRED (#106.2). M7 public read still does not execute
+            in the server — ApexPublicReadRouter is instantiated nowhere under
+            parallax/ — but every parallax_apex_* series in this group is now
+            exported at a constant 0 by parallax.apex.router.prime_zero_series(),
+            called from create_app(). So this expression EVALUATES and this
+            alert can fire; before #106 it sat in no-data, which is silent in
+            exactly the same way a healthy system is.
+            READ THE ZERO ALONGSIDE parallax_subsystem_wired{subsystem="apex_m7"}.
+            0 means nothing has run: the zeros are placeholders and this alert's
+            silence carries no information about M7. 1 means the read path is
+            live and the same silence is a real measurement. Quiet-while-unwired
+            is NOT a passing check — that distinction is the whole point of the
+            readiness gauge, because a zero on its own cannot make it.
+            No rule change is needed when M7 lands: the real increments simply
+            take over from the primed zeros.
 
             parallax_apex_empty_result_total{cause="empty_corpus"} has been
             incrementing for over an hour — the package dir is accessible but
@@ -188,17 +208,21 @@ groups:
         annotations:
           summary: More than one Aphelion lib version serving Apex reads
           description: |
-            NO PRODUCER (#106.2) — THIS ALERT CANNOT FIRE. The parallax_apex_*
-            collectors are registered by parallax/apex/router.py, which nothing
-            under parallax/ imports: ApexPublicReadRouter is never instantiated
-            outside tests, so M7 public read does not execute in the server and
-            its collectors are absent from a running process entirely. Every
-            expression in this group evaluates to no-data, NOT to a healthy 0.
-            They are deliberately NOT exported as zeros: a zero is a
-            measurement, and would make an `increase(...) > 0` rule read as
-            "checked, and healthy" for a subsystem that never ran. These rules
-            become live when M7 read is wired into the server; until then their
-            silence carries no information. See the #106 PR.
+            ZERO UNTIL WIRED (#106.2). M7 public read still does not execute
+            in the server — ApexPublicReadRouter is instantiated nowhere under
+            parallax/ — but every parallax_apex_* series in this group is now
+            exported at a constant 0 by parallax.apex.router.prime_zero_series(),
+            called from create_app(). So this expression EVALUATES and this
+            alert can fire; before #106 it sat in no-data, which is silent in
+            exactly the same way a healthy system is.
+            READ THE ZERO ALONGSIDE parallax_subsystem_wired{subsystem="apex_m7"}.
+            0 means nothing has run: the zeros are placeholders and this alert's
+            silence carries no information about M7. 1 means the read path is
+            live and the same silence is a real measurement. Quiet-while-unwired
+            is NOT a passing check — that distinction is the whole point of the
+            readiness gauge, because a zero on its own cannot make it.
+            No rule change is needed when M7 lands: the real increments simply
+            take over from the primed zeros.
 
             parallax_apex_lib_version_info exposes >1 distinct `version` label —
             the fleet is running mixed Aphelion versions. The §3.3 startup version

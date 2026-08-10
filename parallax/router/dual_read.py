@@ -38,7 +38,7 @@ from parallax.router.discrepancy_live import (
     record_dual_read_request,
 )
 from parallax.router.dual_read_decision_log import append_decision, is_log_enabled
-from parallax.router.live_arbitration import arbitrate
+from parallax.router.live_arbitration import arbitrate, arbitration_latency_seconds
 from parallax.router.ports import QueryPort
 
 # Import _hits_equal from shadow.py directly (Q7: reuse, do NOT copy-paste).
@@ -345,12 +345,23 @@ class DualReadRouter:
         # ``None`` or empty (crosswalk-miss path).  Attach the verdict
         # only on dual-attempt paths; ``"skipped"`` short-circuits above
         # never reach here.
-        arbitration = arbitrate(
-            primary=primary_result,  # type: ignore[arg-type]
-            secondary=secondary_result,  # type: ignore[arg-type]
-            query_type=request.query_type,
-            correlation_id=cid,
-        )
+        #
+        # #106 — this is the site parallax_arbitration_latency_seconds measures.
+        # The dashboard panel that selects it had no producer anywhere in the
+        # repo; timing the call here (rather than inside ``arbitrate``, which is
+        # contractually pure) is what puts it on the wire. try/finally so a
+        # raising arbitration is still measured — an exception path that stopped
+        # reporting would make a broken rule table look like a quiet one.
+        _arbitration_started = time.perf_counter()
+        try:
+            arbitration = arbitrate(
+                primary=primary_result,  # type: ignore[arg-type]
+                secondary=secondary_result,  # type: ignore[arg-type]
+                query_type=request.query_type,
+                correlation_id=cid,
+            )
+        finally:
+            arbitration_latency_seconds.observe(time.perf_counter() - _arbitration_started)
 
         # M3b Phase 2 (US-005-M3-T2.2): when the arbitration verdict
         # requires manual review (winning_source in {"tie","fallback"}),

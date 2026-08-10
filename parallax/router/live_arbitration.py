@@ -31,13 +31,17 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+import prometheus_client
+
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.types import QueryType
 
 __all__ = [
+    "ARBITRATION_LATENCY_BUCKETS",
     "POLICY_VERSION_PRE_RC",
     "POLICY_VERSION_DEFAULT",
     "LiveArbitrationDecision",
+    "arbitration_latency_seconds",
     "arbitrate",
 ]
 
@@ -47,6 +51,70 @@ POLICY_VERSION_PRE_RC = "v0.0-pre-rc"
 
 # Default policy version emitted by ``arbitrate`` for new decisions.
 POLICY_VERSION_DEFAULT = "v0.3.0-rc"
+
+
+# ---------------------------------------------------------------------------
+# Arbitration latency (#106 — the T1.4 placeholder, resolved)
+# ---------------------------------------------------------------------------
+# ``parallax_arbitration_latency_seconds`` was selected by a panel in
+# grafana/dashboards/parallax-dual-read-observability.json and produced by
+# nothing at all — no Python file in the repo mentioned it, which is how the
+# #106 parity gate found it. The stand-in was
+# ``parallax_arbitration_p99_latency_ms``, a Gauge hardcoded to 0.0 in
+# routes/metrics.py and labelled "placeholder (real latency wired by T1.4
+# follow-up)". This is that follow-up.
+#
+# BUCKETS ARE SUB-MILLISECOND ON PURPOSE. ``arbitrate`` is a pure dict lookup
+# over two evidence objects; a healthy call is single-digit microseconds.
+# prometheus_client's DEFAULT_BUCKETS start at le=0.005, so every normal call
+# would land in the first bucket and histogram_quantile would report a constant
+# 0.005 — a p99 that cannot move is worse than no p99, because it looks
+# measured. The ladder below resolves the healthy range and still has headroom
+# above it: the interesting failure is not "arbitration got slow" in absolute
+# terms but "arbitration got orders of magnitude slower", e.g. a future rule
+# table that touches I/O.
+#
+# Observed from parallax/router/dual_read.py, NOT from inside ``arbitrate``:
+# the function's contract is that it is pure with no I/O and no side effects,
+# and a histogram observation is a side effect. The collector lives here rather
+# than at the call site so the buckets sit next to the code whose cost they
+# describe.
+ARBITRATION_LATENCY_BUCKETS = (
+    0.000_01,
+    0.000_025,
+    0.000_05,
+    0.000_1,
+    0.000_25,
+    0.000_5,
+    0.001,
+    0.005,
+    0.025,
+    0.1,
+)
+
+
+def _get_or_create_arbitration_histogram() -> prometheus_client.Histogram:
+    """Register the histogram, or return the one a previous import left behind.
+
+    prometheus_client raises ``ValueError`` on duplicate registration, which a
+    module reload (pytest importing the tree twice) would otherwise turn into a
+    hard import failure. Looked up by the name as passed — see the #106.4 note
+    on ``parallax.router.circuit_breaker._get_or_create_counter`` for the
+    ``_total``-suffix variant of this bug; a Histogram is indexed under its
+    ``_bucket`` child.
+    """
+    try:
+        return prometheus_client.Histogram(
+            "parallax_arbitration_latency_seconds",
+            "Wall-clock duration of a live cross-store arbitrate() call, in seconds.",
+            buckets=ARBITRATION_LATENCY_BUCKETS,
+        )
+    except ValueError:
+        registry = prometheus_client.REGISTRY._names_to_collectors  # type: ignore[attr-defined]
+        return registry["parallax_arbitration_latency_seconds_bucket"]  # type: ignore[return-value]
+
+
+arbitration_latency_seconds = _get_or_create_arbitration_histogram()
 
 # Source-level rule table: which store "owns" each QueryType when both
 # sides return populated results (Q1 Option A).  Crosswalk-miss

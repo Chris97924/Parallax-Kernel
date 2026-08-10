@@ -163,17 +163,27 @@ groups:
           description: |
             Lifespan drain handler hit the 15-minute timeout — in-flight requests
             were force-cut. Investigate stuck connections or upstream blocks.
-            KNOWN LATENT (#102 review, re-measured in #106): the increment
-            happens during lifespan shutdown, after the listening socket has
-            closed, so Prometheus never scrapes the post-increment value and
-            this alert is expected to stay silent even on a real timeout. Its
-            absence is NOT evidence of a clean drain.
-            USE THE LOG INSTEAD: the producer emits a structured WARNING keyed
+            HOW THIS FIRES (#106.3): the increment happens during lifespan
+            shutdown, after uvicorn has closed the listening socket, so it is
+            never scraped from the process that observed it. That process
+            instead appends the event to a durable journal
+            (PARALLAX_DRAIN_JOURNAL_PATH, default parallax_drain_journal.json
+            beside the server's working directory), and the NEXT process
+            restores the accumulated total into parallax_drain_timeout_total at
+            startup. The 0 -> 1 step therefore lands on a live target and this
+            alert fires after the restart, not during the shutdown. Expect it
+            shortly after the affected replica comes back, and read
+            {{ $labels.instance }} as "the replica that force-cut", not "the
+            replica that is unhealthy now".
+            WHAT BREAKS IT: a journal path on ephemeral storage that does not
+            survive the restart. If a drain timeout is in the logs and this
+            alert never fired, check that first.
+            THE LOG REMAINS the second channel: a structured WARNING keyed
             event="drain_timeout" (parallax.server.lifespan.DRAIN_TIMEOUT_EVENT)
             carrying inflight_count and timeout_seconds. That key is the
             supported match target — match on it rather than on the message
-            prose, which is free to change. Wiring it to a destination is
-            deliberately left open (#106 policy deferral).
+            prose, which is free to change. It reports at the moment of the
+            timeout, where this alert reports one restart later.
 
       # The three dual-read DoD gauges below are exposed by
       # parallax/server/routes/metrics.py partitioned by `traffic_source`

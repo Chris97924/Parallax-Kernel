@@ -67,83 +67,44 @@ _SAMPLE_SUFFIXES = ("_bucket", "_count", "_sum", "_total", "_created")
 # Hardcoded on purpose, matching the convention in test_apex_m7_dashboards.py:
 # this IS the contract, and a change must be a conscious edit.
 
+# WHAT LEFT THIS TABLE, AND WHY IT IS NEARLY EMPTY NOW
+# ----------------------------------------------------
+# #106 declared eighteen series dead across four groups and deferred all four
+# fixes as policy calls. Chris ratified full completion, and the follow-up PR
+# built the producers rather than the annotations:
+#
+#   * M4 canary T1-T5 + rollback_state (six names) — parallax/canary/exporter.py
+#     reads the durable OutcomeStore/AuditLog on each scrape, so the server can
+#     report events that happened in a `parallax canary` process. T3 needed the
+#     new instrumentation the old note predicted: parallax/canary/instrument.py
+#     measures per-request durations into audit_log.latency_ms.
+#   * Apex M7 (eight) and SQLiteGate (four) — zero-exported at startup by their
+#     modules' prime_zero_series(), rendered from the default registry. The old
+#     entry argued against this on the grounds that a zero is a measurement and
+#     would read as "checked, and healthy". That objection is answered by
+#     parallax_subsystem_wired, which publishes whether the subsystem has run at
+#     all; a zero next to wired=0 is explicitly not a measurement, and no-data
+#     could never have said even that.
+#   * parallax_arbitration_latency_seconds — a real histogram observed at the
+#     dual-read arbitration site (parallax/router/dual_read.py).
+#
+# The gate itself is unchanged and did the work it was built for: both
+# directions are still enforced, so each of those removals had to be justified
+# by an actual scrape (test_declared_dead_series_are_really_absent fails on any
+# entry left behind).
 _NO_PRODUCER: dict[str, str] = {
-    # -- #106.1: M4 canary T1-T5 -------------------------------------------
-    # Zero Python producers anywhere: the six names below are selected by
-    # prometheus/rules/parallax-m4-canary.rules.yml and the stage-1 dashboard,
-    # and no module registers, let alone increments, any of them.
-    #
-    # The T1-T5 machinery in parallax/canary/ is real but lives on the other
-    # side of a process boundary: triggers.py / rollback.py / outcomes.py are
-    # imported only by parallax/canary/cli.py, i.e. by `parallax canary` runs,
-    # not by the server that serves /metrics. Counters incremented there would
-    # live and die inside a short CLI process that Prometheus never scrapes, so
-    # "add producers" is not a wiring change — it needs a server-side exporter
-    # reading the durable OutcomeStore/AuditLog, or the rules need deleting.
-    # That call is left to Chris (#106 policy deferral); what is NOT deferred is
-    # that the alerts must stop reading as healthy, which the annotations now
-    # handle.
-    #
-    # M4CanaryDataLossDetected is the sharp end: a severity=critical,
-    # no-hysteresis, hard-rollback alert on data loss, evaluating no-data since
-    # the day it was written.
-    "parallax_canary_events": "no producer; T1/T2/T5 denominator. See #106.1.",
-    "parallax_canary_event_errors": "no producer; T1 numerator. See #106.1.",
-    "parallax_canary_discrepancy": "no producer; T2 numerator. See #106.1.",
-    "parallax_canary_data_loss_events": (
-        "no producer; T4 DATA-LOSS critical alert has never been able to fire. See #106.1."
-    ),
-    "parallax_canary_request_duration_ms": "no producer; T3 p99 histogram. See #106.1.",
-    "parallax_canary_rollback_state": "no producer; stage-1 dashboard only. See #106.1.",
-    # -- #106.2: Apex M7 public read ---------------------------------------
-    # Registered by parallax/apex/router.py, which nothing under parallax/
-    # imports — ApexPublicReadRouter is never instantiated outside tests, so M7
-    # public read does not run in the server at all. Both halves are broken:
-    # the collectors are absent from the running process's default registry,
-    # and _build_payload would not render them even if present.
-    #
-    # Deliberately NOT wired onto the wire. Exporting them would publish a
-    # permanent zero for a subsystem that never executes, and a zero is a
-    # measurement — the apex-m7 rules are `increase(...) > 0` alerts that would
-    # then read as "checked, and healthy" rather than "not running". The
-    # zero-export inversion in metrics.py is reserved for collectors that are
-    # genuinely live in-process (see its comment on the counters it does pluck).
-    "parallax_apex_read": "producer never instantiated (M7 not wired). See #106.2.",
-    "parallax_apex_read_latency_ms": "producer never instantiated (M7 not wired). See #106.2.",
-    "parallax_apex_read_errors": "producer never instantiated (M7 not wired). See #106.2.",
-    "parallax_apex_package_dir_errors": (
-        "producer never instantiated (M7 not wired). See #106.2."
-    ),
-    "parallax_apex_empty_result": "producer never instantiated (M7 not wired). See #106.2.",
-    "parallax_apex_empty_corpus": "producer never instantiated (M7 not wired). See #106.2.",
-    "parallax_apex_audit_write_failures": (
-        "producer never instantiated (M7 not wired). See #106.2."
-    ),
-    "parallax_apex_lib_version_info": "producer never instantiated (M7 not wired). See #106.2.",
-    # -- #106.2: SQLiteGate -------------------------------------------------
-    # Same shape. parallax/router/sqlite_gate.py registers five collectors;
-    # SQLiteGate is instantiated nowhere in parallax/ (the only `SQLiteGate(`
-    # in the tree is inside its own docstring), and crosswalk_backfill imports
-    # it solely for the is_connection_gated classmethod. Four of the five are
-    # selected by panels in the dual-read dashboard.
-    "parallax_sqlite_lock_wait_seconds": "SQLiteGate never instantiated. See #106.2.",
-    "parallax_sqlite_lock_hold_seconds": "SQLiteGate never instantiated. See #106.2.",
-    "parallax_sqlite_lock_queue_depth": "SQLiteGate never instantiated. See #106.2.",
-    "parallax_sqlite_errors": "SQLiteGate never instantiated. See #106.2.",
     # -- pre-existing, already documented in the rule itself -----------------
     # Producer exists (crosswalk_backfill.py) but record_orphan_miss() has no
     # production call site and the module is imported by nothing. Diagnosed in
     # full in the CrosswalkMissRateHigh comment in parallax-dual-read.rules.yml
     # during #101; listed here so the set is complete rather than partly prose.
+    #
+    # Deliberately NOT closed by the completion PR: the other four groups were
+    # consumers reading series nobody produced, and the fix was to produce them.
+    # This one is a producer nobody calls, so exporting it would publish a zero
+    # for a code path that does not exist — the fix is a call site or a deletion,
+    # and neither is an observability change.
     "parallax_crosswalk_miss_orphan": "producer has no call site; see #101 note in the rule.",
-    # -- found by this test, not by the issue --------------------------------
-    # Selected by a latency panel in parallax-dual-read-observability.json and
-    # registered by nothing at all — no Python file in the repo mentions it.
-    # The nearest real series is parallax_arbitration_p99_latency_ms, itself a
-    # hardcoded 0.0 placeholder awaiting the T1.4 follow-up.
-    "parallax_arbitration_latency_seconds": (
-        "no producer anywhere in the repo; dashboard panel only. Found by #106."
-    ),
 }
 
 

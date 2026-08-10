@@ -49,6 +49,9 @@ from prometheus_client import (
     generate_latest,
 )
 
+from parallax.canary.exporter import CanaryExporter
+from parallax.canary.exporter import cached_canary_snapshot as _cached_canary_snapshot
+from parallax.canary.exporter import reset_cache_for_tests as _reset_canary_cache_for_tests
 from parallax.obs.log import get_logger as _get_logger
 from parallax.obs.metrics import registry as _inhouse_registry
 from parallax.router.dual_read_metrics import (
@@ -109,6 +112,7 @@ _RESERVED_GAUGE_SUFFIXES = frozenset(
         "dual_read_outcomes_total",
         "arbitration_p99_latency_ms",
         "arbitration_policy_version",
+        "arbitration_latency_seconds",
         # #102 — same treatment, same reason: rendered from the DEFAULT
         # registry at the bottom of ``_build_payload``, so an in-house counter
         # sanitizing to one of these would put a second metric of the same
@@ -231,6 +235,10 @@ def _reset_cache_for_tests() -> None:
     with _dual_read_cache_lock:
         _dual_read_cache = None
         _dual_read_cache_at = 0.0
+    # #106.1 — the canary snapshot has its own TTL cache in the exporter module;
+    # a test that writes a fixture store and then scrapes has to invalidate it
+    # too, or it asserts against a snapshot taken before the fixture existed.
+    _reset_canary_cache_for_tests()
 
 
 def _collect_shadow_metrics() -> dict[str, float]:
@@ -484,6 +492,40 @@ def _render_default_registry_gauge(name: str) -> str:
     return ""
 
 
+def _render_default_registry_histogram(name: str) -> str:
+    """Render a live prometheus_client Histogram from the DEFAULT registry as text.
+
+    Third sibling of :func:`_render_default_registry_counter` /
+    :func:`_render_default_registry_gauge`, and it needs its own because a
+    Histogram is the one shape whose family name matches none of its sample
+    names: the samples are ``<name>_bucket`` (carrying ``le``), ``<name>_count``
+    and ``<name>_sum``. The counter helper would emit a ``<name>_total`` header
+    with nothing under it; the gauge helper would emit a header and drop every
+    sample.
+
+    ``_created`` is deliberately not emitted, matching the counter helper: it is
+    a process-start timestamp no consumer here selects, and leaving it out keeps
+    the payload parseable by the strict text parser the parity gate uses.
+
+    Returns ``""`` when the metric is not registered, so a missing collector
+    costs one series rather than 500-ing the whole scrape.
+    """
+    for metric in REGISTRY.collect():
+        if metric.name != name:
+            continue
+        lines = [
+            f"# HELP {name} {metric.documentation}",
+            f"# TYPE {name} histogram",
+        ]
+        for sample in metric.samples:
+            if not sample.name.endswith(("_bucket", "_count", "_sum")):
+                continue
+            labels = _format_prometheus_labels(sample.labels)
+            lines.append(f"{sample.name}{labels} {sample.value}")
+        return "\n".join(lines) + "\n"
+    return ""
+
+
 def _build_payload() -> str:
     """Render Prometheus text format combining in-house counters + shadow gauges."""
     reg = CollectorRegistry()
@@ -659,15 +701,36 @@ def _build_payload() -> str:
         registry=reg,
     ).set(dr_metrics.compute_error)
 
-    # Architect-flagged observability gap: real arbitration p99 latency wiring
-    # is deferred to a future T1.4 follow-up. Expose 0.0 as a placeholder so
-    # downstream Grafana panels do not 404 on the metric.
+    # SUPERSEDED BY parallax_arbitration_latency_seconds (#106, the T1.4
+    # follow-up this gauge was waiting for). Kept on the wire because it is a
+    # shipped series name and removing it would break any dashboard or scrape
+    # config still selecting it, but its value has always been a hardcoded 0.0
+    # and still is — read the histogram instead, which is a real measurement
+    # taken at the arbitration call site in parallax/router/dual_read.py.
     Gauge(
         "parallax_arbitration_p99_latency_ms",
-        "p99 latency of arbitrate() over the rolling 72h window — placeholder "
-        "(real latency wired by T1.4 follow-up).",
+        "DEPRECATED placeholder, always 0.0 — never a measurement. Use "
+        "histogram_quantile(0.99, rate(parallax_arbitration_latency_seconds_bucket[5m])) "
+        "* 1000 for the real p99.",
         registry=reg,
     ).set(0.0)
+
+    # ------------------------------------------------------------------
+    # #106.1 — M4 canary T1-T5, read from the durable OutcomeStore/AuditLog.
+    #
+    # The trigger machinery runs in `parallax canary` processes Prometheus never
+    # scrapes, so five alerts (T4 among them: severity=critical, no hysteresis,
+    # DATA LOSS) and seven panels selected series that had no producer at all.
+    # A registry-side collector is the shape that fixes it: the values are
+    # re-read from SQLite on each scrape rather than accumulated in memory, so
+    # this process can report events that happened in another one.
+    #
+    # Read-only and never-raising by construction — see the exporter's module
+    # docstring. A missing store yields the zero baseline plus
+    # parallax_canary_store_present 0, which is what tells an operator the zeros
+    # are placeholders.
+    # ------------------------------------------------------------------
+    reg.register(CanaryExporter(_cached_canary_snapshot()))
 
     # Info-metric (Q1' wiring): expose the live arbitration policy version as
     # a label on a constant 1.0-valued gauge so Prometheus joins on this
@@ -736,6 +799,35 @@ def _build_payload() -> str:
             # Prometheus attaches at scrape time. No cardinality concern.
             "parallax_circuit_breaker_tripped",
             "parallax_drain_timeout",
+            # ------------------------------------------------------------------
+            # #106.2 — the apex M7 / SQLiteGate zero-export. Same defect as the
+            # two above (registered in the default registry, never plucked out
+            # here) compounded by a second one: neither subsystem runs in the
+            # server, so the collectors were absent from the process entirely
+            # and the labelled ones had no child series even after import.
+            # ``create_app`` now imports both modules and calls their
+            # ``prime_zero_series()``, which materialises the reviewed label
+            # sets; these lines are what carry them to the wire.
+            #
+            # ZEROS, NOT SILENCE — reversing the call #106 made. The objection
+            # to zeros was that `increase(...) > 0` over a permanent 0 reads as
+            # "checked, and healthy". True, but no-data reads as healthy too AND
+            # is indistinguishable from a broken exporter. The fix is the
+            # missing third fact: parallax_subsystem_wired (rendered below) says
+            # whether the subsystem has run at all, so 0-and-wired is a
+            # measurement and 0-and-not-wired is explicitly not one. Every apex
+            # rule annotation now points at it.
+            #
+            # BASE NAMES, as for the two above: prometheus_client strips the
+            # trailing ``_total`` at construction, so ``parallax_sqlite_errors``
+            # is the collected name for ``parallax_sqlite_errors_total``.
+            "parallax_apex_read",
+            "parallax_apex_read_errors",
+            "parallax_apex_package_dir_errors",
+            "parallax_apex_empty_result",
+            "parallax_apex_empty_corpus",
+            "parallax_apex_audit_write_failures",
+            "parallax_sqlite_errors",
         )
     )
 
@@ -785,10 +877,47 @@ def _build_payload() -> str:
     # (circuit_breaker_tripped_total) at line 53. The helpers still return ""
     # rather than raising if that ever stops being true — losing one series is
     # better than 500-ing the whole scrape.
-    default_registry_gauges = _render_default_registry_gauge("parallax_inflight_requests")
+    default_registry_gauges = "".join(
+        _render_default_registry_gauge(name)
+        for name in (
+            "parallax_inflight_requests",
+            # #106.2 — the gauge half of the apex/sqlite zero-export, plus the
+            # readiness signal that makes the zeros interpretable.
+            "parallax_apex_lib_version_info",
+            "parallax_sqlite_lock_queue_depth",
+            "parallax_subsystem_wired",
+        )
+    )
+
+    # #106 — the arbitration latency histogram, observed at the dual-read
+    # arbitration call site (parallax/router/dual_read.py). Its collector is
+    # defined in parallax.router.live_arbitration, which this module already
+    # imports for POLICY_VERSION_DEFAULT, so it is unconditionally present in a
+    # running server's default registry.
+    #
+    # It is unlabelled, so prometheus_client materialises every bucket at 0.0
+    # when the collector is constructed — the family is on the wire from the
+    # first scrape, before any arbitration has run. That does NOT fabricate a
+    # latency: histogram_quantile over a range where every bucket rate is 0 has
+    # no observations to interpolate and returns NaN, which Grafana draws as
+    # no-data. The consuming panel therefore carries no `or vector(0)`, which
+    # would have converted that honest gap into a reported 0ms p99.
+    default_registry_histograms = "".join(
+        _render_default_registry_histogram(name)
+        for name in (
+            "parallax_arbitration_latency_seconds",
+            # #106.2 — the histogram third of the apex/sqlite zero-export.
+            "parallax_apex_read_latency_ms",
+            "parallax_sqlite_lock_wait_seconds",
+            "parallax_sqlite_lock_hold_seconds",
+        )
+    )
 
     return (
-        generate_latest(reg).decode("utf-8") + default_registry_counters + default_registry_gauges
+        generate_latest(reg).decode("utf-8")
+        + default_registry_counters
+        + default_registry_gauges
+        + default_registry_histograms
     )
 
 

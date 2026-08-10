@@ -35,6 +35,8 @@ from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
 from parallax import __version__
+from parallax.apex.router import prime_zero_series as apex_prime_zero_series
+from parallax.router.sqlite_gate import prime_zero_series as sqlite_gate_prime_zero_series
 from parallax.server.auth import (
     PARALLAX_BIND_HOST_ENV,
     assert_safe_to_start,
@@ -133,6 +135,18 @@ def create_app(
     )
     app.state.db_factory = db_factory or default_db_factory
     app.state.settings = dict(settings or {})
+
+    # #106.2 — put the apex M7 and SQLiteGate collectors on the wire at zero.
+    # Neither subsystem runs in the server, so twelve series that shipped
+    # consumers select had never appeared in a scrape and every rule and panel
+    # reading them evaluated no-data forever. Priming here rather than in the
+    # lifespan is deliberate: a lifespan only runs under `with TestClient(app)`
+    # or a real uvicorn boot, so a scrape taken without it — which is how the
+    # #106 parity gate takes its cold scrape — would still see nothing.
+    # parallax_subsystem_wired reports 0.0 for both until one is constructed,
+    # which is what keeps these zeros from reading as measurements.
+    apex_prime_zero_series()
+    sqlite_gate_prime_zero_series()
 
     # Refuse to start when bound to a non-localhost interface without auth.
     # Override with ``PARALLAX_ALLOW_OPEN_PUBLIC=1`` if absolutely needed.

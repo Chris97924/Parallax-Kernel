@@ -736,7 +736,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "M3b placeholder — arbitration p99 latency is wired in M3b T2.3. Expected to show 0 or 'No data' during M3a.",
+      "description": "p99 wall-clock duration of a live cross-store arbitrate() call, measured at the dual-read arbitration site (parallax/router/dual_read.py) and exported as parallax_arbitration_latency_seconds (#106). 'No data' means no arbitration ran in the window — histogram_quantile over zero observations is NaN, and that is deliberately NOT masked to 0, so an idle or broken dual-read path is distinguishable from an instant one. Typical healthy value is microseconds: arbitrate() is a pure rule-table lookup.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -773,12 +773,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(parallax_arbitration_latency_seconds_bucket[5m]))) or vector(0)",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(parallax_arbitration_latency_seconds_bucket[5m])))",
           "instant": true,
           "refId": "A"
         }
       ],
-      "title": "M3b placeholder — arbitration_p99_latency_ms",
+      "title": "Arbitration p99 latency",
       "type": "stat"
     },
     {

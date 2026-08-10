@@ -3,6 +3,10 @@
 #   cases 1-8   AphelionUnreachableRateHigh          (#103 review)
 #   cases 9-14  CircuitBreakerTripped     — CRITICAL (#102)
 #   cases 15-19 DrainTimeoutDetected      — CRITICAL (#102)
+#   cases 20-22 DrainTimeoutDetected across a restart — the durable journal
+#               (#106.3). Case 20 replaces the "this can never fire" case that
+#               #102 left pinned here; 21 and 22 guard the regression the fix
+#               could introduce, where a redeploy replays old history and pages.
 #
 # Run:  promtool test rules prometheus/tests/parallax-dual-read.test.yml
 #
@@ -676,17 +680,27 @@ tests:
               description: |
                 Lifespan drain handler hit the 15-minute timeout — in-flight requests
                 were force-cut. Investigate stuck connections or upstream blocks.
-                KNOWN LATENT (#102 review, re-measured in #106): the increment
-                happens during lifespan shutdown, after the listening socket has
-                closed, so Prometheus never scrapes the post-increment value and
-                this alert is expected to stay silent even on a real timeout. Its
-                absence is NOT evidence of a clean drain.
-                USE THE LOG INSTEAD: the producer emits a structured WARNING keyed
+                HOW THIS FIRES (#106.3): the increment happens during lifespan
+                shutdown, after uvicorn has closed the listening socket, so it is
+                never scraped from the process that observed it. That process
+                instead appends the event to a durable journal
+                (PARALLAX_DRAIN_JOURNAL_PATH, default parallax_drain_journal.json
+                beside the server's working directory), and the NEXT process
+                restores the accumulated total into parallax_drain_timeout_total at
+                startup. The 0 -> 1 step therefore lands on a live target and this
+                alert fires after the restart, not during the shutdown. Expect it
+                shortly after the affected replica comes back, and read
+                10.0.0.1:8765 as "the replica that force-cut", not "the
+                replica that is unhealthy now".
+                WHAT BREAKS IT: a journal path on ephemeral storage that does not
+                survive the restart. If a drain timeout is in the logs and this
+                alert never fired, check that first.
+                THE LOG REMAINS the second channel: a structured WARNING keyed
                 event="drain_timeout" (parallax.server.lifespan.DRAIN_TIMEOUT_EVENT)
                 carrying inflight_count and timeout_seconds. That key is the
                 supported match target — match on it rather than on the message
-                prose, which is free to change. Wiring it to a destination is
-                deliberately left open (#106 policy deferral).
+                prose, which is free to change. It reports at the moment of the
+                timeout, where this alert reports one restart later.
 
   # -------------------------------------------------------------------------
   # 16. SILENT when every drain completed cleanly. Kills the >= 0 mutant, as
@@ -764,69 +778,149 @@ tests:
               description: |
                 Lifespan drain handler hit the 15-minute timeout — in-flight requests
                 were force-cut. Investigate stuck connections or upstream blocks.
-                KNOWN LATENT (#102 review, re-measured in #106): the increment
-                happens during lifespan shutdown, after the listening socket has
-                closed, so Prometheus never scrapes the post-increment value and
-                this alert is expected to stay silent even on a real timeout. Its
-                absence is NOT evidence of a clean drain.
-                USE THE LOG INSTEAD: the producer emits a structured WARNING keyed
+                HOW THIS FIRES (#106.3): the increment happens during lifespan
+                shutdown, after uvicorn has closed the listening socket, so it is
+                never scraped from the process that observed it. That process
+                instead appends the event to a durable journal
+                (PARALLAX_DRAIN_JOURNAL_PATH, default parallax_drain_journal.json
+                beside the server's working directory), and the NEXT process
+                restores the accumulated total into parallax_drain_timeout_total at
+                startup. The 0 -> 1 step therefore lands on a live target and this
+                alert fires after the restart, not during the shutdown. Expect it
+                shortly after the affected replica comes back, and read
+                10.0.0.1:8765 as "the replica that force-cut", not "the
+                replica that is unhealthy now".
+                WHAT BREAKS IT: a journal path on ephemeral storage that does not
+                survive the restart. If a drain timeout is in the logs and this
+                alert never fired, check that first.
+                THE LOG REMAINS the second channel: a structured WARNING keyed
                 event="drain_timeout" (parallax.server.lifespan.DRAIN_TIMEOUT_EVENT)
                 carrying inflight_count and timeout_seconds. That key is the
                 supported match target — match on it rather than on the message
-                prose, which is free to change. Wiring it to a destination is
-                deliberately left open (#106 policy deferral).
+                prose, which is free to change. It reports at the moment of the
+                timeout, where this alert reports one restart later.
 
   # -------------------------------------------------------------------------
-  # 20. THE PRODUCTION SHAPE — and it is SILENT. (#102 review P1-2.)
+  # 20. THE PRODUCTION SHAPE — and since #106.3 it FIRES.
   #
-  #     Cases 15 and 19 above prove the rule's LOGIC is right: given a series
-  #     that steps 0 -> 1 and keeps being scraped, the alert fires. Production
-  #     cannot produce that series, and this case is the honest model.
+  #     This case used to assert the opposite, and said so: "it should start
+  #     FAILING the day a durable producer is added -- that is the signal the
+  #     fix landed." The producer landed (parallax/server/drain_journal.py), so
+  #     this is the rewritten contract.
   #
-  #     Measured on uvicorn 0.52.1 against a real server: during lifespan
-  #     shutdown -- where _drain_inflight runs and where drain_timeout_total is
-  #     incremented -- the listening socket is already closed. Scrapes from
-  #     inside that window returned ConnectTimeout, and a bare TCP connect to
-  #     the port timed out. The process then exits.
+  #     What is still true, and is the reason the shape looks odd: measured on
+  #     uvicorn 0.52.1, the listening socket is already closed by the time
+  #     _drain_inflight runs, so the in-process increment is never scraped. A
+  #     counter owned by the terminating exporter cannot report its own
+  #     termination, and moving the increment earlier in the drain does not
+  #     help — the whole drain runs inside the same already-unserved window.
   #
-  #     So what Prometheus actually records is: 0 for the whole life of the
-  #     process, then the target disappears. The increment is real and is
-  #     never exported. `_` here is exactly that -- no sample, because there is
-  #     no longer a server to scrape.
+  #     What changed is who publishes it. The dying process journals the event
+  #     to disk; the next process restores the accumulated total at startup.
+  #     So the series is: 0 for the life of the old process, a gap while nothing
+  #     is listening, then 1 from the new process's first scrape. The step lands
+  #     on a live target, and increase() over a window spanning the restart sees
+  #     it.
   #
-  #     increase() over that sees no step, and DrainTimeoutDetected stays
-  #     silent through the very event it exists for. This case asserts that
-  #     silence so the gap is pinned in CI rather than described in a comment
-  #     someone may not read. It should start FAILING the day a durable
-  #     producer is added -- that is the signal the fix landed.
-  #
-  #     Note what this rules OUT: moving the increment earlier in the drain
-  #     does not help, because the entire drain runs inside the same
-  #     already-unserved window. A counter owned by the terminating exporter
-  #     cannot report its own termination.
+  #     Mutation note: drop the restore (journal written but never read) and the
+  #     series returns to '0+0x60 _x60', which is case 21's input — this case
+  #     stops firing.
   # -------------------------------------------------------------------------
   - interval: 1m
-    name: production shape (increment never scraped) leaves the alert silent
+    name: production shape (journalled timeout restored after restart) fires
     input_series:
-      # 0 for the life of the process, then the exporter is gone. The drain
-      # timeout increments somewhere in the gap and is never sampled.
+      # 0 while the old process served, a 5m gap over the restart, then the
+      # restored total from the process that replaced it.
       - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
-        values: '0+0x60 _x60'
+        values: '0+0x60 _x5 1+0x55'
     alert_rule_test:
-      - eval_time: 61m
+      - eval_time: 70m
         alertname: DrainTimeoutDetected
-        exp_alerts: []
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: parallax_dual_read
+              job: parallax
+              instance: 10.0.0.1:8765
+            exp_annotations:
+              summary: Graceful drain timeout occurred
+              description: |
+                Lifespan drain handler hit the 15-minute timeout — in-flight requests
+                were force-cut. Investigate stuck connections or upstream blocks.
+                HOW THIS FIRES (#106.3): the increment happens during lifespan
+                shutdown, after uvicorn has closed the listening socket, so it is
+                never scraped from the process that observed it. That process
+                instead appends the event to a durable journal
+                (PARALLAX_DRAIN_JOURNAL_PATH, default parallax_drain_journal.json
+                beside the server's working directory), and the NEXT process
+                restores the accumulated total into parallax_drain_timeout_total at
+                startup. The 0 -> 1 step therefore lands on a live target and this
+                alert fires after the restart, not during the shutdown. Expect it
+                shortly after the affected replica comes back, and read
+                10.0.0.1:8765 as "the replica that force-cut", not "the
+                replica that is unhealthy now".
+                WHAT BREAKS IT: a journal path on ephemeral storage that does not
+                survive the restart. If a drain timeout is in the logs and this
+                alert never fired, check that first.
+                THE LOG REMAINS the second channel: a structured WARNING keyed
+                event="drain_timeout" (parallax.server.lifespan.DRAIN_TIMEOUT_EVENT)
+                carrying inflight_count and timeout_seconds. That key is the
+                supported match target — match on it rather than on the message
+                prose, which is free to change. It reports at the moment of the
+                timeout, where this alert reports one restart later.
+
+  # -------------------------------------------------------------------------
+  # 21. THE REGRESSION THIS FIX COULD INTRODUCE, pinned as silence.
+  #
+  #     Restoring with inc(journal_total) instead of inc(journal_total -
+  #     current) republishes the whole history on every boot. Prometheus reads
+  #     a counter that resets to 0 and climbs back to N as an increase of N, so
+  #     every ordinary redeploy of a replica that has EVER timed out would page
+  #     oncall at CRITICAL — and the alert would become something people mute.
+  #
+  #     The series here is a replica whose journal already holds one timeout,
+  #     restarting cleanly: it exported 1 before, and exports 1 again after.
+  #     Restore-by-delta produces exactly this. Restore-by-total produces
+  #     '1+0x60 _x5 0 1+0x54' instead, whose reset-and-climb increase() is
+  #     non-zero, and this case fails.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: a clean restart does not replay an old journalled timeout
+    input_series:
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '1+0x60 _x5 1+0x55'
+    alert_rule_test:
       - eval_time: 70m
         alertname: DrainTimeoutDetected
         exp_alerts: []
-      - eval_time: 90m
+      - eval_time: 100m
         alertname: DrainTimeoutDetected
         exp_alerts: []
     promql_expr_test:
-      # A flat zero while the target was up, then nothing at all. Neither is a
-      # signal that a drain timed out.
+      # Flat across the restart. The journal is being read, not re-applied.
       - expr: increase(parallax_drain_timeout_total[1h])
-        eval_time: 55m
+        eval_time: 100m
         exp_samples:
           - labels: '{instance="10.0.0.1:8765", job="parallax"}'
             value: 0
+
+  # -------------------------------------------------------------------------
+  # 22. A REPLICA THAT NEVER TIMED OUT stays silent across its own restart.
+  #
+  #     Companion control to case 21: the common case is a redeploy of a healthy
+  #     replica whose journal is absent entirely, so the restore is a no-op and
+  #     the counter comes back at 0. Nothing about the fix may make a routine
+  #     deploy look like a force-cut.
+  # -------------------------------------------------------------------------
+  - interval: 1m
+    name: a healthy replica restart is not a drain timeout
+    input_series:
+      - series: 'parallax_drain_timeout_total{job="parallax",instance="10.0.0.1:8765"}'
+        values: '0+0x60 _x5 0+0x55'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []
+      - eval_time: 121m
+        alertname: DrainTimeoutDetected
+        exp_alerts: []

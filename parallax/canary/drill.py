@@ -34,6 +34,8 @@ from parallax.canary.idempotency import (
     CachedResponse,
     IdempotencyHandler,
 )
+from parallax.canary.instrument import CanaryRequestRecorder
+from parallax.canary.outcomes import OutcomeStore
 
 __all__ = [
     "DrillStatus",
@@ -225,8 +227,16 @@ def run_reemit_drill(
     audit_log: AuditLog | None = None,
     reemit_count: int = 5,
     dry_run: bool = True,
+    outcome_store: OutcomeStore | None = None,
+    stage: str | None = None,
 ) -> DrillReport:
     """Simulate Orbit re-emitting events after a rollback.
+
+    Passing both ``outcome_store`` and ``stage`` turns the first emit pass into
+    a measured canary producer (#106.1): each event is timed and written to
+    ``audit_log.latency_ms`` and ``canary_outcomes`` together, which is what the
+    server-side T1-T5 exporter reads. Omit them and the drill behaves exactly as
+    it did before.
 
     The drill records each event twice via :class:`AuditLog`. Audit log
     semantics MUST treat the second insertion as an UPSERT that
@@ -295,17 +305,41 @@ def run_reemit_drill(
         )
 
     # Real path: write each row twice and verify single-row presence.
-    first_pass_ok = all(
-        audit_log.record(
-            make_record(
-                event_id=eid,
-                response_status=200,
-                latency_ms=10.0,
-                idempotency_hit=False,
-            )
+    #
+    # #106.1 — the first pass is now MEASURED, not stamped. It used to write a
+    # hardcoded latency_ms=10.0, which is the only per-request duration the
+    # durable store has ever held; a T3 histogram built on it would show one
+    # spike at a constant and a p99 that cannot move. When a stage is supplied
+    # the emits also land in the OutcomeStore, so `parallax canary
+    # --orbit-reemit-test --stage m4_1pct` is a real, fixture-driven producer
+    # for every T1-T5 series rather than a drill with a side effect.
+    recorder: CanaryRequestRecorder | None = None
+    if outcome_store is not None and stage is not None:
+        recorder = CanaryRequestRecorder(
+            audit_log=audit_log, outcome_store=outcome_store, stage=stage
         )
-        for eid in event_ids
-    )
+        first_pass_ok = True
+        for eid in event_ids:
+            with recorder.request(event_id=eid) as span:
+                pass
+            # Read the span AFTER the context exits — that is where both writes
+            # happen and where ``recorded`` is set.
+            first_pass_ok = first_pass_ok and span.recorded
+    else:
+        # No stage configured: unchanged pre-#106 behaviour. The drill is still
+        # a drill — it verifies the UPSERT invariant, and the stamped latency is
+        # inert because nothing reads it without an outcome row to join to.
+        first_pass_ok = all(
+            audit_log.record(
+                make_record(
+                    event_id=eid,
+                    response_status=200,
+                    latency_ms=10.0,
+                    idempotency_hit=False,
+                )
+            )
+            for eid in event_ids
+        )
     steps.append(
         DrillStepResult(
             name="emit_first_pass",
@@ -316,17 +350,31 @@ def run_reemit_drill(
     )
 
     # Re-emit (Orbit replay) — same event_ids again. Audit log UPSERT path.
-    second_pass_ok = all(
-        audit_log.record(
-            make_record(
-                event_id=eid,
-                response_status=200,
-                latency_ms=10.0,
-                idempotency_hit=True,
+    #
+    # The instrumented branch has to go through the recorder too, and that is
+    # not symmetry for its own sake: ``AuditLog.record`` UPSERTs, so a second
+    # pass stamping latency_ms=10.0 would overwrite the duration the first pass
+    # measured and every T3 observation would come out as the old constant. A
+    # replay is a real canary request; measuring it is both correct and the only
+    # way the first measurement survives.
+    if recorder is not None:
+        second_pass_ok = True
+        for eid in event_ids:
+            with recorder.request(event_id=eid) as span:
+                span.idempotency_hit = True
+            second_pass_ok = second_pass_ok and span.recorded
+    else:
+        second_pass_ok = all(
+            audit_log.record(
+                make_record(
+                    event_id=eid,
+                    response_status=200,
+                    latency_ms=10.0,
+                    idempotency_hit=True,
+                )
             )
+            for eid in event_ids
         )
-        for eid in event_ids
-    )
     # Confirm row count did not double.
     conn = audit_log._connect()
     placeholders = ",".join("?" * len(event_ids))
@@ -485,6 +533,8 @@ def run_full_drill(
     concurrency: int = 8,
     timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S,
     dry_run: bool = True,
+    outcome_store: OutcomeStore | None = None,
+    stage: str | None = None,
 ) -> tuple[DrillReport, DrillReport, DrillReport]:
     """Run the three drills in sequence and return their reports."""
     drain = run_drain_drill(
@@ -496,6 +546,8 @@ def run_full_drill(
         audit_log=audit_log,
         reemit_count=reemit_count,
         dry_run=dry_run,
+        outcome_store=outcome_store,
+        stage=stage,
     )
     idem = run_idempotency_drill(
         audit_log=audit_log,

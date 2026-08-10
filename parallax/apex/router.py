@@ -55,6 +55,7 @@ from aphelion.yaml_canonical import parse_frontmatter, split_frontmatter
 
 from parallax.apex import subject_index
 from parallax.apex.resolver import DEFAULT_TOP_K, resolve_subjects
+from parallax.obs.subsystem_readiness import SUBSYSTEM_APEX_M7, mark_wired
 from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.aphelion_adapter import (
     CLAIM_CONTENT_KEY,
@@ -66,10 +67,12 @@ from parallax.router.contracts import QueryRequest
 
 __all__ = [
     "REQUIRED_APHELION_MIN_VERSION",
+    "ZERO_EXPORT_LABEL_SETS",
     "ApexPublicReadRouter",
     "ApexRouterStartupError",
     "assert_aphelion_version",
     "classify_package_exception",
+    "prime_zero_series",
     "validate_package_dir",
 ]
 
@@ -193,6 +196,84 @@ LIB_VERSION_INFO = _get_or_create(
     ),
     "parallax_apex_lib_version_info",
 )
+
+
+# ---------------------------------------------------------------------------
+# Zero-export priming (#106.2)
+# ---------------------------------------------------------------------------
+# Registering a collector is not exposition, and for a LABELLED collector it is
+# not even a series: prometheus_client creates a child only when ``.labels()``
+# is called, so an untouched Counter contributes a HELP/TYPE header and nothing
+# under it. Prometheus records no samples, and every rule in
+# prometheus/rules/parallax-apex-m7.rules.yml evaluates against no-data — which
+# is silent in exactly the way a healthy subsystem is silent. That is the whole
+# #106 defect class.
+#
+# So the label sets below are materialised at server startup. Each is 0.0 and
+# stays 0.0 until M7 read is wired into the server, at which point the real
+# increments take over.
+#
+# WHICH LABEL VALUES, AND WHY THESE: one rule, applied mechanically.
+#
+#     Prime exactly the label sets the shipped consumers select, leaving every
+#     label they do not constrain EMPTY. A collector no consumer label-selects
+#     gets a single all-empty series.
+#
+# An empty label value is a legitimate Prometheus series (it is equivalent to
+# the label being absent for matching purposes) and it is already part of this
+# metric's vocabulary — ``_record_error`` writes ``exc_class=""`` on every
+# non-``lib_error`` path. The alternative, priming a plausible-looking value
+# like ``reason="package_missing"``, would invent dimensionality: it asserts
+# that a specific failure mode was checked and found clean, which is precisely
+# the false reassurance the zero-export was accused of. An empty label says "no
+# value has ever been observed", which is true.
+#
+# The one exception is ``cause="empty_corpus"``, and it is an exception because
+# ApexStuckEmptyCorpus selects that exact label — priming anything else would
+# leave that alert matching nothing, i.e. still dead.
+#
+# THE ZEROS ARE ONLY HALF THE SIGNAL. parallax_subsystem_wired{subsystem=
+# "apex_m7"} reports 0.0 until ApexPublicReadRouter is constructed, so a reader
+# can tell a real zero from a subsystem that never ran. The rule annotations
+# name it.
+ZERO_EXPORT_LABEL_SETS: dict[str, tuple[dict[str, str], ...]] = {
+    "parallax_apex_read": ({"result": ""},),
+    "parallax_apex_read_latency_ms": ({"result": ""},),
+    "parallax_apex_read_errors": ({"reason": "", "exc_class": ""},),
+    "parallax_apex_package_dir_errors": ({"reason": ""},),
+    # ApexStuckEmptyCorpus selects cause="empty_corpus" by equality.
+    "parallax_apex_empty_result": ({"cause": "empty_corpus"},),
+    "parallax_apex_empty_corpus": ({},),
+    "parallax_apex_audit_write_failures": ({"cause": ""},),
+    "parallax_apex_lib_version_info": ({"version": "", "min_version": ""},),
+}
+
+_ZERO_EXPORT_COLLECTORS: dict[str, Any] = {
+    "parallax_apex_read": READ_TOTAL,
+    "parallax_apex_read_latency_ms": READ_LATENCY,
+    "parallax_apex_read_errors": READ_ERRORS,
+    "parallax_apex_package_dir_errors": PACKAGE_DIR_ERRORS,
+    "parallax_apex_empty_result": EMPTY_RESULT,
+    "parallax_apex_empty_corpus": EMPTY_CORPUS,
+    "parallax_apex_audit_write_failures": AUDIT_WRITE_FAILURES,
+    "parallax_apex_lib_version_info": LIB_VERSION_INFO,
+}
+
+
+def prime_zero_series() -> None:
+    """Materialise every apex M7 series at zero. Idempotent.
+
+    ``.labels(...)`` creates the child and leaves it at its zero value; it is
+    NOT an increment, so calling this twice (or after real traffic has started)
+    changes nothing. The unlabelled ``EMPTY_CORPUS`` counter already has its
+    single series from construction and is listed only so the table below stays
+    the exhaustive statement of what this module zero-exports.
+    """
+    for name, label_sets in ZERO_EXPORT_LABEL_SETS.items():
+        collector = _ZERO_EXPORT_COLLECTORS[name]
+        for labels in label_sets:
+            if labels:
+                collector.labels(**labels)
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +478,11 @@ class ApexPublicReadRouter:
         # ``_last_corpus_empty`` this is single-context-per-call state; do not
         # share one instance across concurrent queries without synchronization.
         self._scoped_packages: tuple[str, ...] | None = None
+        # #106.2 — from here on the zero-exported apex series are real
+        # measurements rather than placeholders, and the readiness gauge is what
+        # says so. Marked in the constructor, not at a wiring site, so it cannot
+        # claim the subsystem is live when nothing built it.
+        mark_wired(SUBSYSTEM_APEX_M7)
         self._adapter = AphelionReadAdapter(
             audit_conn_provider=audit_conn_provider,
             package_dir=self._package_dir,

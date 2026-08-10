@@ -35,8 +35,14 @@ from typing import Any, ClassVar, Literal
 import prometheus_client
 
 from parallax.obs.log import get_logger
+from parallax.obs.subsystem_readiness import SUBSYSTEM_SQLITE_GATE, mark_wired
 
-__all__ = ["SQLiteGate", "SQLiteGateMetrics"]
+__all__ = [
+    "ZERO_EXPORT_LABEL_SETS",
+    "SQLiteGate",
+    "SQLiteGateMetrics",
+    "prime_zero_series",
+]
 
 _log = get_logger("parallax.router.sqlite_gate")
 
@@ -114,6 +120,62 @@ _errors_counter = _get_or_create_counter(
     "Count of sqlite errors by error class, component, and op.",
     ["code", "component", "op"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Zero-export priming (#106.2)
+# ---------------------------------------------------------------------------
+# Four of the five collectors above are selected by panels in
+# grafana/dashboards/parallax-dual-read-observability.json, and SQLiteGate is
+# instantiated nowhere under parallax/ — so those panels have been reading
+# no-data since they shipped. Registration is not exposition, and for a labelled
+# collector it is not even a series: the child only exists once ``.labels()``
+# runs. See ``parallax.apex.router.prime_zero_series`` for the full argument and
+# the one rule that picks these label values:
+#
+#     Prime exactly the label sets the shipped consumers select, leaving every
+#     label they do not constrain EMPTY. A collector no consumer label-selects
+#     gets a single all-empty series.
+#
+# Both lock histogram panels select ``component="m3_dual_read"``; ``op`` and
+# ``code`` are grouped by, never equality-matched, so they are primed empty
+# rather than with a guessed value.
+#
+# ``parallax_sqlite_wal_size_bytes`` is deliberately absent: no rule or panel
+# selects it, so it has no consumer to un-break, and the #106 gate does not
+# police series that nothing reads.
+#
+# parallax_subsystem_wired{subsystem="sqlite_gate"} reports 0.0 until a
+# SQLiteGate is constructed, so these zeros can be told apart from measurements.
+ZERO_EXPORT_LABEL_SETS: dict[str, tuple[dict[str, str], ...]] = {
+    "parallax_sqlite_lock_wait_seconds": ({"component": "m3_dual_read", "op": ""},),
+    "parallax_sqlite_lock_hold_seconds": ({"component": "m3_dual_read", "op": ""},),
+    "parallax_sqlite_lock_queue_depth": ({},),
+    "parallax_sqlite_errors": ({"code": "", "component": "", "op": ""},),
+}
+
+_ZERO_EXPORT_COLLECTORS: dict[str, Any] = {
+    "parallax_sqlite_lock_wait_seconds": _lock_wait_hist,
+    "parallax_sqlite_lock_hold_seconds": _lock_hold_hist,
+    "parallax_sqlite_lock_queue_depth": _queue_depth_gauge,
+    "parallax_sqlite_errors": _errors_counter,
+}
+
+
+def prime_zero_series() -> None:
+    """Materialise every consumed SQLiteGate series at zero. Idempotent.
+
+    ``.labels(...)`` creates the child at its zero value and is not an
+    increment, so re-running this after real traffic has started changes
+    nothing. ``_queue_depth_gauge`` takes no labels and already has its single
+    series from construction; it is listed so the table stays the exhaustive
+    statement of what this module zero-exports.
+    """
+    for name, label_sets in ZERO_EXPORT_LABEL_SETS.items():
+        collector = _ZERO_EXPORT_COLLECTORS[name]
+        for labels in label_sets:
+            if labels:
+                collector.labels(**labels)
 
 
 class SQLiteGateMetrics:
@@ -212,6 +274,10 @@ class SQLiteGate:
         self._conn = connection
         self._component = component
         self._lock = threading.Lock()
+        # #106.2 — from here on this module's zero-exported series are real
+        # measurements. Marked in the constructor so the readiness gauge cannot
+        # claim the gate is live when nothing built one.
+        mark_wired(SUBSYSTEM_SQLITE_GATE)
         self._register_and_apply_pragmas()
 
     # ------------------------------------------------------------------

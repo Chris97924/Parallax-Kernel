@@ -31,6 +31,7 @@ from prometheus_client import Counter
 
 from parallax.apex.audit_db import open_audit_db, resolve_audit_db_path
 from parallax.router.inflight import get_inflight_count
+from parallax.server.drain_journal import read_drain_journal, record_drain_timeout
 
 __all__ = [
     "DRAIN_TIMEOUT_EVENT",
@@ -38,6 +39,7 @@ __all__ = [
     "DRAIN_POLL_INTERVAL_SECONDS",
     "drain_timeout_total",
     "parallax_lifespan",
+    "restore_drain_timeout_counter",
 ]
 
 _log = logging.getLogger("parallax.server.lifespan")
@@ -45,18 +47,19 @@ _log = logging.getLogger("parallax.server.lifespan")
 DRAIN_TIMEOUT_SECONDS: Final[float] = 900.0  # 15 minutes
 DRAIN_POLL_INTERVAL_SECONDS: Final[float] = 0.5
 
-#: Structured key on the drain-timeout log record — the one producer-side signal
-#: for this event that survives the process (#106.3).
+#: Structured key on the drain-timeout log record (#106.3).
 #:
-#: ``drain_timeout_total`` cannot carry it: uvicorn closes the listening socket
-#: before running lifespan shutdown, so the increment below happens when no
-#: scrape can still reach this process, and ``DrainTimeoutDetected`` evaluates
-#: against a series whose last sample predates the event it is meant to catch.
-#: The log stream is what outlives the process, so the event gets a key an alert
-#: can match exactly, instead of a prose fragment that stops matching the day
-#: the sentence is reworded. Named here rather than inlined so the rule
-#: annotation, the alert, and this producer can be pinned to one another by
-#: ``tests/server/test_drain_timeout_durable_signal_106.py``.
+#: #107 introduced this because the in-process counter was unscrapeable: uvicorn
+#: closes the listening socket before running lifespan shutdown, so the
+#: increment below happens when no scrape can still reach this process. The key
+#: gives a log-based alert something stable to match on instead of a prose
+#: fragment that stops matching the day the sentence is reworded.
+#:
+#: It is deliberately kept — byte-for-byte, including its position in the
+#: rendered tail — now that the metric path is durable too. The journal makes
+#: ``DrainTimeoutDetected`` able to fire; the log line is still what carries the
+#: event to a sink that is not Prometheus, and the two are pinned to one another
+#: by ``tests/server/test_drain_timeout_durable_signal_106.py``.
 DRAIN_TIMEOUT_EVENT: Final[str] = "drain_timeout"
 
 
@@ -73,10 +76,49 @@ except ValueError:
     drain_timeout_total = _pc.REGISTRY._names_to_collectors["parallax_drain_timeout_total"]  # type: ignore[assignment]
 
 
+def restore_drain_timeout_counter(journal_path: str | None = None) -> float:
+    """Prime ``drain_timeout_total`` from the durable journal. Returns the delta added.
+
+    This is the half of #106.3 that makes ``DrainTimeoutDetected`` able to fire.
+    The increment in :func:`_drain_inflight` happens after uvicorn has closed
+    the listening socket, so it is never scraped; the journal carries it across
+    the restart and this restores it into a process Prometheus *can* reach. The
+    step from N to N+1 is then an ordinary counter increment on a live target.
+
+    REPLAY IDEMPOTENT BY CONSTRUCTION: the counter is advanced by
+    ``journal_total - current_value``, never by ``journal_total``. A restart
+    with no new timeout computes a delta of zero and adds nothing, so a redeploy
+    cannot manufacture a step. Calling this twice in one process is likewise a
+    no-op the second time, which matters because a lifespan can be entered more
+    than once under a test client.
+
+    A journal that exists but could not be parsed is reported at WARNING: the
+    restored total may under-count, and silently starting from zero would read
+    downstream as "this deployment has never timed out".
+    """
+    journal = read_drain_journal(journal_path)
+    if not journal.readable:
+        _log.warning(
+            "parallax.lifespan: drain journal unreadable — drain-timeout history may be "
+            "under-reported on %s",
+            "parallax_drain_timeout_total",
+        )
+    current = drain_timeout_total._value.get()  # noqa: SLF001 — no public read accessor
+    delta = journal.total - current
+    if delta <= 0:
+        return 0.0
+    drain_timeout_total.inc(delta)
+    _log.info(
+        "parallax.lifespan: restored %.0f drain-timeout event(s) from the journal", delta
+    )
+    return delta
+
+
 async def _drain_inflight(
     *,
     timeout_seconds: float = DRAIN_TIMEOUT_SECONDS,
     poll_interval_seconds: float = DRAIN_POLL_INTERVAL_SECONDS,
+    journal_path: str | None = None,
 ) -> None:
     """Poll until inflight count reaches 0 or *timeout_seconds* elapses.
 
@@ -109,6 +151,17 @@ async def _drain_inflight(
         if remaining <= 0:
             final_count = get_inflight_count()
             drain_timeout_total.inc()
+            # #106.3 — the durable half. The increment above dies with the
+            # process (the socket is already closed by the time we get here);
+            # this hands the event to the next process, which restores it into
+            # the same counter where a scrape can finally see the step. Written
+            # BEFORE the log line so a journal failure is reported adjacent to
+            # the event it belongs to rather than after it.
+            record_drain_timeout(
+                inflight_count=final_count,
+                timeout_seconds=timeout_seconds,
+                path=journal_path,
+            )
             # Sentence for a human reading the log, structured fields for
             # whatever alerts on it — and the key=value tail below repeats the
             # same fields IN THE MESSAGE ITSELF, not only in extra. Both
@@ -153,7 +206,12 @@ async def parallax_lifespan(app: FastAPI) -> AsyncIterator[None]:
     validated path is stashed on ``app.state.audit_db_path`` for the query
     route to hand to the thread-local provider.
 
-    Shutdown: drain in-flight requests up to ``DRAIN_TIMEOUT_SECONDS``.
+    Startup also restores ``parallax_drain_timeout_total`` from the #106.3
+    journal (:func:`restore_drain_timeout_counter`) so a timeout recorded by the
+    process this one replaces becomes visible to a scrape.
+
+    Shutdown: drain in-flight requests up to ``DRAIN_TIMEOUT_SECONDS``, and
+    persist the event to the journal if the drain times out.
     """
     # Startup — Apex M5 audit-db boot validation (spec §4). A misconfigured
     # or unwritable audit path raises AuditDbConfigError here and the server
@@ -161,6 +219,10 @@ async def parallax_lifespan(app: FastAPI) -> AsyncIterator[None]:
     # exception into a non-78 process exit; ``parallax serve`` (parallax.cli
     # ._cmd_serve) runs the same check as a preflight BEFORE uvicorn.run() so
     # the canonical launcher exits with the deterministic EX_CONFIG (78).
+    # #106.3 — carry any drain timeout recorded by the process we are replacing
+    # into this one's counter, before the first scrape can land.
+    restore_drain_timeout_counter()
+
     audit_db_path = resolve_audit_db_path()
     # contextlib.closing guarantees the validation connection is released even
     # if a later line raises — the lifespan holds no runtime connection.

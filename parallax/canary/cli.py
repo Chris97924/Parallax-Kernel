@@ -54,7 +54,7 @@ from parallax.canary.drill import (
     run_full_drill,
     run_reemit_drill,
 )
-from parallax.canary.outcomes import KNOWN_STAGES
+from parallax.canary.outcomes import KNOWN_STAGES, OutcomeStore
 
 __all__ = ["register_canary_subparser", "cmd_canary"]
 
@@ -100,7 +100,13 @@ def register_canary_subparser(sub: argparse._SubParsersAction[argparse.ArgumentP
     p_canary.add_argument(
         "--stage",
         choices=sorted(KNOWN_STAGES),
-        help="Canary stage for --dod (m4_1pct / m4_10pct / m4_50pct / m4_100pct).",
+        help=(
+            "Canary stage (m4_1pct / m4_10pct / m4_50pct / m4_100pct). Required by "
+            "--dod. On the real-mode drills it makes each emitted event a durable "
+            "canary observation — measured duration into audit_log.latency_ms and "
+            "business outcome into canary_outcomes — which is what the server's "
+            "parallax_canary_* T1-T5 exporter reads."
+        ),
     )
     p_canary.add_argument(
         "--days",
@@ -253,8 +259,23 @@ def _print_dod(report: DodReport, *, fmt: str) -> None:
 # ----------------------------------------------------------------------
 
 
+def _open_outcome_store(args: argparse.Namespace) -> OutcomeStore | None:
+    """Open the OutcomeStore when a stage was named (#106.1).
+
+    ``--stage`` is what turns a drill into a canary producer: with it, each
+    emitted event lands in ``canary_outcomes`` alongside its measured duration
+    in ``audit_log``, which is the pair the server-side T1-T5 exporter joins.
+    Without it the drills behave exactly as they did before, so no existing
+    invocation changes meaning.
+    """
+    if not getattr(args, "stage", None) or args.dry_run:
+        return None
+    return OutcomeStore(db_path=args.audit_db)
+
+
 def _cmd_rollback_drill(args: argparse.Namespace) -> int:
     audit: AuditLog | None = None
+    outcomes: OutcomeStore | None = None
     try:
         # Real-mode drills MUST exercise the configured audit store —
         # falling back to None silently routes the drill back into dry-run
@@ -263,6 +284,7 @@ def _cmd_rollback_drill(args: argparse.Namespace) -> int:
         # the production-path verification this command exists for.
         if not args.dry_run:
             audit = AuditLog(db_path=args.audit_db)
+        outcomes = _open_outcome_store(args)
         drain, reemit, idem = run_full_drill(
             audit_log=audit,
             in_flight_count=args.in_flight,
@@ -270,10 +292,14 @@ def _cmd_rollback_drill(args: argparse.Namespace) -> int:
             concurrency=args.concurrency,
             timeout_s=args.timeout,
             dry_run=args.dry_run,
+            outcome_store=outcomes,
+            stage=args.stage if outcomes is not None else None,
         )
     finally:
         if audit is not None:
             audit.close()
+        if outcomes is not None:
+            outcomes.close()
 
     _print_drill_reports([drain, reemit, idem], fmt=args.format)
     if any(r.overall == DrillStatus.FAIL for r in (drain, reemit, idem)):
@@ -293,20 +319,26 @@ def _cmd_drain_test(args: argparse.Namespace) -> int:
 
 def _cmd_reemit_test(args: argparse.Namespace) -> int:
     audit: AuditLog | None = None
+    outcomes: OutcomeStore | None = None
     try:
         # Same gating as _cmd_rollback_drill — real mode must hit the
         # configured audit store, never None (which silently falls back
         # to the no-audit dry-run branch in run_reemit_drill).
         if not args.dry_run:
             audit = AuditLog(db_path=args.audit_db)
+        outcomes = _open_outcome_store(args)
         report = run_reemit_drill(
             audit_log=audit,
             reemit_count=args.reemit_count,
             dry_run=args.dry_run,
+            outcome_store=outcomes,
+            stage=args.stage if outcomes is not None else None,
         )
     finally:
         if audit is not None:
             audit.close()
+        if outcomes is not None:
+            outcomes.close()
     _print_drill_reports([report], fmt=args.format)
     return 0 if report.overall == DrillStatus.PASS else 1
 

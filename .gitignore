@@ -22,6 +22,12 @@ build/
 !*.env.example
 *.db
 db/*.db
+# SQLite WAL sidecars. Reading a WAL database materialises these next to it —
+# including from a read-only connection, which is what /metrics takes over the
+# canary store (#106.1) — so they appear in the tree without anything having
+# written to the database.
+*.db-shm
+*.db-wal
 
 # Coverage
 .coverage

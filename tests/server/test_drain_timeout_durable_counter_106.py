@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -299,17 +300,23 @@ def test_the_alert_no_longer_declares_itself_latent() -> None:
 
 
 def test_the_promtool_fixture_expects_the_annotation_the_rule_actually_has() -> None:
-    """promtool compares ``exp_annotations`` literally, and CI is the wrong place to find out.
+    """promtool compares RENDERED annotations, and CI is the wrong place to find out.
 
     The rule's description is duplicated into every firing case in
     ``prometheus/tests/parallax-dual-read.test.yml``. Edit one and not the other
-    and the suite fails in CI with a wall of diffed prose, minutes after the push
-    — so the two copies are pinned here, where the edit happens.
+    and the suite fails in CI with a wall of diffed prose, minutes after the
+    push — so the two copies are pinned here, where the edit happens.
+
+    The fixtures hold the annotation as an oncall would see it, with
+    ``{{ $labels.x }}`` already substituted (the repo convention — see the
+    AphelionUnreachableRateHigh cases). This test does the same substitution
+    from the case's own ``exp_labels`` rather than comparing raw text, because
+    raw equality would force the rule to give up templating to stay testable.
     """
     tests_path = _REPO_ROOT / "prometheus" / "tests" / "parallax-dual-read.test.yml"
 
     groups = yaml.safe_load(_RULES.read_text(encoding="utf-8"))["groups"]
-    expected = next(
+    template = next(
         rule["annotations"]
         for group in groups
         for rule in group.get("rules", [])
@@ -317,17 +324,29 @@ def test_the_promtool_fixture_expects_the_annotation_the_rule_actually_has() -> 
     )
 
     cases = yaml.safe_load(tests_path.read_text(encoding="utf-8"))["tests"]
-    fixtures = [
-        alert["exp_annotations"]
+    alerts = [
+        alert
         for case in cases
         for rule_test in case.get("alert_rule_test", []) or []
         if rule_test.get("alertname") == "DrainTimeoutDetected"
         for alert in rule_test.get("exp_alerts", []) or []
     ]
 
-    assert fixtures, "no firing DrainTimeoutDetected case left — the alert is untested"
-    for fixture in fixtures:
-        assert fixture == expected, (
-            "a promtool case expects annotations the rule no longer has; promtool "
-            "compares them literally and will fail in CI"
+    assert alerts, "no firing DrainTimeoutDetected case left — the alert is untested"
+    for alert in alerts:
+        expected = {
+            key: _render_labels(value, alert["exp_labels"]) for key, value in template.items()
+        }
+        assert alert["exp_annotations"] == expected, (
+            "a promtool case expects annotations the rule no longer renders to; "
+            "promtool compares them literally and will fail in CI"
         )
+
+
+def _render_labels(text: str, labels: dict[str, str]) -> str:
+    """Substitute ``{{ $labels.name }}`` the way promtool does before comparing."""
+    return re.sub(
+        r"\{\{\s*\$labels\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}",
+        lambda match: str(labels.get(match.group(1), match.group(0))),
+        text,
+    )

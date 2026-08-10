@@ -690,7 +690,7 @@ tests:
                 startup. The 0 -> 1 step therefore lands on a live target and this
                 alert fires after the restart, not during the shutdown. Expect it
                 shortly after the affected replica comes back, and read
-                {{ $labels.instance }} as "the replica that force-cut", not "the
+                10.0.0.1:8765 as "the replica that force-cut", not "the
                 replica that is unhealthy now".
                 WHAT BREAKS IT: a journal path on ephemeral storage that does not
                 survive the restart. If a drain timeout is in the logs and this
@@ -788,7 +788,7 @@ tests:
                 startup. The 0 -> 1 step therefore lands on a live target and this
                 alert fires after the restart, not during the shutdown. Expect it
                 shortly after the affected replica comes back, and read
-                {{ $labels.instance }} as "the replica that force-cut", not "the
+                10.0.0.1:8765 as "the replica that force-cut", not "the
                 replica that is unhealthy now".
                 WHAT BREAKS IT: a journal path on ephemeral storage that does not
                 survive the restart. If a drain timeout is in the logs and this
@@ -857,7 +857,7 @@ tests:
                 startup. The 0 -> 1 step therefore lands on a live target and this
                 alert fires after the restart, not during the shutdown. Expect it
                 shortly after the affected replica comes back, and read
-                {{ $labels.instance }} as "the replica that force-cut", not "the
+                10.0.0.1:8765 as "the replica that force-cut", not "the
                 replica that is unhealthy now".
                 WHAT BREAKS IT: a journal path on ephemeral storage that does not
                 survive the restart. If a drain timeout is in the logs and this

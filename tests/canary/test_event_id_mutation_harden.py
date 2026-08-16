@@ -45,6 +45,7 @@ import uuid
 
 import pytest
 
+from parallax.canary import event_id as event_id_mod
 from parallax.canary.event_id import is_uuid7, uuid7
 
 # --- Golden vector, derived from RFC 9562 §5.7 -----------------------------
@@ -175,11 +176,45 @@ class TestFreshIdsCarryTheCurrentTime:
         embedded = int.from_bytes(eid.bytes[:6], "big")
         assert before_ms - 5_000 <= embedded <= after_ms + 5_000
 
-    def test_successive_ids_are_non_decreasing_in_time(self) -> None:
-        """The timestamp prefix must not go backwards between two calls."""
-        first = int.from_bytes(uuid7().bytes[:6], "big")
-        second = int.from_bytes(uuid7().bytes[:6], "big")
-        assert second >= first
+    def test_timestamp_prefix_follows_the_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The 48-bit prefix is whatever ``_now_ms`` returned, in that order.
+
+        Driven by a scripted clock rather than the host's. ``uuid7`` reads a
+        *wall* clock, and a wall clock can step backwards — NTP correction, a
+        DST-adjusted RTC, a VM resuming from a snapshot — so asserting
+        monotonicity across two real calls asserts a promise the generator does
+        not make, and turns an unrelated host event into a red test. What the
+        code does promise is this: the prefix tracks ``_now_ms`` exactly, and
+        successive calls preserve the clock's own ordering.
+        """
+        ticks = iter([1_700_000_000_000, 1_700_000_000_001, 1_700_000_000_500])
+        monkeypatch.setattr(event_id_mod, "_now_ms", lambda: next(ticks))
+        stamps = [int.from_bytes(uuid7().bytes[:6], "big") for _ in range(3)]
+        assert stamps == [1_700_000_000_000, 1_700_000_000_001, 1_700_000_000_500]
+        assert stamps == sorted(stamps), "clock order must survive into the prefix"
+
+    def test_a_backwards_clock_still_mints_distinct_valid_ids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rollback contract, stated rather than assumed.
+
+        This is the case the previous version of the test above got wrong. When
+        the clock steps back, ``uuid7`` does NOT keep ids ordered — and it is not
+        supposed to. What it must keep is validity and uniqueness, which come
+        from the version/variant fields and the 74 random bits, not from the
+        timestamp. Pinning that here means a future change to the ordering
+        behaviour has to come past a test that says what today's behaviour is.
+        """
+        ticks = iter([1_700_000_000_000, 1_699_999_999_000])
+        monkeypatch.setattr(event_id_mod, "_now_ms", lambda: next(ticks))
+        first, second = uuid7(), uuid7()
+
+        assert is_uuid7(first) is True
+        assert is_uuid7(second) is True
+        assert first != second
+        assert int.from_bytes(second.bytes[:6], "big") < int.from_bytes(
+            first.bytes[:6], "big"
+        ), "a rolled-back clock does produce an earlier prefix — that is the contract"
 
 
 # ===========================================================================

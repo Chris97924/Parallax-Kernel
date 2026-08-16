@@ -40,7 +40,6 @@ the code agrees with itself.
 
 from __future__ import annotations
 
-import time
 import uuid
 
 import pytest
@@ -62,6 +61,25 @@ _GOLDEN_RAND = bytes([0xAB, 0xCD, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
 #                      0b10 << 6 | 0x2F . 0xAF      -> byte 8    = af
 #                      tail ............. 01 02 03 04 05 06 07
 _GOLDEN_UUID = "018bcfe5-6800-7bcd-af01-020304050607"
+
+
+class _FrozenClock:
+    """Stand-in for ``time`` with both clock sources pinned, to different values.
+
+    ``_now_ms`` is specified to read the *epoch* clock. Giving ``monotonic_ns``
+    a visibly unrelated value means a generator that reaches for the wrong
+    source produces an obviously wrong millisecond rather than a plausible one.
+    """
+
+    def __init__(self, *, epoch_ns: int, monotonic_ns: int) -> None:
+        self._epoch_ns = epoch_ns
+        self._monotonic_ns = monotonic_ns
+
+    def time_ns(self) -> int:
+        return self._epoch_ns
+
+    def monotonic_ns(self) -> int:
+        return self._monotonic_ns
 
 
 # ===========================================================================
@@ -162,19 +180,34 @@ class TestEveryRandomByteContributes:
 
 @pytest.mark.unit
 class TestFreshIdsCarryTheCurrentTime:
-    def test_default_timestamp_is_now_in_milliseconds(self) -> None:
-        """Kills every rescaling of ``time.time_ns() // 1_000_000``.
+    def test_default_timestamp_is_the_epoch_millisecond(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The prefix is exactly ``time_ns() // 1_000_000`` — asserted, not bracketed.
 
-        A ``// 1_000`` divisor yields microseconds (≈1000× too large, and past
-        the 48-bit ceiling by the year 10889); ``// 1_000_000_000`` yields
-        seconds (≈1000× too small, placing the id in 1970). The window is wide
-        (±5 s) so the assertion is about the *scale*, not about clock precision.
+        Kills every rescaling of the divisor: ``// 1_000`` yields microseconds
+        (≈1000× too large, and past the 48-bit ceiling), ``// 1_000_000_000``
+        yields seconds (≈1000× too small, placing the id in 1970), and reading
+        ``monotonic_ns`` instead yields time since boot.
+
+        What is pinned here is the module's *clock source*, not ``_now_ms``
+        itself — patching ``_now_ms`` would take the division out of the test
+        along with the host. The earlier version of this test instead sampled
+        the real wall clock either side of the call and allowed ±5 s, which is
+        what made it a scale check rather than a value check, and also what made
+        it environmental: a clock correction wider than the window fails a
+        correct implementation.
+
+        The pinned nanoseconds carry a 789 000 ns remainder, so truncation and
+        rounding disagree — a generator that rounded would produce ...124.
         """
-        before_ms = int(time.time() * 1000)
-        eid = uuid7()
-        after_ms = int(time.time() * 1000)
-        embedded = int.from_bytes(eid.bytes[:6], "big")
-        assert before_ms - 5_000 <= embedded <= after_ms + 5_000
+        monkeypatch.setattr(
+            event_id_mod,
+            "time",
+            _FrozenClock(epoch_ns=1_700_000_000_123_789_000, monotonic_ns=4_200_000_000_000),
+        )
+        embedded = int.from_bytes(uuid7().bytes[:6], "big")
+        assert embedded == 1_700_000_000_123
 
     def test_timestamp_prefix_follows_the_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The 48-bit prefix is whatever ``_now_ms`` returned, in that order.

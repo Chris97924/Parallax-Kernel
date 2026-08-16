@@ -205,6 +205,7 @@ class TestFirstCallPersistsTheWorkersResult:
         """
         pinned = _dt.datetime(2001, 2, 3, 4, 5, 6, tzinfo=_dt.UTC)
         monkeypatch.setattr(idempotency_mod, "_dt", _scripted_datetime_module(pinned))
+        # One stamp: `now` repeats it, so this test does not depend on call count.
         h: IdempotencyHandler[str] = IdempotencyHandler(audit_log=audit)
         eid = str(uuid7())
         h.handle(event_id=eid, request="x", worker=_ok_worker)
@@ -212,38 +213,56 @@ class TestFirstCallPersistsTheWorkersResult:
         assert row is not None
         assert row.request_at_iso == pinned.isoformat()
 
-    def test_request_at_is_captured_before_the_worker_runs(self, audit: AuditLog) -> None:
+    def test_request_at_is_captured_before_the_worker_runs(
+        self, audit: AuditLog, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """It is the time the request *started*, not the time it finished.
 
-        Kills the mutant that moves the capture below ``worker(request)``: with
-        a 500 ms worker, an end-of-request stamp lands half a second late. The
-        tolerance sits well clear of both sides — a correct capture is separated
-        from ``started`` only by a SQLite lookup, and the mutant misses by 0.5 s
-        — so a loaded machine cannot flip the verdict either way.
+        Decided by *which* scripted stamp the handler consumed rather than by
+        measuring elapsed wall time. The worker burns a stamp of its own,
+        standing in for the clock advancing while the request runs: a handler
+        that captures before the worker takes the first stamp and leaves the
+        second to the worker, and one that captures after takes the second.
+
+        The earlier version slept 500 ms and asserted the drift stayed under
+        200 ms. That reads the host clock twice, so a clock correction between
+        the two samples fails a correct implementation — and it needed half a
+        second of wall time to do it. This decides the same question exactly,
+        with no clock and no sleep.
         """
+        started = _dt.datetime(2001, 2, 3, 4, 5, 6, tzinfo=_dt.UTC)
+        finished = _dt.datetime(2001, 2, 3, 4, 5, 9, tzinfo=_dt.UTC)
+        fake_dt = _scripted_datetime_module(started, finished)
+        monkeypatch.setattr(idempotency_mod, "_dt", fake_dt)
         h: IdempotencyHandler[str] = IdempotencyHandler(audit_log=audit)
         eid = str(uuid7())
-        started = _dt.datetime.now(_dt.UTC)
 
-        def slow_worker(_r: object) -> CachedResponse:
-            time.sleep(0.5)
+        def worker(_r: object) -> CachedResponse:
+            fake_dt.datetime.now(fake_dt.UTC)
             return CachedResponse(status=200, body="ok")
 
-        h.handle(event_id=eid, request="x", worker=slow_worker)
+        h.handle(event_id=eid, request="x", worker=worker)
         row = audit.lookup(eid)
         assert row is not None
-        recorded = _dt.datetime.fromisoformat(row.request_at_iso)
-        drift = (recorded - started).total_seconds()
-        assert 0.0 <= drift < 0.2, f"request_at drifted {drift:.3f}s — captured after the worker?"
+        assert row.request_at_iso == started.isoformat()
+        assert row.request_at_iso != finished.isoformat(), (
+            "the handler took the stamp the worker should have — captured after the worker?"
+        )
 
 
-def _scripted_datetime_module(stamp: _dt.datetime):
-    """Return a stand-in for the ``datetime`` module whose ``now`` is pinned."""
+def _scripted_datetime_module(*stamps: _dt.datetime):
+    """Stand-in for the ``datetime`` module whose ``now`` walks a fixed list.
+
+    Once the list is down to its last entry that entry repeats, so a caller that
+    only cares about a single pinned value passes one stamp and never has to
+    count calls.
+    """
+    remaining = list(stamps)
 
     class _Datetime:
         @staticmethod
         def now(_tz: object = None) -> _dt.datetime:
-            return stamp
+            return remaining.pop(0) if len(remaining) > 1 else remaining[0]
 
     class _Module:
         UTC = _dt.UTC

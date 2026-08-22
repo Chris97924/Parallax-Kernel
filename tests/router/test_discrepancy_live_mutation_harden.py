@@ -135,6 +135,184 @@ class TestWindowTrim:
 
 
 # ---------------------------------------------------------------------------
+# The window is re-evaluated on read, not only on write (#116)
+# ---------------------------------------------------------------------------
+
+
+class TestReadSideWindowDecay:
+    """The trim used to run on the write path only.
+
+    Unlike the rest of this file these were not written against a mutant of
+    the shipped code — the shipped code *was* the defect (#116, found in the
+    same S7 sweep). A user that stops sending traffic never reaches the
+    write-path trim again, so whatever the window last held was reported as
+    the current rate forever: a burst of divergences followed by silence read
+    as a permanently elevated rate instead of decaying out. The contract is
+    that a read re-evaluates the window against the current clock; these pin
+    that, and the read path's own trim arithmetic with it.
+    """
+
+    def test_quiet_users_discrepancy_rate_decays_out_of_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#116 repro: rate 1.0 -> traffic stops -> clock past the window -> 0.0.
+
+        MUTANT, and the shipped defect: no trim on the read path at all, or
+        a cutoff computed from the newest recorded entry instead of from the
+        current clock. Both leave the stale burst in the denominator, and
+        both are invisible to every existing test, because all of them read
+        back either immediately after a write or after a write that did the
+        trimming for them.
+        """
+        clock = _FakeClock()
+        monkeypatch.setattr(dl, "time", clock)
+        counter = LiveDiscrepancyCounter(window_seconds=100.0)
+
+        counter.record(user_id="quiet", outcome="diverge")
+        assert counter.discrepancy_rate(user_id="quiet") == 1.0, "precondition"
+
+        clock.now = 1000.0  # silence, well past the 100s window
+
+        assert counter.discrepancy_rate(user_id="quiet") == 0.0, (
+            "a user that stopped sending traffic kept its last rate; the read "
+            "side is not re-evaluating the window against the current clock"
+        )
+
+    def test_quiet_users_unreachable_rate_decays_out_of_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same freeze on the other reader.
+
+        MUTANT: the read-side trim wired into ``discrepancy_rate`` only. The
+        two rates share a window and a future consumer; a frozen unreachable
+        rate holds ``AphelionUnreachableRateHigh`` on just as effectively as
+        a frozen discrepancy rate holds its own alert on.
+        """
+        clock = _FakeClock()
+        monkeypatch.setattr(dl, "time", clock)
+        counter = LiveDiscrepancyCounter(window_seconds=100.0)
+
+        counter.record(user_id="quiet", outcome="aphelion_unreachable")
+        assert counter.aphelion_unreachable_rate(user_id="quiet") == 1.0, "precondition"
+
+        clock.now = 1000.0
+
+        assert counter.aphelion_unreachable_rate(user_id="quiet") == 0.0, (
+            "the unreachable rate froze at its last value after traffic stopped"
+        )
+
+    def test_the_public_reader_decays_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same repro through the module-level API on the singleton.
+
+        ``dual_read_discrepancy_rate`` is the function the first consumer
+        will call, and the singleton's default window is the one it will get.
+        A fix applied to ``LiveDiscrepancyCounter`` but bypassed by the
+        module-level wrapper would still ship the frozen rate.
+        """
+        clock = _FakeClock()
+        monkeypatch.setattr(dl, "time", clock)
+        uid = "s7-read-decay-singleton"
+
+        record_dual_read_outcome(user_id=uid, outcome="diverge")
+        assert dl.dual_read_discrepancy_rate(user_id=uid) == 1.0, "precondition"
+
+        clock.now = 7200.0  # two default windows of silence
+
+        assert dl.dual_read_discrepancy_rate(user_id=uid) == 0.0, (
+            "the public rolling-window reader froze at its last value"
+        )
+
+    def test_a_third_partys_write_is_not_what_clears_the_quiet_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The issue's control, kept as a test: the decay belongs to the reader.
+
+        A write trims only the deque it appends to. Pinning that keeps the
+        repro above honest — a "fix" that swept every user's window on any
+        write would pass it while leaving a genuinely idle process, one
+        taking no writes at all, frozen exactly as before.
+        """
+        clock = _FakeClock()
+        monkeypatch.setattr(dl, "time", clock)
+        counter = LiveDiscrepancyCounter(window_seconds=100.0)
+
+        counter.record(user_id="quiet", outcome="diverge")
+        clock.now = 1000.0
+        counter.record(user_id="busy", outcome="match")
+
+        assert counter._data[("quiet", "natural")], (
+            "another user's write emptied the quiet user's window; a write "
+            "must only ever touch its own deque"
+        )
+        assert counter.discrepancy_rate(user_id="quiet") == 0.0, (
+            "the read did not decay the quiet user's window"
+        )
+
+    def test_read_keeps_entries_that_are_still_inside_the_window(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MUTANT: the read-side comparison reversed, ``<`` -> ``>``.
+
+        Reversed, every read empties the window from the front and every
+        rate reads 0.0, so no alert can ever fire. The repro above cannot
+        catch it — there the expected answer is 0.0 as well.
+        """
+        clock = _FakeClock()
+        monkeypatch.setattr(dl, "time", clock)
+        counter = LiveDiscrepancyCounter(window_seconds=100.0)
+
+        counter.record(user_id="u", outcome="diverge")
+        clock.now = 50.0  # half a window later; the entry is still in
+
+        assert counter.discrepancy_rate(user_id="u") == 1.0, (
+            "a read evicted an entry that was still inside the window"
+        )
+
+    def test_read_retains_the_entry_sitting_exactly_on_the_cutoff(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MUTANT: the read-side comparison ``< cutoff`` -> ``<= cutoff``.
+
+        ``TestWindowTrim`` pins this boundary for the write path. The read
+        path has to agree with it, or one entry is inside or outside the
+        window depending on which side looked at it last.
+        """
+        clock = _FakeClock()
+        monkeypatch.setattr(dl, "time", clock)
+        counter = LiveDiscrepancyCounter(window_seconds=100.0)
+
+        counter.record(user_id="u", outcome="diverge")
+        clock.now = 100.0  # cutoff is now exactly the entry's own timestamp
+
+        assert counter.discrepancy_rate(user_id="u") == 1.0, (
+            "the entry sitting exactly on the cutoff was evicted on read"
+        )
+
+    def test_read_evicts_the_oldest_entry_not_the_newest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MUTANT: the read-side eviction popping the wrong end.
+
+        One expired entry, one live one, and no write in between to hide it:
+        popping from the right drops the live entry first and then spins on
+        the expired one until the deque is empty, so the rate reads 0.0
+        where the surviving outcome says 1.0.
+        """
+        clock = _FakeClock()
+        monkeypatch.setattr(dl, "time", clock)
+        counter = LiveDiscrepancyCounter(window_seconds=100.0)
+
+        counter.record(user_id="u", outcome="match")  # t=0 — expires
+        clock.now = 60.0
+        counter.record(user_id="u", outcome="diverge")  # t=60 — must survive
+        clock.now = 120.0  # cutoff 20.0: t=0 is out, t=60 is in
+
+        assert counter.discrepancy_rate(user_id="u") == 1.0, (
+            "the read-side trim evicted the live entry instead of the expired one"
+        )
+
+
+# ---------------------------------------------------------------------------
 # traffic_source normalisation
 # ---------------------------------------------------------------------------
 

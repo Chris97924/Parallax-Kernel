@@ -14,8 +14,8 @@ Public API:
     DualReadOutcome                       -- Literal of five outcome labels
     LiveDiscrepancyCounter                -- rolling-window per-user state
     record_dual_read_outcome              -- module-level convenience wrapper
-    dual_read_discrepancy_rate            -- pure read on singleton
-    aphelion_unreachable_rate             -- pure read on singleton
+    dual_read_discrepancy_rate            -- rolling-window read on singleton
+    aphelion_unreachable_rate             -- rolling-window read on singleton
     parallax_aphelion_total               -- Aphelion-bound request counter
 
 Design notes
@@ -24,6 +24,9 @@ Design notes
   unchanged. This module uses 0.001 (0.1%) per Q2 Option B decision.
 - Q3 decision: new stream — ``DualReadOutcome`` is NOT an extension of M2's
   ``ArbitrationOutcome`` Literal. Both Literals stay independent.
+- The rolling window is evaluated against the clock on read as well as on
+  write (#116) — a user that goes quiet has to decay out on its own. See
+  ``LiveDiscrepancyCounter._in_window``.
 - Thread safety: a single ``threading.Lock`` guards the whole deque dict.
   Per-user locks were considered but the single global lock is simpler and
   correct; contention is bounded by the roll-up write frequency, not by
@@ -170,14 +173,29 @@ _requests_counter = _get_or_create_counter(
 _Entry = tuple[float, str]
 
 
+def _trim(dq: collections.deque[_Entry], cutoff: float) -> None:
+    """Drop entries strictly older than ``cutoff`` off the front of ``dq``.
+
+    The deque is ordered oldest-first. ``<`` and not ``<=``: an entry exactly
+    ``window_seconds`` old sits on the boundary of the closed interval the
+    parameter names, so it is still in.
+
+    Caller must hold the lock. Shared by the write and read paths so the two
+    cannot drift apart on which end they evict or where the boundary falls.
+    """
+    while dq and dq[0][0] < cutoff:
+        dq.popleft()
+
+
 @dataclasses.dataclass
 class LiveDiscrepancyCounter:
     """Process-local rolling-window counter. Thread-safe.
 
     Uses a single module-level lock to protect the per-user deques.
     This is simpler than per-user locks and correct: the lock is held only
-    for deque.append + deque trimming, which is O(evicted_entries) but
-    bounded by ``window_seconds``.
+    for deque.append + deque trimming (on both the write and the read path)
+    plus the read's snapshot copy, which is O(evicted_entries) but bounded
+    by ``window_seconds``.
     """
 
     window_seconds: float = 3600.0  # mirrors M2's discrepancy_rate(window='1h')
@@ -206,9 +224,7 @@ class LiveDiscrepancyCounter:
         with self._lock:
             dq = self._data.setdefault((user_id, source), collections.deque())
             dq.append((now, outcome))
-            # Trim front (oldest entries)
-            while dq and dq[0][0] < cutoff:
-                dq.popleft()
+            _trim(dq, cutoff)
 
     def discrepancy_rate(self, *, user_id: str, traffic_source: str | None = None) -> float:
         """Fraction of in-window outcomes that are 'diverge'.
@@ -217,12 +233,7 @@ class LiveDiscrepancyCounter:
         exclusion of 'shadow_only' from the discrepancy denominator per
         ralplan §6 line 429). Empty window → 0.0.
         """
-        source = _normalize_traffic_source(traffic_source)
-        with self._lock:
-            dq = self._data.get((user_id, source))
-            if not dq:
-                return 0.0
-            entries = list(dq)
+        entries = self._in_window(user_id=user_id, traffic_source=traffic_source)
 
         # Denominator: all outcomes EXCEPT aphelion_unreachable
         denominator = sum(1 for _, o in entries if o != "aphelion_unreachable")
@@ -241,12 +252,7 @@ class LiveDiscrepancyCounter:
 
         Denominator is ALL outcomes (total events). Empty window → 0.0.
         """
-        source = _normalize_traffic_source(traffic_source)
-        with self._lock:
-            dq = self._data.get((user_id, source))
-            if not dq:
-                return 0.0
-            entries = list(dq)
+        entries = self._in_window(user_id=user_id, traffic_source=traffic_source)
 
         total = len(entries)
         if total == 0:
@@ -258,6 +264,34 @@ class LiveDiscrepancyCounter:
         """Clear all per-user deques. Test helper."""
         with self._lock:
             self._data.clear()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _in_window(self, *, user_id: str, traffic_source: str | None) -> list[_Entry]:
+        """Trim one user's window against the clock and snapshot what survives.
+
+        Both rates go through here, so a read re-evaluates the window the
+        same way a write does (#116). Trimming on write alone left a user
+        that stopped sending traffic pinned at whatever rate the window last
+        held: nothing ever re-examined it, so a burst of divergences
+        followed by silence read as a permanently elevated rate instead of
+        decaying to no data. The reader is the only thing that runs while a
+        user is quiet, so it has to be the thing that ages the window out.
+
+        A write still trims only the deque it appends to — sweeping every
+        user's window on write would leave an idle process, one taking no
+        writes at all, frozen exactly as before.
+        """
+        source = _normalize_traffic_source(traffic_source)
+        cutoff = time.monotonic() - self.window_seconds
+        with self._lock:
+            dq = self._data.get((user_id, source))
+            if not dq:
+                return []
+            _trim(dq, cutoff)
+            return list(dq)
 
 
 # ---------------------------------------------------------------------------

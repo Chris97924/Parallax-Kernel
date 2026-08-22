@@ -20,6 +20,7 @@ from parallax.router.contracts import (
     QueryType,
     RetrievalEvidence,
 )
+from parallax.router.mock_adapter import MockMemoryRouter
 
 # ---------------------------------------------------------------------------
 # Re-export check
@@ -171,18 +172,25 @@ def test_arbitration_decision_fields() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Invariant (writes_performed == 0 when dry_run=True) is enforceable only "
-        "by the real BackfillPort adapter landing in Lane D-2. The dataclass "
-        "itself has no __post_init__; testing it here is tautological. "
-        "SF2 waiver from 2-agent review."
-    ),
-)
 def test_backfill_report_dry_run_writes_zero() -> None:
-    """Placeholder: real invariant test lives with the D-2 adapter."""
-    raise AssertionError("deferred to Lane D-2")
+    """The dry-run invariant is an *adapter* obligation, not a dataclass one.
+
+    ``BackfillReport`` has no ``__post_init__``, so constructing one with
+    ``dry_run=True`` and ``writes_performed=5`` here would prove nothing about
+    the system — which is why this was a non-strict xfail placeholder that
+    raised ``AssertionError`` rather than a test.
+
+    What is assertable at this layer is the boundary itself: the frozen mock
+    adapter does not implement ``backfill`` at all, so it cannot violate the
+    invariant, and any implementation that starts returning a report has to
+    turn this red first. The invariant proper is enforced against the real
+    adapter in ``tests/router/test_real_adapter_backfill.py`` and
+    ``tests/router/test_backfill_runner.py``.
+    """
+    router = MockMemoryRouter()
+    request = BackfillRequest(user_id="u1", crosswalk_version="v1")
+    with pytest.raises(NotImplementedError, match="MockMemoryRouter.backfill"):
+        router.backfill(request)
 
 
 # ---------------------------------------------------------------------------

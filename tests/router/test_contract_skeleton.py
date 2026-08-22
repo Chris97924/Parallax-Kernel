@@ -1,8 +1,24 @@
-"""US-005: Contract-test skeleton — xfail gates for frozen port methods.
+"""US-005: Contract-test skeleton — the frozen port methods raise, by contract.
 
-The three raising methods (query/ingest/backfill) are marked strict xfail so
-if a future accidental implementation stops raising, the suite turns red.
-health() is the one method that works — tested with a non-xfail test.
+The three frozen methods (query/ingest/backfill) assert ``NotImplementedError``
+directly. ``health()`` is the one method that works.
+
+Why these are ``pytest.raises`` and no longer ``xfail(strict=True)``
+--------------------------------------------------------------------
+They were written as strict xfails while the real adapter was still pending,
+which reads as "this test is expected to fail" when what is actually being
+asserted is "this method is expected to *raise*" — a positive contract about
+the frozen mock, not a deferred assertion about anything. Two costs came with
+the disguise: a strict xfail reports as ``xfailed`` rather than ``passed``, so
+these three never counted as coverage of the freeze; and had the mock started
+raising a *different* exception, the xfail would have stayed green because any
+failure satisfies it.
+
+The real adapter arrived and is covered by
+``tests/router/test_real_adapter_backfill.py`` and
+``tests/router/test_backfill_runner.py``, so nothing here is deferred any more.
+The exception type is named explicitly below, which is the assertion the xfail
+could not make.
 """
 
 from __future__ import annotations
@@ -14,34 +30,28 @@ from parallax.router.mock_adapter import MockMemoryRouter
 from parallax.router.types import QueryType
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Lane D-1 freeze: real adapter arrives in Lane D-2; mock deliberately raises",
-)
 def test_query_xfail() -> None:
+    """``MockMemoryRouter.query`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = QueryRequest(query_type=QueryType.RECENT_CONTEXT, user_id="u1")
-    router.query(req)  # expected to raise NotImplementedError -> xfail
+    with pytest.raises(NotImplementedError, match="MockMemoryRouter.query"):
+        router.query(req)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Lane D-1 freeze: real adapter arrives in Lane D-2; mock deliberately raises",
-)
 def test_ingest_xfail() -> None:
+    """``MockMemoryRouter.ingest`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = IngestRequest(user_id="u1", kind="memory", payload={"body": "hi"})
-    router.ingest(req)  # expected to raise NotImplementedError -> xfail
+    with pytest.raises(NotImplementedError, match="MockMemoryRouter.ingest"):
+        router.ingest(req)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Lane D-1 freeze: real adapter arrives in Lane D-2; mock deliberately raises",
-)
 def test_backfill_xfail() -> None:
+    """``MockMemoryRouter.backfill`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = BackfillRequest(user_id="u1", crosswalk_version="v1")
-    router.backfill(req)  # expected to raise NotImplementedError -> xfail
+    with pytest.raises(NotImplementedError, match="MockMemoryRouter.backfill"):
+        router.backfill(req)
 
 
 def test_health_works() -> None:

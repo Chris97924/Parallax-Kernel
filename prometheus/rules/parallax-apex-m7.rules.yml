@@ -161,8 +161,11 @@ groups:
             Spec: docs/m7-prep/apex-router-public-read-spec.md §4.3 + §4.5.
 
       # Stuck-empty corpus: empty_result{cause="empty_corpus"} increments on EVERY
-      # read against an accessible-but-empty package dir (unlike empty_corpus_total
-      # which only counts first-read-per-process). A sustained rate for >1h means
+      # read against an accessible-but-empty package dir. (So does
+      # empty_corpus_total — it is the unlabelled twin, NOT a once-per-process
+      # signal, whatever its old HELP text claimed; this rule selects the
+      # labelled series to stay symmetric with the other empty_result causes.)
+      # A sustained rate for >1h means
       # this host keeps serving reads with no packages — i.e. M6 ingest is not
       # reaching it. EXPECTED on a fresh deploy until the first package lands.
       - alert: ApexStuckEmptyCorpus

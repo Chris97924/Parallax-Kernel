@@ -174,7 +174,7 @@ EMPTY_RESULT = _get_or_create(
 EMPTY_CORPUS = _get_or_create(
     lambda: prometheus_client.Counter(
         "parallax_apex_empty_corpus",
-        "First-read-per-process detection of an accessible-but-empty corpus.",
+        "Number of reads that hit an empty Apex corpus (incremented on every such read).",
     ),
     "parallax_apex_empty_corpus",
 )
@@ -764,6 +764,16 @@ class ApexPublicReadRouter:
             f"candidates={len(candidates)}",
             f"subjects={','.join(c.subject for c in candidates)}",
         )
+        if not merged:
+            # Third negative path, and it used to be the odd one out. An empty
+            # corpus and an unresolved prompt both return through
+            # ``_empty_evidence``, which stamps ``conflict_class=NOT_FOUND``;
+            # candidates that resolve to real packages whose R4 reads yield
+            # nothing is the same kind of miss and has to carry the same marker,
+            # or a consumer keying on it recognises two of the three and
+            # silently mis-classifies the third. The resolver notes are passed
+            # through, so routing here costs no context.
+            return _empty_evidence(notes)
         return RetrievalEvidence(hits=tuple(merged), stages=("aphelion_v03_r4",), notes=notes)
 
     def _scan_index_entries(self) -> list[subject_index.IndexEntry]:

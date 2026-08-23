@@ -172,8 +172,14 @@ def test_empty_corpus_help_text_describes_per_read_semantics() -> None:
 
     assert "first-read" not in documentation.lower()
     assert "per-process" not in documentation.lower()
-    assert "every" in documentation.lower(), (
-        "the HELP must state the per-read semantics the code actually has"
+    # The positive check asserts the substring the module actually ships, not a
+    # single word. A bare ``"every" in doc`` constrains vocabulary rather than
+    # meaning: "Counted once for every process that boots onto an empty corpus"
+    # passes all three of these assertions while stating precisely the
+    # per-process semantics this test exists to forbid.
+    assert "every such read" in documentation.lower(), (
+        "the HELP must state the per-read semantics the code actually has, "
+        f"got: {documentation!r}"
     )
 
 

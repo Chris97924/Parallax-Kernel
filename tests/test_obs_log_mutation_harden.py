@@ -5,9 +5,10 @@ Additive companion to ``tests/test_obs_log.py`` and
 mutant of the module survived those two suites plus
 ``tests/router/test_log_payload_sanitize.py`` and
 ``tests/router/test_exc_info_disclosure_106.py``. Each pins the specific
-constant, boundary, guard or ordering the mutant moved. The surviving mutants
-are listed in ``mutations-w4-obs.json`` with their patches and their exit codes
-before and after this file existed.
+constant, boundary, guard or ordering the mutant moved.
+
+Tally — applied 24 / killed by the pre-existing suites 12 / killed by the tests
+below 12 / equivalent (excluded) 0 / unaddressed 0.
 
 What the existing suites could not see
 --------------------------------------

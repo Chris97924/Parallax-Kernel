@@ -34,7 +34,7 @@ def test_query_raises_not_implemented() -> None:
     """``MockMemoryRouter.query`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = QueryRequest(query_type=QueryType.RECENT_CONTEXT, user_id="u1")
-    with pytest.raises(NotImplementedError, match="MockMemoryRouter.query"):
+    with pytest.raises(NotImplementedError, match=r"MockMemoryRouter\.query"):
         router.query(req)
 
 
@@ -42,7 +42,7 @@ def test_ingest_raises_not_implemented() -> None:
     """``MockMemoryRouter.ingest`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = IngestRequest(user_id="u1", kind="memory", payload={"body": "hi"})
-    with pytest.raises(NotImplementedError, match="MockMemoryRouter.ingest"):
+    with pytest.raises(NotImplementedError, match=r"MockMemoryRouter\.ingest"):
         router.ingest(req)
 
 
@@ -50,7 +50,7 @@ def test_backfill_raises_not_implemented() -> None:
     """``MockMemoryRouter.backfill`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = BackfillRequest(user_id="u1", crosswalk_version="v1")
-    with pytest.raises(NotImplementedError, match="MockMemoryRouter.backfill"):
+    with pytest.raises(NotImplementedError, match=r"MockMemoryRouter\.backfill"):
         router.backfill(req)
 
 

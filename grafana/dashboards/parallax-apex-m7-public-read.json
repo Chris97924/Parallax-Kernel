@@ -318,7 +318,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "Reads served against an accessible-but-empty package dir in the last hour, from parallax_apex_empty_corpus_total. This counter increments on EVERY such read (spec §4.5 amendment 2026-08-23 — the first-read-per-process design was never implemented), so its raw level grows with request rate and says nothing about deploy health; only the windowed rate does. A sustained non-zero here means this host keeps serving reads with no packages — M6 ingest is not reaching it. EXPECTED on a fresh deploy until the first package lands. Same condition as the ApexStuckEmptyCorpus alert, which watches the labelled twin parallax_apex_empty_result_total{cause=\"empty_corpus\"}.",
+      "description": "Reads served against an accessible-but-empty package dir in the last hour, from parallax_apex_empty_corpus_total. This counter increments on EVERY such read (spec §4.5 amendment 2026-08-23 — the first-read-per-process design was never implemented), so its raw level grows with request rate and says nothing about deploy health; only the windowed rate does. A sustained non-zero here means this host keeps serving reads with no packages — M6 ingest is not reaching it. EXPECTED on a fresh deploy until the first package lands. Same condition as the ApexStuckEmptyCorpus alert, which watches the labelled twin parallax_apex_empty_result_total{cause=\"empty_corpus\"}. Threshold bands are derived from that alert, not from the raw level: green (<4) is below the smallest 1h total that can hold rate[15m] > 0 in every trailing 15m window, so the alert's for:1h clock cannot have run out; yellow (>=4) is the band where it can; red (>=60) is one empty-corpus read per minute sustained for the hour, i.e. steady traffic served against no packages rather than a deploy-time blip.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -327,7 +327,8 @@
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 }
+              { "color": "yellow", "value": 4 },
+              { "color": "red", "value": 60 }
             ]
           },
           "unit": "short"

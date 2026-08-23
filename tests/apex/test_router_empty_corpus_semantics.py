@@ -17,15 +17,28 @@ makes them true.
 
 **S6-F2 — the free-text negative-result marker.**
 ``_empty_evidence`` exists so a free-text miss is shaped like an exact-subject
-miss: it stamps ``conflict_class=NOT_FOUND`` as the first note. Two of the three
-negative paths went through it — empty corpus, and zero resolved candidates.
-The third, where candidates resolve and their packages are found but the
-per-candidate R4 reads yield nothing, fell through to the generic tail return
+miss: it stamps ``conflict_class=not_found`` as the first note. Two of the three
+free-text negative paths went through it — empty corpus, and zero resolved
+candidates. The third, where candidates resolve and their packages are found but
+the per-candidate R4 reads yield nothing, fell through to the generic tail return
 and produced a zero-hit ``RetrievalEvidence`` carrying no NOT_FOUND note at all.
 A consumer keying on that marker therefore recognised two of the three miss
 kinds and silently mis-classified the third as something other than a miss.
 
-The three paths are asserted against each other rather than one at a time, so
+**S6-F2 follow-up — the marker had to be the adapter's spelling.** Routing the
+third path through ``_empty_evidence`` only achieves the symmetry it claims if
+``_empty_evidence`` stamps what the exact-subject path stamps. It did not: it
+wrote a hand-typed ``conflict_class=NOT_FOUND`` while the M5 adapter renders
+``f"conflict_class={result.conflict_class.value}"`` and
+``ConflictClass.NOT_FOUND.value == "not_found"``. One class handed out two
+spellings for one condition — uppercase through ``_query_freetext``, lowercase
+through ``_query_exact`` — and the original version of this file compared the
+free-text paths only against each other, so the single asymmetry the change
+existed to close was the one its tests could not see. ``_empty_evidence`` now
+builds the note from the enum member, and the miss kinds are asserted **across**
+the two paths, not just within one.
+
+The paths are asserted against each other rather than one at a time, so
 re-introducing a second shape for "no hits" fails here rather than at whichever
 consumer notices first.
 
@@ -44,6 +57,7 @@ from typing import Any
 
 import prometheus_client
 import pytest
+from aphelion.read_adapter import ConflictClass
 
 from parallax.apex import router as router_mod
 from parallax.apex import subject_index
@@ -53,10 +67,13 @@ from parallax.retrieval.contracts import RetrievalEvidence
 from parallax.router.contracts import QueryRequest
 from parallax.router.types import QueryType
 
-#: The exact note ``_empty_evidence`` stamps. A literal rather than a call to
-#: ``_empty_evidence()``, because deriving the expectation from the function
-#: under test would let a renamed marker satisfy every assertion below at once.
-NOT_FOUND_NOTE = "conflict_class=NOT_FOUND"
+#: The exact note both miss paths must stamp. A literal rather than a call to
+#: ``_empty_evidence()`` or a read of ``router_mod._NOT_FOUND_NOTE``, because
+#: deriving the expectation from the code under test would let a renamed marker
+#: satisfy every assertion below at once. Lowercase because that is what the M5
+#: adapter renders (``ConflictClass.NOT_FOUND.value == "not_found"``), pinned
+#: independently by ``tests/router/test_aphelion_adapter.py``.
+NOT_FOUND_NOTE = "conflict_class=not_found"
 
 
 def _counter_value(metric: Any, **labels: str) -> float:
@@ -293,18 +310,30 @@ def test_a_resolved_candidate_with_hits_is_not_marked_not_found(
 
 
 @pytest.mark.integration
-def test_all_three_freetext_miss_kinds_agree_on_the_marker(
+def test_every_miss_kind_agrees_on_the_marker_across_both_read_paths(
     package_dir: Path, audit_conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Empty corpus, no candidates, and no claims must be indistinguishable
-    on the NOT_FOUND marker and on the stage list.
+    """All four miss kinds must be indistinguishable on the NOT_FOUND marker
+    and on the stage list — including across the exact/free-text split.
 
-    Asserted together rather than as three separate expectations so a
-    divergence surfaces as one failure that names the odd path out, and so a
-    future fourth negative path has an obvious place to be added.
+    The exact-subject read is the load-bearing entry here. It is the one miss
+    whose note is produced by the M5 adapter rather than by ``_empty_evidence``,
+    so it is the only path that can catch the two halves of the router
+    disagreeing about how to spell one condition. Comparing the free-text paths
+    to each other (as this test originally did) passes just as happily when both
+    of them are wrong together.
+
+    Asserted in one loop rather than as four separate expectations so a
+    divergence surfaces as one failure that names the odd path out.
+
+    Ordering note: the exact-subject query runs first, while ``router._adapter``
+    is still the real adapter — the later ``_no_hits`` monkeypatch would
+    otherwise stub out the very component whose spelling is under test.
     """
     router = _make_router(package_dir, audit_conn)
-    empty_corpus = router.query(_freetext_query("anything"))
+
+    exact_empty_corpus = router.query(_exact_query())
+    freetext_empty_corpus = router.query(_freetext_query("anything"))
 
     monkeypatch.setattr(
         router_mod.subject_index,
@@ -316,11 +345,39 @@ def test_all_three_freetext_miss_kinds_agree_on_the_marker(
     monkeypatch.setattr(router._adapter, "query", _no_hits)  # noqa: SLF001
     no_claims = router.query(_freetext_query("alpha topic"))
 
-    for label, evidence in (
-        ("empty_corpus", empty_corpus),
-        ("no_candidates", no_candidates),
-        ("no_claims", no_claims),
-    ):
+    kinds = (
+        ("exact_subject_empty_corpus", exact_empty_corpus),
+        ("freetext_empty_corpus", freetext_empty_corpus),
+        ("freetext_no_candidates", no_candidates),
+        ("freetext_no_claims", no_claims),
+    )
+    for label, evidence in kinds:
         assert evidence.hits == (), f"{label} must return zero hits"
-        assert evidence.notes[0] == NOT_FOUND_NOTE, f"{label} lost the NOT_FOUND marker"
+        assert evidence.notes[0] == NOT_FOUND_NOTE, (
+            f"{label} carries {evidence.notes[0]!r}, not the shared marker "
+            f"{NOT_FOUND_NOTE!r} — one condition, two spellings"
+        )
         assert evidence.stages == ("aphelion_v03_r4",), f"{label} reported a different stage"
+
+    # Byte-identical, not merely "each matches the constant": states the
+    # invariant the way a consumer keying on notes[0] experiences it.
+    markers = {evidence.notes[0] for _, evidence in kinds}
+    assert len(markers) == 1, f"miss paths disagree on the marker: {sorted(markers)}"
+
+
+@pytest.mark.unit
+def test_the_miss_marker_is_the_adapter_enum_value_not_a_hand_typed_literal() -> None:
+    """The router's marker must track ``ConflictClass``, the shared source.
+
+    ``NOT_FOUND_NOTE`` above is a literal so a rename cannot silently satisfy
+    the suite. This test is the other end of that: it pins the literal to the
+    aphelion enum the M5 adapter renders from, so if the library ever changes
+    the member's value, this fails loudly (telling you the literal is stale)
+    instead of the two read paths quietly drifting apart again.
+
+    The enum is read from ``aphelion``, not from ``parallax.apex.router``, so
+    this is a check against the external contract rather than against the module
+    under test restating itself.
+    """
+    assert NOT_FOUND_NOTE == f"conflict_class={ConflictClass.NOT_FOUND.value}"
+    assert ConflictClass.NOT_FOUND.value == "not_found"

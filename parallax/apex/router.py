@@ -47,6 +47,7 @@ from typing import Any
 
 import prometheus_client
 from aphelion.errors import SchemaError, SecurityError, SemanticError, VerificationError
+from aphelion.read_adapter import ConflictClass
 from aphelion.signer import SignerVerificationError
 from aphelion.unpacker import unpack
 from aphelion.validator import validate_signatures
@@ -425,16 +426,26 @@ def _with_subject(request: QueryRequest, subject: str) -> QueryRequest:
     return replace(request, params=params)
 
 
+#: The miss marker, built from the same enum member the M5 adapter renders
+#: (``parallax/router/aphelion_adapter.py`` builds its note from
+#: ``result.conflict_class.value``). Spelled from :class:`ConflictClass` rather
+#: than as a literal because the two must be byte-identical: an exact-subject
+#: miss reaches a consumer through the adapter and a free-text miss through
+#: :func:`_empty_evidence`, and a hand-written ``NOT_FOUND`` here would hand out
+#: two spellings for one condition from one class.
+_NOT_FOUND_NOTE = f"conflict_class={ConflictClass.NOT_FOUND.value}"
+
+
 def _empty_evidence(extra_notes: tuple[str, ...] = ()) -> RetrievalEvidence:
     """A content-free :class:`RetrievalEvidence` for the free-text empty paths.
 
-    Mirrors the adapter's miss note (``conflict_class=NOT_FOUND``) so a free-text
+    Mirrors the adapter's miss note (``conflict_class=not_found``) so a free-text
     empty result is shaped like an exact-subject miss for downstream consumers.
     """
     return RetrievalEvidence(
         hits=(),
         stages=("aphelion_v03_r4",),
-        notes=("conflict_class=NOT_FOUND", *extra_notes),
+        notes=(_NOT_FOUND_NOTE, *extra_notes),
     )
 
 
@@ -767,7 +778,7 @@ class ApexPublicReadRouter:
         if not merged:
             # Third negative path, and it used to be the odd one out. An empty
             # corpus and an unresolved prompt both return through
-            # ``_empty_evidence``, which stamps ``conflict_class=NOT_FOUND``;
+            # ``_empty_evidence``, which stamps ``conflict_class=not_found``;
             # candidates that resolve to real packages whose R4 reads yield
             # nothing is the same kind of miss and has to carry the same marker,
             # or a consumer keying on it recognises two of the three and

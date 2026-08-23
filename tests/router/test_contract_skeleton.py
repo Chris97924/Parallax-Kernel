@@ -30,7 +30,7 @@ from parallax.router.mock_adapter import MockMemoryRouter
 from parallax.router.types import QueryType
 
 
-def test_query_xfail() -> None:
+def test_query_raises_not_implemented() -> None:
     """``MockMemoryRouter.query`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = QueryRequest(query_type=QueryType.RECENT_CONTEXT, user_id="u1")
@@ -38,7 +38,7 @@ def test_query_xfail() -> None:
         router.query(req)
 
 
-def test_ingest_xfail() -> None:
+def test_ingest_raises_not_implemented() -> None:
     """``MockMemoryRouter.ingest`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = IngestRequest(user_id="u1", kind="memory", payload={"body": "hi"})
@@ -46,7 +46,7 @@ def test_ingest_xfail() -> None:
         router.ingest(req)
 
 
-def test_backfill_xfail() -> None:
+def test_backfill_raises_not_implemented() -> None:
     """``MockMemoryRouter.backfill`` is frozen and raises ``NotImplementedError``."""
     router = MockMemoryRouter()
     req = BackfillRequest(user_id="u1", crosswalk_version="v1")

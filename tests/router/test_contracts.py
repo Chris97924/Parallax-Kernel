@@ -172,8 +172,17 @@ def test_arbitration_decision_fields() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_backfill_report_dry_run_writes_zero() -> None:
+def test_frozen_mock_cannot_violate_the_dry_run_invariant() -> None:
     """The dry-run invariant is an *adapter* obligation, not a dataclass one.
+
+    Named for what it asserts. The old name
+    (``test_backfill_report_dry_run_writes_zero``) advertised coverage of the
+    dry-run invariant that this test does not have — the same "signal that says
+    one thing and does another" class the rest of this branch set out to fix.
+    Kept rather than deleted as a duplicate of
+    ``test_contract_skeleton.py::test_backfill_raises_not_implemented``, because
+    this is the file a reader looking for the BackfillReport invariant opens,
+    and the docstring below is the signpost to where it is really enforced.
 
     ``BackfillReport`` has no ``__post_init__``, so constructing one with
     ``dry_run=True`` and ``writes_performed=5`` here would prove nothing about

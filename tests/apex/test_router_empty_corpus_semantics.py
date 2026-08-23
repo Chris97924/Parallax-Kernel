@@ -52,6 +52,7 @@ lifecycle semantics that are not what is being pinned.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -90,7 +91,7 @@ def package_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def audit_conn(tmp_path: Path) -> sqlite3.Connection:
+def audit_conn(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     conn = open_audit_db(tmp_path / "s5_audit.db", validate=False)
     yield conn
     conn.close()

@@ -40,9 +40,9 @@ exactly what makes a constant untestable.
 from __future__ import annotations
 
 import datetime as _dt
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -53,7 +53,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
-def _clean_metrics_cache() -> Any:
+def _clean_metrics_cache() -> Iterator[None]:
     """The module caches are process-global; drop them around every test."""
     metrics_mod._reset_cache_for_tests()
     yield

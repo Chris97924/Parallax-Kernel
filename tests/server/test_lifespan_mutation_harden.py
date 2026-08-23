@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -49,7 +50,7 @@ def _counter_value() -> float:
 
 
 @pytest.fixture(autouse=True)
-def _clean_gauge() -> None:
+def _clean_gauge() -> Iterator[None]:
     """The inflight gauge is process-global; return it to zero either side."""
     _drain_gauge_to_zero()
     yield

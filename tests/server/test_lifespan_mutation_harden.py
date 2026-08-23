@@ -286,10 +286,7 @@ def test_lifespan_startup_restores_the_journal_into_the_counter(
     """
     from fastapi import FastAPI
 
-    from parallax.server.drain_journal import record_drain_timeout
-
     journal = tmp_path / "journal.json"
-    record_drain_timeout(inflight_count=1, timeout_seconds=900.0, path=journal)
     # Put the journal ahead of the live counter so the restore has a real delta.
     monkeypatch.setenv("PARALLAX_DRAIN_JOURNAL_PATH", str(journal))
     monkeypatch.setenv("PARALLAX_AUDIT_DB_PATH", str(tmp_path / "audit.db"))

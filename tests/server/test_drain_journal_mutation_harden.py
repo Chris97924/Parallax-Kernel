@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -281,18 +283,38 @@ def test_the_journal_is_fsynced_before_the_replace(
     presence: the fsync has to land before the replace, or the replace can
     publish a filename whose contents are not yet on disk.
     """
-    calls: list[str] = []
+    # ``dj.os`` IS the stdlib os module, so these wrappers observe every fsync
+    # and replace in the process, not only this module's. Rather than assert
+    # whole-process call equality — which any unrelated background write landing
+    # inside the window would break, failing the test on something it does not
+    # test — each call is recorded with the path it acted on and the assertion
+    # is scoped to this test's own ``tmp_path``.
+    #
+    # Attributing the fsync needs the temp file's name, since fsync only sees a
+    # descriptor. ``dj.tempfile`` is replaced with a one-attribute namespace
+    # (not an attribute poked onto the shared tempfile module) so that patch, at
+    # least, really is module-local, and it records the fd -> name mapping the
+    # journal write is about to use.
+    calls: list[tuple[str, str]] = []
+    fd_names: dict[int, str] = {}
     real_fsync = os.fsync
     real_replace = os.replace
+    real_named_temp_file = tempfile.NamedTemporaryFile
+
+    def _named_temp_file(*args: Any, **kwargs: Any) -> Any:
+        handle = real_named_temp_file(*args, **kwargs)
+        fd_names[handle.fileno()] = handle.name
+        return handle
 
     def _fsync(fd: int) -> None:
-        calls.append("fsync")
+        calls.append(("fsync", fd_names.get(fd, f"<unknown fd {fd}>")))
         real_fsync(fd)
 
     def _replace(src: Any, dst: Any) -> None:
-        calls.append("replace")
+        calls.append(("replace", os.fspath(dst)))
         real_replace(src, dst)
 
+    monkeypatch.setattr(dj, "tempfile", SimpleNamespace(NamedTemporaryFile=_named_temp_file))
     monkeypatch.setattr(dj.os, "fsync", _fsync)
     monkeypatch.setattr(dj.os, "replace", _replace)
 
@@ -300,7 +322,13 @@ def test_the_journal_is_fsynced_before_the_replace(
         inflight_count=1, timeout_seconds=1.0, path=tmp_path / "journal.json"
     )
 
-    assert calls == ["fsync", "replace"]
+    # The temp file is created in ``resolved.parent`` (same filesystem, so the
+    # replace is atomic) and the destination is the journal itself, so both of
+    # this module's calls land under tmp_path and nothing else does.
+    ours = [op for op, target in calls if target.startswith(str(tmp_path))]
+    assert ours == ["fsync", "replace"], (
+        f"expected fsync-then-replace on this journal, got {calls!r}"
+    )
 
 
 @pytest.mark.unit

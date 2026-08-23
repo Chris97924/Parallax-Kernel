@@ -4,8 +4,11 @@ Additive companion to ``tests/server/test_metrics_endpoint.py``,
 ``tests/server/test_metrics_dual_read_endpoint.py``,
 ``tests/server/test_metrics_never_on_wire_102.py`` and ``tests/observability/``.
 Thirty semantic mutants were applied to a pristine tree one at a time against
-that whole set; twenty were killed by it. Every test below closes one of the
-ten that were not. The patches and exit codes are in ``mutations-w4-obs.json``.
+that whole set; twenty were killed by it. Of the ten that survived, the tests
+below close nine; the tenth (S2-M13) is excluded as an equivalent mutant rather
+than killed — see the manifest, which backs the equivalence with 207,380
+differential inputs and zero differing outputs. The patches and exit codes are
+in ``mutations-w4-obs.json``.
 
 The shape of what the existing suites could not see
 ---------------------------------------------------

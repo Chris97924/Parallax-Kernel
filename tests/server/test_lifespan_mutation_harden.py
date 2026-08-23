@@ -179,20 +179,30 @@ def test_drain_gives_up_at_the_deadline_it_was_given(tmp_path: Path) -> None:
     increments the counter, so every existing assertion holds. Only the elapsed
     time distinguishes them — measured against literals, and generously, so the
     test cannot flake on a slow box while still failing a 2x deadline.
+
+    The bracket is scaled rather than loosened. The measured window is not just
+    the drain: ``time.monotonic()`` is sampled after ``asyncio.run`` returns, so
+    loop setup/teardown and a full journal write (mkdir, NamedTemporaryFile,
+    json.dump, os.fsync, os.replace) all land inside it. At the original 0.4s
+    deadline that left ~0.35s of headroom, which one fsync stall on a loaded
+    Windows box eats — and the upper bound could not simply be widened, because
+    0.8 is exactly where the ``deadline * 2`` mutant lands. Multiplying both
+    sides by five keeps the identical 2x discrimination while giving 2s of
+    absolute headroom.
     """
     inflight_gauge.inc()
     start = time.monotonic()
 
     asyncio.run(
         lifespan_mod._drain_inflight(
-            timeout_seconds=0.4,
+            timeout_seconds=2.0,
             poll_interval_seconds=0.05,
             journal_path=str(tmp_path / "journal.json"),
         )
     )
     elapsed = time.monotonic() - start
 
-    assert 0.4 <= elapsed < 0.8, f"drain must stop at its own deadline, took {elapsed:.3f}s"
+    assert 2.0 <= elapsed < 4.0, f"drain must stop at its own deadline, took {elapsed:.3f}s"
 
 
 @pytest.mark.unit

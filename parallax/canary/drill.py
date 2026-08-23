@@ -168,14 +168,21 @@ def run_drain_drill(
     # Deterministic per-request "work time". Sum stays well under the
     # default 60s timeout for any reasonable in_flight_count.
     per_request_s = 0.001 if dry_run else min(0.05, timeout_s / max(in_flight_count, 1) / 4)
-    started = time.monotonic()
+    # perf_counter, not monotonic: on Windows monotonic ticks
+    # every 15.625 ms, so a drain shorter than one tick measures as exactly
+    # 0.0 elapsed and any timeout below one tick is unenforceable. The drain
+    # budget is a deadline, so the cut condition is "the budget is spent"
+    # (>=), not "the budget is overspent" (>) — that is what makes
+    # timeout_s=0.0 mean "cut immediately" on every platform instead of
+    # granting one free request whenever the clock has not ticked yet.
+    started = time.perf_counter()
     drained = 0
     while drained < in_flight_count:
-        if time.monotonic() - started > timeout_s:
+        if time.perf_counter() - started >= timeout_s:
             break
         sleep(per_request_s)
         drained += 1
-    elapsed = time.monotonic() - started
+    elapsed = time.perf_counter() - started
     residual = in_flight_count - drained
 
     steps.append(

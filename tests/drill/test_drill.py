@@ -75,6 +75,25 @@ def test_drain_drill_force_cut_when_deadline_misses() -> None:
     assert int(drain_step.observations["residual_count"]) > 0
 
 
+def test_drain_drill_small_positive_timeout_still_drains() -> None:
+    """A small but non-zero budget must still drain normally.
+
+    Companion to the force-cut test above: the deadline comparison is ">="
+    so that timeout_s=0.0 cuts immediately, and this pins that the change
+    did not turn every short timeout into a cut. 4 dry-run requests cost
+    ~4 ms of simulated work against a 200 ms budget, so the loop must
+    complete. This also only means anything because the drain clock is
+    perf_counter: under the 15.625 ms Windows monotonic tick a 200 ms
+    budget is barely 12 observable ticks and elapsed_ms quantises to 0.
+    """
+    report = run_drain_drill(in_flight_count=4, timeout_s=0.2, dry_run=True)
+    assert report.overall == DrillStatus.PASS
+    drain_step = next(s for s in report.steps if s.name == "drain_within_deadline")
+    assert drain_step.status == DrillStatus.PASS
+    assert int(drain_step.observations["drained_count"]) == 4
+    assert int(drain_step.observations["residual_count"]) == 0
+
+
 def test_drain_drill_zero_in_flight_is_invalid() -> None:
     """``in_flight_count=0`` is meaningless — drill must FAIL fast."""
     report = run_drain_drill(in_flight_count=0, dry_run=True)

@@ -163,8 +163,11 @@ groups:
       # Stuck-empty corpus: empty_result{cause="empty_corpus"} increments on EVERY
       # read against an accessible-but-empty package dir. (So does
       # empty_corpus_total — it is the unlabelled twin, NOT a once-per-process
-      # signal, whatever its old HELP text claimed; this rule selects the
-      # labelled series to stay symmetric with the other empty_result causes.)
+      # signal: the first-read-per-process design was never implemented and the
+      # spec was amended to the shipped per-read behaviour on 2026-08-23, see
+      # §4.5. This rule selects the labelled series to stay symmetric with the
+      # other empty_result causes; because both series are per-read, neither may
+      # be alerted on as a level — hence the rate() below.)
       # A sustained rate for >1h means
       # this host keeps serving reads with no packages — i.e. M6 ingest is not
       # reaching it. EXPECTED on a fresh deploy until the first package lands.

@@ -318,7 +318,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "description": "First-read-per-process detection of an accessible-but-empty package dir from parallax_apex_empty_corpus_total. A value stuck > 0 across a deploy that should have packages indicates a stuck-empty corpus (M6 ingest not reaching this host).",
+      "description": "Reads served against an accessible-but-empty package dir in the last hour, from parallax_apex_empty_corpus_total. This counter increments on EVERY such read (spec §4.5 amendment 2026-08-23 — the first-read-per-process design was never implemented), so its raw level grows with request rate and says nothing about deploy health; only the windowed rate does. A sustained non-zero here means this host keeps serving reads with no packages — M6 ingest is not reaching it. EXPECTED on a fresh deploy until the first package lands. Same condition as the ApexStuckEmptyCorpus alert, which watches the labelled twin parallax_apex_empty_result_total{cause=\"empty_corpus\"}.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -348,13 +348,12 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum(parallax_apex_empty_corpus_total)",
-          "instant": true,
-          "legendFormat": "empty-corpus detections",
+          "expr": "sum(increase(parallax_apex_empty_corpus_total[1h]))",
+          "legendFormat": "empty-corpus reads",
           "refId": "A"
         }
       ],
-      "title": "Empty-corpus detections (stuck-deploy guard)",
+      "title": "Empty-corpus reads per 1h (stuck-deploy guard)",
       "type": "stat"
     },
     {

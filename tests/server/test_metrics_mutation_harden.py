@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -87,9 +88,20 @@ def test_documented_windows_and_cache_ttl_are_the_shipped_values() -> None:
 
 
 def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Install a hand-advanced ``time.monotonic`` and return its mutable cell."""
+    """Install a hand-advanced ``time.monotonic`` and return its mutable cell.
+
+    The stub replaces the module's ``time`` *binding*, not an attribute on the
+    stdlib module. ``metrics.py`` does ``import time``, so patching
+    ``metrics_mod.time.monotonic`` would mutate the shared module object and
+    stop the clock for every ``time.monotonic()`` caller in the process —
+    pytest's own timing, prometheus_client, any background thread — for the
+    duration of the test. monkeypatch would undo it, so the blast radius was
+    bounded, but the patch read as module-local while it was not. metrics.py
+    uses only ``time.monotonic`` (lines 357, 362, 378, 383), so a one-attribute
+    namespace is a complete stand-in.
+    """
     now = [1000.0]
-    monkeypatch.setattr(metrics_mod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(metrics_mod, "time", SimpleNamespace(monotonic=lambda: now[0]))
     return now
 
 

@@ -60,6 +60,7 @@ import contextlib
 import hashlib
 import inspect
 import pathlib
+import re
 import sqlite3
 from collections.abc import Iterator
 
@@ -86,7 +87,7 @@ _SHA256_BARE_U = hashlib.sha256(b"u").hexdigest()
 
 
 @pytest.fixture()
-def conn(tmp_path: pathlib.Path) -> sqlite3.Connection:
+def conn(tmp_path: pathlib.Path) -> Iterator[sqlite3.Connection]:
     c = connect(tmp_path / "ingest_harden.db")
     migrate_to_latest(c)
     yield c
@@ -105,10 +106,48 @@ def _traced(conn: sqlite3.Connection) -> Iterator[list[str]]:
         conn.set_trace_callback(None)
 
 
+# ``set_trace_callback`` reports EXPANDED SQL — bound values are inlined as
+# literals — so every structural check below masks the literals first. The
+# pattern honours SQL's doubled-quote escaping so a value containing a quote
+# cannot end the match early.
+_SQL_LITERAL = re.compile(r"'(?:[^']|'')*'")
+_PREDICATE = re.compile(r"(\w+) *(>=|<=|<>|!=|=|<|>) *\?")
+
+
+def _skeleton(sql: str) -> str:
+    """``sql`` with literals masked as ``?`` and all whitespace collapsed.
+
+    Reduces a statement to its STRUCTURE, so assertions made on it survive a
+    reflow or a change of bound values but still see the operators and the
+    columns they are applied to.
+    """
+    return " ".join(_SQL_LITERAL.sub("?", sql).split())
+
+
 def _only(statements: list[str], needle: str) -> str:
-    matches = [s for s in statements if needle in s]
+    """The single executed statement whose skeleton contains ``needle``.
+
+    Matched against the skeleton rather than the raw text so that reflowing
+    the SQL — a line break after the column list, say — does not turn a real
+    assertion into an "expected exactly one ... got []" failure.
+    """
+    want = " ".join(needle.split())
+    matches = [s for s in statements if want in _skeleton(s)]
     assert len(matches) == 1, f"expected exactly one {needle!r} statement, got {matches}"
     return matches[0]
+
+
+def _where_predicates(sql: str) -> list[tuple[str, str]]:
+    """Every ``<column> <op> <value>`` comparison in ``sql``'s WHERE clause.
+
+    Returned sorted, so the result is invariant under a semantics-preserving
+    reorder of the conjuncts and under whitespace, while still changing the
+    moment any column's operator is relaxed away from ``=``. Duplicates are
+    preserved (a list, not a dict) so a repeated column stays visible.
+    """
+    where = _skeleton(sql).partition(" WHERE ")[2]
+    assert where, f"no WHERE clause in {sql!r}"
+    return sorted(_PREDICATE.findall(where))
 
 
 # ---------------------------------------------------------------------------
@@ -223,9 +262,16 @@ class TestReselectTenantScoping:
         the unique index on ``memories(content_hash, user_id)`` SQLite walks
         the range in ascending user_id, and the caller's own row always exists
         by re-select time (INSERT OR IGNORE either wrote it or it was already
-        there), so a relaxed ``>=`` still returns the right row TODAY. The
-        leak is latent in the query plan; the only honest way to pin it is to
-        read back the comparison the code issued.
+        there). The caller is therefore always the SMALLEST user_id satisfying
+        ``user_id >= <caller>``, so ``row[0]`` is its own row and a relaxed
+        ``>=`` returns the right memory_id for every input that can be built.
+        The leak is latent in the query plan; the only honest way to pin it is
+        to read back the comparison the code issued.
+
+        Read back STRUCTURALLY (masked literals, collapsed whitespace, sorted
+        predicates) rather than as a substring of the raw text, so reordering
+        the conjuncts or reflowing the string — both semantics-preserving —
+        leaves this test alone, while relaxing any operator fails it.
         """
         with _traced(conn) as seen:
             ingest_memory(
@@ -234,9 +280,7 @@ class TestReselectTenantScoping:
 
         stmt = _only(seen, "SELECT memory_id FROM memories")
 
-        assert "AND user_id = " in stmt
-        assert ">=" not in stmt
-        assert "<=" not in stmt
+        assert _where_predicates(stmt) == [("content_hash", "="), ("user_id", "=")]
 
     @pytest.mark.unit
     def test_the_claim_reselect_is_equality_scoped_on_user_id_and_source_id(
@@ -247,6 +291,11 @@ class TestReselectTenantScoping:
         ADR-005 made the claim hash user-scoped; the re-select's ``source_id``
         and ``user_id`` equality filters are the second half of that boundary,
         and are masked by the same index-order accident as the memory one.
+
+        Structural for the same reason, and asserting the whole predicate SET
+        rather than membership: dropping a scoping column entirely is as much
+        of a leak as relaxing its operator, and only an equality against the
+        full list catches both.
         """
         with _traced(conn) as seen:
             ingest_claim(
@@ -255,10 +304,11 @@ class TestReselectTenantScoping:
 
         stmt = _only(seen, "SELECT claim_id FROM claims")
 
-        assert "AND source_id = " in stmt
-        assert "AND user_id = " in stmt
-        assert ">=" not in stmt
-        assert "<=" not in stmt
+        assert _where_predicates(stmt) == [
+            ("content_hash", "="),
+            ("source_id", "="),
+            ("user_id", "="),
+        ]
 
     @pytest.mark.unit
     def test_two_users_ingesting_identical_memory_content_stay_separate(
@@ -368,5 +418,18 @@ class TestWithStatusDefaults:
     def test_the_wrapper_claim_state_default_is_also_auto(
         self, conn: sqlite3.Connection
     ) -> None:
-        """Control: the two defaults must not drift apart."""
+        """Control: the two defaults must not drift apart.
+
+        Read back off the persisted row, not just off the signature: resolving
+        the default inside the body (``state: ... | None = None``) is a
+        semantics-preserving refactor that a signature-only assertion would
+        fail while every stored row still said ``'auto'``.
+        """
         assert inspect.signature(ingest_claim).parameters["state"].default == "auto"
+
+        claim_id = ingest_claim(
+            conn, user_id="u", subject="s", predicate="p", object_="o"
+        )
+
+        row = query(conn, "SELECT state FROM claims WHERE claim_id = ?", (claim_id,))[0]
+        assert row["state"] == "auto"

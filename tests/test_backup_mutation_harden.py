@@ -75,9 +75,11 @@ import os
 import pathlib
 import sqlite3
 import tarfile
+from collections.abc import Callable
 
 import pytest
 
+import parallax.backup as _backup
 from parallax.backup import (
     MANIFEST_NAME,
     BackupManifest,
@@ -111,6 +113,44 @@ def cfg(tmp_path: pathlib.Path) -> _Cfg:
     migrate_to_latest(c)
     c.close()
     return _Cfg(db_path=db, vault_path=vault)
+
+
+class _Sqlite3Proxy:
+    """Stand-in for the ``sqlite3`` module inside ONE importer's namespace.
+
+    Anything not explicitly overridden falls through to the real module, so a
+    module that reaches for ``sqlite3.Connection`` or ``sqlite3.Error`` after
+    the swap still sees the genuine objects.
+    """
+
+    def __init__(self, **overrides: object) -> None:
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> object:
+        try:
+            return self._overrides[name]
+        except KeyError:
+            return getattr(sqlite3, name)
+
+
+def _patch_backup_connect(
+    monkeypatch: pytest.MonkeyPatch, factory: Callable[..., object]
+) -> None:
+    """Route ``parallax.backup``'s ``sqlite3.connect`` to ``factory``.
+
+    ``parallax.backup`` does a plain ``import sqlite3``, so its ``sqlite3``
+    attribute IS the shared stdlib module object: setting
+    ``parallax.backup.sqlite3.connect`` would replace ``sqlite3.connect`` for
+    every importer in the process for the duration of the test. That is
+    currently unobservable — pytest runs these serially, and xdist forks
+    separate processes — but it becomes a real cross-test hazard under any
+    in-process thread parallelism.
+
+    Rebinding the ``sqlite3`` NAME in backup's own globals is the smallest
+    scope that still intercepts the call, and ``monkeypatch`` restores the
+    original binding at teardown whether the test passes or raises.
+    """
+    monkeypatch.setattr(_backup, "sqlite3", _Sqlite3Proxy(connect=factory))
 
 
 def _seed_rows(db_path: pathlib.Path) -> None:
@@ -415,9 +455,7 @@ class TestWalCheckpoint:
             def close(self) -> None:
                 return None
 
-        monkeypatch.setattr(
-            "parallax.backup.sqlite3.connect", lambda *_a, **_k: _NoRowConn()
-        )
+        _patch_backup_connect(monkeypatch, lambda *_a, **_k: _NoRowConn())
 
         with pytest.raises(RuntimeError, match="returned no row"):
             _checkpoint_truncate(cfg.db_path)
@@ -446,9 +484,7 @@ class TestWalCheckpoint:
             def close(self) -> None:
                 return None
 
-        monkeypatch.setattr(
-            "parallax.backup.sqlite3.connect", lambda *_a, **_k: _Conn()
-        )
+        _patch_backup_connect(monkeypatch, lambda *_a, **_k: _Conn())
 
         with pytest.raises(RuntimeError, match="wal_checkpoint"):
             _checkpoint_truncate(cfg.db_path)

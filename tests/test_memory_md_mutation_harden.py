@@ -79,7 +79,7 @@ from parallax.sqlite_store import connect
 
 
 @pytest.fixture()
-def conn(tmp_path: pathlib.Path) -> sqlite3.Connection:
+def conn(tmp_path: pathlib.Path) -> Iterator[sqlite3.Connection]:
     c = connect(tmp_path / "memory_md_harden.db")
     migrate_to_latest(c)
     yield c
@@ -362,7 +362,17 @@ class TestIngestTransaction:
         be replaced with ``= None`` — which leaves the CALLER's connection in
         autocommit mode for the rest of its life, silently removing implicit
         transactions from every later write on it.
+
+        The second assertion's premise — that the caller HAD a non-autocommit
+        isolation level going in, so ``= None`` would really be a change — is
+        derived from a fresh connection at runtime rather than hardcoded to
+        CPython's current default. Hardcoding ``""`` would make this test fail
+        (and point at memory_md) the day ``sqlite_store.connect`` opted into
+        explicit transaction control, even though ``_manual_tx`` would still
+        be restoring the caller's value correctly.
         """
+        with contextlib.closing(connect(tmp_path / "isolation_probe.db")) as probe:
+            default_isolation = probe.isolation_level
         before = conn.isolation_level
         _memory_md(tmp_path, "# Reference\n- [Ref](ref.md) — a ref\n")
         _companion(tmp_path, "ref.md")
@@ -370,7 +380,7 @@ class TestIngestTransaction:
         ingest_memory_md(conn, memory_md_path=tmp_path / "MEMORY.md", user_id="u1")
 
         assert conn.isolation_level == before
-        assert conn.isolation_level == ""
+        assert before == default_isolation
 
 
 # ---------------------------------------------------------------------------

@@ -6,12 +6,18 @@ Additive companion to ``test_retrieve.py`` / ``test_retrieve_api.py`` /
 ``test_by_timeline_microsecond_boundary.py`` / ``test_fts_events_index.py`` /
 ``test_content_hash_user_id_scope.py``.
 
-TALLY — applied 59 / killed-by-new 37 / already-covered 21 / equivalent 1 /
+TALLY — applied 59 / killed-by-new 38 / already-covered 21 / equivalent 0 /
 unaddressed 0. Fifty-nine semantic mutants were applied one at a time to a
 pristine tree: 21 died against the pre-existing suite and 38 walked through
-it. Of those 38 survivors, 37 are killed by the tests below and 1 is proven
-EQUIVALENT rather than merely uncovered — see
-``TestByBugFix.test_the_claim_dedup_guard_is_provably_dead_code``.
+it. All 38 survivors are killed by the tests below.
+
+R33 (delete the claim de-duplication guard) was recorded as EQUIVALENT in the
+first round and re-adjudicated to killed-by-new in review: the proof rested on
+"``claim_id`` is ``TEXT PRIMARY KEY``, so distinct rows carry distinct ids",
+which SQLite does not enforce — a non-INTEGER PRIMARY KEY admits NULL unless
+``NOT NULL`` is declared, and ``claims.claim_id`` is not. Two NULL-id rows
+collide on ``cid`` and the guard fires. See
+``TestByBugFix.test_the_claim_dedup_guard_fires_on_null_claim_ids``.
 
 What the existing suite is blind to, and why
 --------------------------------------------
@@ -86,6 +92,7 @@ import datetime as _dt
 import inspect
 import pathlib
 import sqlite3
+from collections.abc import Iterator
 
 import pytest
 from ulid import ULID
@@ -98,6 +105,8 @@ from parallax.retrieve import (
     _RETRIEVE_KINDS,
     _TRIGRAM_MIN_CHARS,
     RetrievalHit,
+    RetrievalTrace,
+    RetrievalTraceStage,
     _claim_to_hit,
     _event_title,
     _event_to_hit,
@@ -125,7 +134,7 @@ _U = "u"
 
 
 @pytest.fixture()
-def conn(tmp_path: pathlib.Path) -> sqlite3.Connection:
+def conn(tmp_path: pathlib.Path) -> Iterator[sqlite3.Connection]:
     """Fully migrated store — ``events_fts`` (migration 0014) present."""
     c = connect(tmp_path / "retrieve_harden.db")
     migrate_to_latest(c)
@@ -134,7 +143,7 @@ def conn(tmp_path: pathlib.Path) -> sqlite3.Connection:
 
 
 @pytest.fixture()
-def bare_conn(tmp_path: pathlib.Path) -> sqlite3.Connection:
+def bare_conn(tmp_path: pathlib.Path) -> Iterator[sqlite3.Connection]:
     """A store that has ``events`` but NOT ``events_fts`` (pre-0014 / schema.sql)."""
     c = sqlite3.connect(str(tmp_path / "bare.db"))
     c.row_factory = sqlite3.Row
@@ -195,6 +204,15 @@ def _claim_hits(hits: list[RetrievalHit]) -> list[RetrievalHit]:
 
 def _event_hits(hits: list[RetrievalHit]) -> list[RetrievalHit]:
     return [h for h in hits if h.entity_kind == "event"]
+
+
+def _only_stage(trace: RetrievalTrace, name: str) -> RetrievalTraceStage:
+    """The single funnel stage called ``name``, or a naming failure."""
+    matches = [s for s in trace.stages if s.name == name]
+    assert len(matches) == 1, (
+        f"expected exactly one {name!r} stage, got {[s.name for s in trace.stages]}"
+    )
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
@@ -778,25 +796,81 @@ class TestByBugFix:
         assert wanted in [h.entity_id for h in hits]
 
     @pytest.mark.unit
-    def test_the_claim_dedup_guard_is_provably_dead_code(
+    def test_the_claim_dedup_guard_fires_on_null_claim_ids(
         self, conn: sqlite3.Connection
     ) -> None:
-        """EQUIVALENCE PROOF for the ``if cid in seen: continue`` guard.
+        """Mutant R33 (delete ``if cid in seen: continue``) is NOT equivalent.
 
-        Mutant R33 (delete the guard) survived the suite, and it survives this
-        file too — because it is EQUIVALENT, not merely uncovered:
+        This exclusion was first recorded as an equivalence on the premise
+        "``claim_id`` is ``TEXT PRIMARY KEY``, so distinct rows carry distinct
+        ``cid`` values". SQLite does not enforce that: a non-INTEGER PRIMARY
+        KEY of a rowid table admits NULL unless ``NOT NULL`` is declared, and
+        ``claims.claim_id`` is declared without it (``schema.sql``,
+        ``parallax/migrations/m0001_initial_schema.py``). ``retrieve.py`` then
+        does ``cid = r.get("claim_id", "")``, which yields ``None`` for such a
+        row — the ``""`` default never applies, because the key IS present.
+        Two NULL-id rows therefore collide on ``cid = None`` and the guard is
+        reached.
 
-        1. ``claim_rows`` comes from ONE ``SELECT * FROM claims WHERE user_id
-           = ? AND (<ORed LIKEs>)``. There is no JOIN and no UNION, so SQLite
-           yields each qualifying base-table row exactly once however many
-           disjuncts it satisfies.
-        2. ``claim_id`` is ``TEXT PRIMARY KEY`` on ``claims`` (schema.sql),
-           so distinct rows carry distinct ``cid`` values.
+        Re-adjudicated empirically on sqlite 3.50.4: both rows below insert
+        cleanly, and ``by_bug_fix`` returns ONE claim hit with the guard and
+        TWO without it. The guard is live code, so the mutant dies here.
 
-        Therefore ``cid in seen`` is unreachable and removing the guard cannot
-        change any observable output. This test pins premise (1) — the property
-        a future refactor would break by adding a JOIN — rather than pretending
-        to kill the mutant.
+        The rows are written with raw SQL on purpose — every writer inside the
+        package mints a ULID (``parallax/ingest.py``), so this input models an
+        external writer or a future migration, not normal package traffic.
+        That is what makes it a mutation test rather than a contract test: it
+        pins the branch's observable effect, not a behaviour callers rely on.
+        """
+        conn.execute(
+            "INSERT INTO sources (source_id, uri, kind, content_hash, user_id,"
+            " ingested_at, state) VALUES (?,?,?,?,?,?,?)",
+            ("s-null", "u://s-null", "note", "h-src", _U, _iso_ago(1), "active"),
+        )
+        for n in (1, 2):
+            conn.execute(
+                "INSERT INTO claims (claim_id, user_id, subject, predicate,"
+                " object, source_id, content_hash, confidence, state,"
+                " created_at, updated_at) VALUES (NULL,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    _U,
+                    f"bug number {n}",  # matches the 'bug' LIKE disjunct
+                    "is",
+                    "open",
+                    "s-null",
+                    f"h-claim-{n}",  # distinct: dodges uniq_claims_content
+                    0.9,
+                    "active",
+                    _iso_ago(1),
+                    _iso_ago(1),
+                ),
+            )
+        conn.commit()
+        stored = conn.execute("SELECT claim_id FROM claims").fetchall()
+        assert [r["claim_id"] for r in stored] == [None, None], (
+            "premise check: SQLite must accept NULL in this TEXT PRIMARY KEY"
+        )
+
+        claims = _claim_hits(by_bug_fix(conn, user_id=_U))
+
+        assert len(claims) == 1
+
+    @pytest.mark.unit
+    def test_the_claim_query_yields_each_matching_row_once(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        """The dedup guard's other half: the claim SELECT must not fan out.
+
+        ``claim_rows`` comes from ONE ``SELECT * FROM claims WHERE user_id = ?
+        AND (<ORed LIKEs>)`` — no JOIN, no UNION — so a row satisfying several
+        disjuncts is still returned once. Adding a JOIN to a future 1:N table
+        (claim_tags, say) would silently multiply every claim by its child
+        count, and the dedup guard downstream would HIDE that from any
+        assertion made on ``by_bug_fix``'s output.
+
+        So this reads the PRE-dedup count instead: ``explain_retrieve``'s
+        ``spo_token_filter`` stage reports ``len(claim_rows)`` as it comes off
+        the query, upstream of the guard.
         """
         ingest_claim(
             conn,
@@ -807,10 +881,10 @@ class TestByBugFix:
             confidence=0.9,
         )
 
-        claims = _claim_hits(by_bug_fix(conn, user_id=_U))
-        ids = [h.entity_id for h in claims]
+        trace = explain_retrieve(conn, kind="bug", user_id=_U)
 
-        assert len(ids) == len(set(ids)) == 1
+        stage = _only_stage(trace, "spo_token_filter")
+        assert stage.candidates_out == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1086,7 +1160,7 @@ class TestExplainRetrieve:
         Built from a payload whose 80-char prefix is known exactly.
         """
         payload = '{"file_path": "' + "x" * 100 + '"}'
-        _raw_event(conn, event_type="tool.edit", payload_json=payload)
+        eid = _raw_event(conn, event_type="tool.edit", payload_json=payload)
 
         trace = explain_retrieve(
             conn, kind="file", user_id=_U, query_text="no-such-path"
@@ -1094,7 +1168,12 @@ class TestExplainRetrieve:
 
         recent = [n for n in trace.notes if "near_miss(file) recent" in n]
         assert len(recent) == 1
-        sample = recent[0].split(": ", 2)[2]
+        # Split on the note's own documented prefix rather than by counting
+        # ': ' separators: the payload contains ': ' too, so a positional
+        # split silently encodes how many fields precede the sample and
+        # mis-slices (rather than naming the cause) if that count ever moves.
+        _, marker, sample = recent[0].partition(f"sample={eid}: ")
+        assert marker, f"note does not carry the documented prefix: {recent[0]!r}"
         assert sample == payload[:80]
         assert len(sample) == 80
 

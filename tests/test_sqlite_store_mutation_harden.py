@@ -51,6 +51,7 @@ import inspect
 import json
 import pathlib
 import sqlite3
+from collections.abc import Iterator
 
 import pytest
 
@@ -73,7 +74,7 @@ _USER = "chris"
 
 
 @pytest.fixture()
-def conn(tmp_path: pathlib.Path) -> sqlite3.Connection:
+def conn(tmp_path: pathlib.Path) -> Iterator[sqlite3.Connection]:
     from parallax.migrations import migrate_to_latest
 
     c = connect(tmp_path / "store_harden.db")

@@ -68,6 +68,8 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import socket
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -139,6 +141,43 @@ def _recorder(
 
     monkeypatch.setattr(canary_cli, name, _capture)
     return seen
+
+
+class _NetworkBlocked(RuntimeError):
+    """Raised when anything in this process tries to open a real connection."""
+
+
+def _block_all_delivery(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Neutralise every outbound-delivery seam in this process, recording use.
+
+    ``_cmd_check_alerting`` delivers nothing today: it imports argparse, json,
+    os and sys and no HTTP client, and it only echoes ``live_probe`` into its
+    payload. This guard exists for the day the live probe the module documents
+    is implemented, because the test below is the one that arms it.
+
+    ``socket.socket`` and ``socket.create_connection`` are the seam rather
+    than any particular client, because every client a future implementation
+    might reach for -- urllib, http.client, requests, httpx, urllib3 -- bottoms
+    out in one of the two. An attempt is BOTH recorded and refused, so the
+    guarantee does not rest on the assertion that reads the recording: delete
+    that assertion and the connection is still impossible.
+    """
+    attempts: list[str] = []
+
+    def _seam(name: str) -> Callable[..., Any]:
+        def _blocked(*args: Any, **kwargs: Any) -> Any:
+            attempts.append(name)
+            raise _NetworkBlocked(
+                f"{name}{args!r} was called while the canary alerting live "
+                "probe was armed; a live probe must be delivered through an "
+                "injectable sender, never a real connection from a unit test"
+            )
+
+        return _blocked
+
+    monkeypatch.setattr(socket, "socket", _seam("socket.socket"))
+    monkeypatch.setattr(socket, "create_connection", _seam("socket.create_connection"))
+    return attempts
 
 
 # ----------------------------------------------------------------------
@@ -646,7 +685,20 @@ def test_check_alerting_reports_both_webhooks_by_their_env_var_names(
     The variable names ARE the contract with the secret manager: reading a
     differently-named one reports a correctly-configured deployment as missing
     its alerting, and reports the wrong name to the operator trying to fix it.
+
+    THE FIRST FOUR STATEMENTS ARE IN THIS ORDER ON PURPOSE. One of those
+    variables, ``PARALLAX_CANARY_ALERTING_LIVE_PROBE``, is the switch the
+    module documents as "send a real test notification (pages oncall --
+    operators only)", and the two set beside it are credential-shaped. So
+    delivery is neutralised FIRST and the switch is armed SECOND: there is
+    never an instant in which an armed probe faces a live network. Arming
+    first would make the safety of this test rest on ``_cmd_check_alerting``
+    staying inert -- i.e. on the very guard logic a mutant is free to invert,
+    and on the live probe never being implemented by someone who inherits this
+    test green. With the seam neutralised first it rests on nothing.
     """
+    attempts = _block_all_delivery(monkeypatch)
+
     monkeypatch.setenv("PAGERDUTY_M4_CANARY_KEY", "pd-key")
     monkeypatch.setenv("SLACK_WEBHOOK_M4_CANARY", "https://slack.example/hook")
     monkeypatch.setenv("PARALLAX_CANARY_ALERTING_LIVE_PROBE", "1")
@@ -663,6 +715,16 @@ def test_check_alerting_reports_both_webhooks_by_their_env_var_names(
         "status": "configured",
     }
     assert payload["live_probe"] is True
+    # The probe is config-only: an ARMED live_probe still delivered nothing.
+    # This is the line that has to be revisited -- loudly, not silently -- on
+    # the day the live probe is implemented.
+    assert attempts == []
+    # ...and that emptiness is not vacuous. The recorder is installed and is
+    # the only delivery path this process has: it logs the attempt and refuses
+    # it, so a monkeypatch that failed to take cannot masquerade as safety.
+    with pytest.raises(_NetworkBlocked):
+        socket.create_connection(("slack.example", 443))
+    assert attempts == ["socket.create_connection"]
 
 
 def test_check_alerting_live_probe_defaults_to_disabled(

@@ -178,8 +178,15 @@ def test_t1_keeps_samples_for_a_full_five_minutes() -> None:
     assert trigger.evaluate(301.0).observations == 0
 
 
-def test_t1_evaluation_reports_its_threshold_and_window(  # noqa: D103
-) -> None:
+def test_t1_evaluation_reports_its_threshold_and_window() -> None:
+    """T1's evaluation names itself and the two limits it was judged against.
+
+    These are the fields a rollback dashboard renders and an operator reads at
+    3am, and every one of them is a separate literal in the evaluation: the id
+    can be crossed with T2's, the threshold can move, and the window can be
+    reported as T2's 180 s. Pinned as literals rather than read back out of
+    the module, which is what would let the threshold move with them.
+    """
     trigger = T1ErrorRateTrigger()
     trigger.record(0.0, is_error=False)
 

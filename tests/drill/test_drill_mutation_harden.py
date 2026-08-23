@@ -84,6 +84,26 @@ Deliberately NOT enumerated: dropping the ``invocation_lock`` around
 assert, that increment runs exactly once and the mutex is never contended, so a
 kill would depend on a lost update that cannot be forced deterministically from
 outside the function. It is listed here rather than silently omitted.
+
+S6 behaviour delta
+------------------
+
+The S6 rider that accompanies these tests makes exactly one behaviour change
+to the live path, at ``parallax/canary/drill.py:181``: the drain deadline is
+now read on ``perf_counter`` and cut on ``>=`` rather than read on
+``monotonic`` and cut on ``>``. It is observable through the two callers that
+gate an exit code on the drain verdict -- ``_cmd_drain_test`` (via
+``parallax/canary/cli.py:311``) and ``run_full_drill`` (``drill.py:547``, driven
+by ``cli.py:288``), i.e. ``parallax canary --drain-test`` and
+``--rollback-drill``. On Windows the old ``monotonic`` ticks every 15.625 ms,
+so within one tick elapsed quantised to 0.0: any ``--timeout`` below a tick was
+unenforceable and a drain that genuinely overran reported PASS / exit 0. Such a
+drain now force-cuts and exits 1, and ``observations['elapsed_ms']`` -- which
+could previously only read 0.0 / 15.625 / 31.25 on Windows -- is truthful.
+Linux and macOS are unaffected (both clocks are already the same one there).
+No documented invocation is in that range: the drills are run at the 60 s
+default or above. Recorded here because it is a real exit-code change that the
+commit message alone does not surface.
 """
 
 from __future__ import annotations

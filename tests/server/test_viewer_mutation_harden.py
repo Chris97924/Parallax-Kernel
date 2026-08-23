@@ -104,7 +104,7 @@ def _seed_events(db_path: pathlib.Path, *, user_id: str, stamps: list[str]) -> l
 
 
 def _stamps(n: int) -> list[str]:
-    """n ascending ISO stamps, one minute apart."""
+    """n ascending ISO stamps, one second apart."""
     return [f"2026-04-21T00:{i // 60:02d}:{i % 60:02d}.000000+00:00" for i in range(n)]
 
 
@@ -169,18 +169,32 @@ def test_index_serves_the_viewer_page_not_an_empty_body(vclient: TestClient) -> 
 
 @pytest.mark.integration
 def test_events_come_back_newest_first(vclient: TestClient, vdb: pathlib.Path) -> None:
-    """DESC is the contract: a debug viewer opens on the most recent activity.
+    """``ORDER BY created_at DESC`` — both halves of it, the column and the direction.
 
-    Three rows with distinct timestamps is the smallest fixture that can tell
-    ASC from DESC — the existing suite seeds one row, under which the two are
-    indistinguishable. The expected order is written out as literal ids rather
-    than derived by sorting the response.
+    A debug viewer opens on the most recent activity, so DESC is the contract;
+    ``created_at`` is the other half, and it is the half a fixture that seeds
+    rows in timestamp order cannot see. There, insertion order, ``rowid`` and
+    ``event_id`` all ascend together, which makes ``ORDER BY rowid DESC`` — a
+    routine "integer compare beats a string compare on an unindexed TEXT
+    column" rewrite — produce exactly the same rows in exactly the same order
+    as the real thing. Backdated rows are not hypothetical for this table:
+    ``conflict_writer`` accepts an explicit ``now_us_utc`` precisely so a
+    replayed event can carry a ``created_at`` that disagrees with its
+    insertion position, and a first page silently ordered by insertion
+    sequence looks identical to a working one.
+
+    So the stamps are handed over out of order — ``ev-0001`` newest,
+    ``ev-0002`` in the middle, ``ev-0000`` oldest. The expected order is still
+    written out as literal ids rather than derived by sorting the response,
+    and it now matches none of ``created_at ASC``, ``event_id``/``rowid ASC``
+    or ``event_id``/``rowid DESC``.
     """
-    ids = _seed_events(vdb, user_id="u1", stamps=_stamps(3))
+    s0, s1, s2 = _stamps(3)
+    ids = _seed_events(vdb, user_id="u1", stamps=[s0, s2, s1])
 
     rows = vclient.get("/viewer/events.json", params={"user_id": "u1"}).json()
 
-    assert [r["event_id"] for r in rows] == [ids[2], ids[1], ids[0]]
+    assert [r["event_id"] for r in rows] == [ids[1], ids[2], ids[0]]
 
 
 @pytest.mark.integration
@@ -418,16 +432,26 @@ def test_retrieve_q_defaults_to_the_empty_string(vclient: TestClient) -> None:
 
 @pytest.mark.unit
 def test_the_retrieve_kind_vocabulary_is_the_full_declared_set() -> None:
-    """The accepted union must cover every option the page's ``<select>`` offers.
+    """The union as it is declared TODAY — which is not the same as what the route serves.
 
-    Asserted against the declared ``Literal`` rather than by request, because
-    ``timeline`` cannot be exercised end-to-end: the route calls
-    ``explain_retrieve`` without ``since``/``until``, which that function
-    requires for this kind, so the request raises rather than answering. That
-    is a pre-existing production defect recorded in the lane report — NOT
-    fixed here, since this story is tests-only — and it must not be allowed to
-    hide the narrower question this test asks, which is whether the union
-    still admits the value at all.
+    Asserted against the declared ``Literal`` rather than by request, and the
+    gap between the two is the point: ``timeline`` is in the union and in the
+    page's ``<select>`` (``viewer.py:102``), and a request for it does not
+    answer. The route calls ``explain_retrieve`` without ``since``/``until``,
+    which that function requires for this kind
+    (``parallax/retrieve.py:1206-1210``), so a user clicking a shipped
+    dropdown entry gets a 500. That is a pre-existing production defect, NOT
+    fixed here because this story is tests-only — it is carried as a deferred
+    finding, and it is tracked executably by
+    ``test_kind_timeline_is_offered_by_the_page_but_cannot_be_served`` below
+    rather than by this docstring alone.
+
+    So this assertion pins current declared state, not a healthy contract, and
+    the two tests move together. If the defect is resolved by DROPPING
+    ``timeline`` from the ``Literal`` and the ``<select>``, this set shrinks
+    and the marked test goes with it; if it is resolved by forwarding the
+    window, this set is unchanged and the marker comes off. What must not
+    happen is the union quietly losing a value the page still offers.
     """
     import typing
 
@@ -441,14 +465,45 @@ def test_the_retrieve_kind_vocabulary_is_the_full_declared_set() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "pre-existing defect, deferred (this story is tests-only): viewer_retrieve "
+        "does not forward since/until, which explain_retrieve requires for "
+        "kind='timeline', so the option the page's <select> offers cannot be served. "
+        "strict=True turns this into a failure the moment it is fixed."
+    ),
+)
+def test_kind_timeline_is_offered_by_the_page_but_cannot_be_served(
+    vclient: TestClient
+) -> None:
+    """The seventh kind, held open as a tracked defect instead of as prose.
+
+    Without this marker the diff records the bug only in docstrings: nothing
+    fails if it regresses further, and nothing flips green when someone fixes
+    it. The assertion below is therefore the HEALTHY behaviour — a 200, like
+    the other six kinds — and the marker carries the whole statement. Today it
+    xfails; on the day the route forwards the window it xpasses, strict mode
+    fails the suite, and that is what forces this marker and the deferred-
+    finding note above to be retired together.
+    """
+    resp = vclient.get(
+        "/viewer/retrieve.json", params={"user_id": "u1", "kind": "timeline", "q": "x"}
+    )
+
+    assert resp.status_code == 200
+
+
+@pytest.mark.integration
 def test_every_exercisable_kind_answers_and_unknown_kinds_are_rejected(
     vclient: TestClient
 ) -> None:
     """The six kinds the route can actually serve, plus the closed-set check.
 
-    ``timeline`` is deliberately absent — see the test above for why. An
-    unrecognised kind must be a 422 at the boundary rather than reaching the
-    retrieval layer.
+    ``timeline`` is deliberately absent — it is covered by the strict-xfail
+    test directly above, which is where the defect is tracked. An unrecognised
+    kind must be a 422 at the boundary rather than reaching the retrieval
+    layer.
     """
     for kind in ("by_entity", "recent", "file", "decision", "bug", "entity"):
         resp = vclient.get(

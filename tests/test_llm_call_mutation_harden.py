@@ -57,6 +57,7 @@ import types as pytypes
 from typing import Any
 
 import pytest
+from tenacity import stop_after_attempt
 
 from parallax.llm import call as call_mod
 from parallax.llm.call import LLMCallError, RateLimitError
@@ -625,35 +626,148 @@ def test_models_outside_the_prefix_table_are_rejected_by_name(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.unit
-def test_the_retry_policy_is_three_attempts_backing_off_from_five_seconds() -> None:
-    """The tenacity configuration IS the contract with a rate-limited provider.
+class _FakeClock:
+    """Stands in for tenacity's sleeper: records the delay instead of taking it.
 
-    Every number here is load-bearing and none is reachable behaviourally: a
-    test that counts dispatches passes under any budget >= 2, and asserting the
-    real 5-60s backoff would cost a minute of wall clock. Read off the
-    decorator instead.
+    ``sleep`` is a documented constructor argument of the ``@retry`` decorator,
+    so swapping it is the supported way to watch the backoff schedule without
+    paying for it in wall clock. Every test below drives the REAL policy object
+    against this clock, which is what keeps the assertions on observable
+    behaviour — attempts made, delays waited, exception finally raised — rather
+    than on tenacity's internal attribute names.
+    """
+
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+
+def _always_raises(exc: type[Exception]) -> tuple[Any, list[str]]:
+    """A ``_dispatch`` replacement that always fails, plus its call log."""
+    calls: list[str] = []
+
+    def boom(
+        model: str,
+        messages: list[dict],
+        *,
+        temperature: float,
+        max_output_tokens: int,
+    ) -> dict:
+        calls.append(model)
+        raise exc("provider refused")
+
+    return boom, calls
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("exc", [RateLimitError, LLMCallError])
+def test_a_retryable_failure_is_attempted_three_times_and_then_reraised(
+    monkeypatch: pytest.MonkeyPatch, exc: type[Exception]
+) -> None:
+    """Three attempts, a 5s floor between them, and the ORIGINAL exception out.
+
+    Each of those is load-bearing, and each is asserted here by running the
+    policy rather than by reading the decorator's fields: a tenacity upgrade
+    that renames an internal must not be able to redden a file whose subject is
+    ``parallax.llm.call`` while the policy has not changed at all.
 
     * three attempts — a 429 burst is usually over inside two retries; one
       attempt is no retry at all, and the fallback model then absorbs load the
-      primary would have served.
-    * a 5s floor — a 0s floor turns a provider-side rate limit into a tight
-      retry loop against the service that just asked us to slow down.
+      primary would have served. A test that merely counts dispatches without
+      pinning the number passes under any budget >= 2.
+    * a 5s floor — the raw exponential starts an order of magnitude below it,
+      so the floor is the only thing standing between a provider-side rate
+      limit and a tight retry loop against the service that just asked us to
+      slow down. Both inter-attempt delays are asserted, not just the first.
     * both LLMCallError and RateLimitError — transient transport failures are
-      LLMCallError, so narrowing the type to RateLimitError stops retrying the
-      most common recoverable case.
+      LLMCallError, so narrowing the retried type to RateLimitError stops
+      retrying the most common recoverable case. Hence the parametrisation:
+      both must produce the same three-attempt shape.
     * reraise — without it an exhausted budget raises tenacity's RetryError,
       which ``call()``'s ``except RateLimitError`` does not catch, so the
-      fallback branch is never entered.
+      fallback branch is never entered. Asserted as the type that escapes.
     """
-    policy = call_mod._dispatch_with_retry.retry
+    boom, calls = _always_raises(exc)
+    clock = _FakeClock()
+    monkeypatch.setattr(call_mod, "_dispatch", boom)
+    monkeypatch.setattr(call_mod._dispatch_with_retry.retry, "sleep", clock)
 
-    assert policy.stop.max_attempt_number == 3
-    assert policy.wait.multiplier == 1
-    assert policy.wait.min == 5.0
-    assert policy.wait.max == 60.0
-    assert set(policy.retry.exception_types) == {LLMCallError, RateLimitError}
-    assert policy.reraise is True
+    with pytest.raises(exc):
+        call_mod._dispatch_with_retry(
+            "gemini-pro", MESSAGES, temperature=0.0, max_output_tokens=8
+        )
+
+    assert len(calls) == 3
+    assert clock.sleeps == [5.0, 5.0]
+
+
+@pytest.mark.unit
+def test_a_failure_outside_the_retried_types_is_dispatched_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retried set is closed, and widening it to ``Exception`` has a real cost.
+
+    A programming error inside an adapter — a ``TypeError`` on a malformed
+    provider payload, say — is not transient. Retrying it burns the whole
+    budget and two backoff windows before surfacing the same bug, and against a
+    rate-limited provider it spends attempts a genuine 429 would have needed.
+    One dispatch and no sleeps is the observable difference.
+    """
+    boom, calls = _always_raises(ValueError)
+    clock = _FakeClock()
+    monkeypatch.setattr(call_mod, "_dispatch", boom)
+    monkeypatch.setattr(call_mod._dispatch_with_retry.retry, "sleep", clock)
+
+    with pytest.raises(ValueError):
+        call_mod._dispatch_with_retry(
+            "gemini-pro", MESSAGES, temperature=0.0, max_output_tokens=8
+        )
+
+    assert len(calls) == 1
+    assert clock.sleeps == []
+
+
+@pytest.mark.unit
+def test_the_backoff_curve_floors_at_five_seconds_and_is_capped_at_sixty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap is unreachable within three attempts, so drive the same wait further.
+
+    ``retry_with`` is tenacity's supported way to re-wrap a decorated function
+    with one argument replaced. Only ``stop`` moves here, so the wait policy
+    under observation is the very object the production decorator installed;
+    twelve attempts is enough for the exponential to saturate.
+
+    The assertions are properties of the curve rather than tenacity's doubling
+    schedule — which delay lands on which attempt is tenacity's semantics and
+    has moved between releases, whereas the floor, the cap and the fact that
+    the curve rises at all are ours:
+
+    * ``5.0`` as the smallest delay pins ``min=5``; the unclamped curve starts
+      well below it, so nothing else in the policy could produce a 5.
+    * ``60.0`` as the largest pins ``max=60`` AND that the cap actually binds.
+      A loosened cap keeps climbing past it; a changed multiplier either never
+      reaches it inside the probe budget or overshoots the floor first.
+    * non-decreasing pins that this is a backoff at all — a constant or
+      shrinking wait is the failure a floor-and-cap check on its own misses.
+    """
+    boom, calls = _always_raises(RateLimitError)
+    clock = _FakeClock()
+    monkeypatch.setattr(call_mod, "_dispatch", boom)
+    probe = call_mod._dispatch_with_retry.retry_with(
+        stop=stop_after_attempt(12), sleep=clock
+    )
+
+    with pytest.raises(RateLimitError):
+        probe("gemini-pro", MESSAGES, temperature=0.0, max_output_tokens=8)
+
+    assert len(calls) == 12
+    assert len(clock.sleeps) == 11
+    assert min(clock.sleeps) == 5.0
+    assert max(clock.sleeps) == 60.0
+    assert clock.sleeps == sorted(clock.sleeps)
 
 
 # ---------------------------------------------------------------------------

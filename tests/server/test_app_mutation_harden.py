@@ -370,13 +370,19 @@ def test_dual_read_snapshot_middleware_sits_outside_traffic_source(
     is read against that span. Swapping the two calls is invisible to every
     behavioural test — both middlewares still run, both still set their
     ``request.state`` attribute — so stack position is the only observable.
+
+    Asserted as relative position rather than as the exact stack, because
+    relative position is the whole of the contract: adding a CORS or
+    request-id middleware later disturbs neither the gauge's span nor the
+    drain gate, and an exact-list assertion would redden on it.
     """
     app = _app(safety_db)
 
-    assert [m.cls for m in app.user_middleware] == [
-        DualReadSnapshotMiddleware,
-        TrafficSourceMiddleware,
-    ]
+    installed = [m.cls for m in app.user_middleware]
+
+    assert installed.index(DualReadSnapshotMiddleware) < installed.index(
+        TrafficSourceMiddleware
+    )
 
 
 # ---------------------------------------------------------------------------

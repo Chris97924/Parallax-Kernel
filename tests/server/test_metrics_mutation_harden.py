@@ -9,7 +9,11 @@ below close nine; the tenth is excluded as an equivalent mutant rather than
 killed, on the argument set out below.
 
 Tally — applied 30 / killed by the pre-existing suites 20 / killed by the tests
-below 9 / equivalent (excluded) 1 / unaddressed 0.
+below 9 / equivalent (excluded) 1 / unaddressed 0. That tally is the record and stands on its own;
+the line below is archival provenance for it, not a dependency of this file.
+
+Evidence manifest: mutations-w4-*.json in the overnight batch archive
+E:/Workspace/.agents/_reports/land-menu-20260823/ (driver-side, not in repo).
 
 The one equivalent mutant, and why it is not killable
 ------------------------------------------------------

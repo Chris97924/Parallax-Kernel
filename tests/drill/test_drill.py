@@ -17,6 +17,7 @@ from collections.abc import Iterator
 
 import pytest
 
+import parallax.canary.drill as drill_mod
 from parallax.canary.audit_log import AuditLog
 from parallax.canary.drill import (
     DEFAULT_DRAIN_TIMEOUT_S,
@@ -40,6 +41,33 @@ def audit_log(shared_db: pathlib.Path) -> Iterator[AuditLog]:
         yield log
     finally:
         log.close()
+
+
+class _VirtualClock:
+    """Stand-in for the ``time`` module inside :mod:`parallax.canary.drill`.
+
+    ``perf_counter`` advances by exactly ``tick`` and ONLY when the drill
+    sleeps, so a drain's elapsed time is arithmetic instead of a measurement
+    of how busy the host happens to be. The drill reads its deadline through
+    the module-level ``time`` name, which is the seam this class is injected
+    at (``monkeypatch.setattr(drill_mod, "time", clock)``).
+
+    ``monotonic`` is deliberately absent. The drain must read the
+    high-resolution clock; a revert to the coarse one raises AttributeError
+    here rather than quietly passing.
+    """
+
+    def __init__(self, tick: float) -> None:
+        self.tick = tick
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += self.tick
 
 
 # ----------------------------------------------------------------------
@@ -73,6 +101,43 @@ def test_drain_drill_force_cut_when_deadline_misses() -> None:
     drain_step = next(s for s in report.steps if s.name == "drain_within_deadline")
     assert drain_step.status == DrillStatus.FAIL
     assert int(drain_step.observations["residual_count"]) > 0
+
+
+def test_drain_drill_small_positive_timeout_still_drains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A small but non-zero budget must still drain normally.
+
+    Companion to the force-cut test above: the deadline comparison is ">="
+    so that timeout_s=0.0 cuts immediately, and this pins that the change
+    did not turn every short timeout into a cut.
+
+    The clock is VIRTUAL on purpose. Timing four real ``sleep(0.001)`` calls
+    against a real 200 ms budget would put a wall-clock race back into the
+    very file whose Windows red was a clock artefact: it would go red once
+    scheduling delay reached ~50 ms per sleep, which a loaded host reaches,
+    and it would present as ``residual_count > 0`` on Windows only — exactly
+    the symptom that took the longest to diagnose. Here each request advances
+    the clock by exactly 1/1024 s, so the four of them spend 3.90625 ms of
+    the 200 ms budget no matter what else the machine is doing, and every
+    number below is decided rather than measured.
+    """
+    clock = _VirtualClock(tick=1 / 1024)
+    monkeypatch.setattr(drill_mod, "time", clock)
+
+    report = run_drain_drill(
+        in_flight_count=4, timeout_s=0.2, dry_run=True, sleep=clock.sleep
+    )
+
+    assert report.overall == DrillStatus.PASS
+    drain_step = next(s for s in report.steps if s.name == "drain_within_deadline")
+    assert drain_step.status == DrillStatus.PASS
+    assert int(drain_step.observations["drained_count"]) == 4
+    assert int(drain_step.observations["residual_count"]) == 0
+    # The drain really ran on the injected clock — 4 ticks of 1/1024 s — so a
+    # test that silently fell back to the host clock cannot pass this line.
+    assert drain_step.observations["elapsed_ms"] == 3.906
+    assert clock.sleeps == [0.001] * 4
 
 
 def test_drain_drill_zero_in_flight_is_invalid() -> None:

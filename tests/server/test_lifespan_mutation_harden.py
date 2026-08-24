@@ -4,8 +4,14 @@ Additive companion to ``tests/server/test_lifespan.py``,
 ``tests/server/test_drain_timeout_durable_counter_106.py``,
 ``tests/server/test_drain_timeout_durable_signal_106.py`` and
 ``tests/server/test_app_t14_wiring.py``. Every test below exists because a
-semantic mutant survived that set. Patches and exit codes are in
-``mutations-w4-obs.json``.
+semantic mutant survived that set.
+
+Tally — applied 17 / killed by the pre-existing suites 8 / killed by the tests
+below 9 / equivalent (excluded) 0 / unaddressed 0. That tally is the record and stands on its own;
+the line below is archival provenance for it, not a dependency of this file.
+
+Evidence manifest: mutations-w4-*.json in the overnight batch archive
+E:/Workspace/.agents/_reports/land-menu-20260823/ (driver-side, not in repo).
 
 The shape of the blind spot
 ---------------------------

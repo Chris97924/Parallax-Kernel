@@ -198,7 +198,7 @@ def test_frozen_mock_cannot_violate_the_dry_run_invariant() -> None:
     """
     router = MockMemoryRouter()
     request = BackfillRequest(user_id="u1", crosswalk_version="v1")
-    with pytest.raises(NotImplementedError, match="MockMemoryRouter.backfill"):
+    with pytest.raises(NotImplementedError, match=r"MockMemoryRouter\.backfill"):
         router.backfill(request)
 
 

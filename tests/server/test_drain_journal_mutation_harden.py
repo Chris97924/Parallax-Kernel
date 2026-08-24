@@ -8,7 +8,13 @@ against that set; eight died on contact and fourteen survived. Every survivor
 has a named killer below. Four further tests are marked COMPANION: they close no
 mutant of their own and are kept only because they complete a table that reads
 wrong half-written — the resolution-order pair and the ``readable`` quartet.
-Patches and exit codes are in ``mutations-w4-obs.json``.
+
+Tally — applied 22 / killed by the pre-existing suites 8 / killed by the tests
+below 14 / equivalent (excluded) 0 / unaddressed 0. That tally is the record and stands on its own;
+the line below is archival provenance for it, not a dependency of this file.
+
+Evidence manifest: mutations-w4-*.json in the overnight batch archive
+E:/Workspace/.agents/_reports/land-menu-20260823/ (driver-side, not in repo).
 
 The shape of the blind spot
 ---------------------------

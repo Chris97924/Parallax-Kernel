@@ -5,10 +5,32 @@ Additive companion to ``tests/server/test_metrics_endpoint.py``,
 ``tests/server/test_metrics_never_on_wire_102.py`` and ``tests/observability/``.
 Thirty semantic mutants were applied to a pristine tree one at a time against
 that whole set; twenty were killed by it. Of the ten that survived, the tests
-below close nine; the tenth (S2-M13) is excluded as an equivalent mutant rather
-than killed — see the manifest, which backs the equivalence with 207,380
-differential inputs and zero differing outputs. The patches and exit codes are
-in ``mutations-w4-obs.json``.
+below close nine; the tenth is excluded as an equivalent mutant rather than
+killed, on the argument set out below.
+
+Tally — applied 30 / killed by the pre-existing suites 20 / killed by the tests
+below 9 / equivalent (excluded) 1 / unaddressed 0. That tally is the record and stands on its own;
+the line below is archival provenance for it, not a dependency of this file.
+
+Evidence manifest: mutations-w4-*.json in the overnight batch archive
+E:/Workspace/.agents/_reports/land-menu-20260823/ (driver-side, not in repo).
+
+The one equivalent mutant, and why it is not killable
+------------------------------------------------------
+In ``_sanitize_metric_name`` the label-selector strip is ``name[:brace]``;
+the mutant keeps the opening brace with ``name[: brace + 1]``. It is
+unobservable, and the argument is checkable against this repo alone. Because
+the truncation cuts at the brace, the retained ``{`` is always the LAST
+character of the string. ``_METRIC_NAME_INVALID_RE`` then rewrites it to ``_``,
+``_MULTI_UNDERSCORE_RE`` collapses it into any underscore already in front of
+it, and the terminal ``.strip("_")`` removes trailing underscores
+unconditionally — so the extra character cannot survive to the output on any
+input. It cannot manufacture a ``parallax_`` prefix either: the prefix check
+runs BEFORE the character substitution, so a brace that later becomes an
+underscore is never seen by it. Corroborated by differential execution of both
+variants over ~207k inputs (exhaustive to length 4 over the
+``a _ { } 1 : ' -`` alphabet plus ``parallax_``, plus 200k randomised strings)
+with zero differing outputs.
 
 The shape of what the existing suites could not see
 ---------------------------------------------------

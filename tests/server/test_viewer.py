@@ -430,6 +430,63 @@ class TestViewerRetrieveJson:
         assert any(h.get("entity_kind") == "claim" for h in hits)
 
 
+class TestViewerRetrieveTimeline:
+    """kind=timeline previously always crashed with a 500.
+
+    ``explain_retrieve(kind='timeline', ...)`` raises ``ValueError`` when
+    ``since``/``until`` are missing, but the route never accepted or forwarded
+    those query params and never caught the ``ValueError`` — so any
+    ``kind=timeline`` request hit an unhandled exception -> 500. Fixed by
+    accepting optional ``since``/``until`` query params and translating
+    missing-or-invalid values into a 422 instead of letting the ValueError
+    propagate.
+    """
+
+    def test_missing_since_until_returns_422_naming_them(
+        self, viewer_client: TestClient
+    ) -> None:
+        resp = viewer_client.get(
+            "/viewer/retrieve.json",
+            params={"kind": "timeline", "user_id": "u1"},
+        )
+        assert resp.status_code == 422, (
+            f"expected 422, got {resp.status_code}: {resp.text}"
+        )
+        detail = str(resp.json().get("detail", ""))
+        assert "since" in detail and "until" in detail, (
+            f"422 detail must name since/until, got: {detail!r}"
+        )
+
+    def test_since_and_until_returns_200_timeline_trace(
+        self, viewer_client: TestClient
+    ) -> None:
+        resp = viewer_client.get(
+            "/viewer/retrieve.json",
+            params={
+                "kind": "timeline",
+                "user_id": "u1",
+                "since": "2026-04-20T00:00:00Z",
+                "until": "2026-04-22T00:00:00Z",
+            },
+        )
+        assert resp.status_code == 200, (
+            f"expected 200, got {resp.status_code}: {resp.text}"
+        )
+        data = resp.json()
+        assert data["kind"] == "timeline"
+        assert "stages" in data
+
+    def test_non_timeline_kind_unaffected_by_new_params(
+        self, viewer_client: TestClient
+    ) -> None:
+        resp = viewer_client.get(
+            "/viewer/retrieve.json",
+            params={"q": "Paris", "kind": "by_entity", "user_id": "u1"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["kind"] == "entity"
+
+
 class TestViewerRetrieveCrossUserIsolation:
     """Safety-critical: viewer_retrieve must never leak across principals.
 

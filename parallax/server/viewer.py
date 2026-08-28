@@ -101,6 +101,8 @@ pre{background:#1a1a1a;padding:.5rem;overflow:auto;max-height:400px;border:1px s
       <option>by_entity</option><option>recent</option><option>file</option>
       <option>decision</option><option>bug</option><option>timeline</option>
     </select>
+    since: <input id="rt-since" value="" placeholder="ISO-8601, timeline only">
+    until: <input id="rt-until" value="" placeholder="ISO-8601, timeline only">
     <button onclick="loadRetrieve()">explain</button>
   </div>
   <pre id="rt-out">(click explain)</pre>
@@ -162,9 +164,13 @@ async function loadRetrieve() {
   const q = document.getElementById('rt-q').value.trim();
   const kindRaw = document.getElementById('rt-kind').value;
   const kind = kindRaw === 'by_entity' ? 'by_entity' : kindRaw;
-  const url = '/viewer/retrieve.json?user_id=' + encodeURIComponent(uid)
+  const since = document.getElementById('rt-since').value.trim();
+  const until = document.getElementById('rt-until').value.trim();
+  let url = '/viewer/retrieve.json?user_id=' + encodeURIComponent(uid)
             + '&q=' + encodeURIComponent(q)
             + '&kind=' + encodeURIComponent(kind);
+  if (since) url += '&since=' + encodeURIComponent(since);
+  if (until) url += '&until=' + encodeURIComponent(until);
   const data = await apiFetch(url);
   if (data) document.getElementById('rt-out').textContent = JSON.stringify(data, null, 2);
 }

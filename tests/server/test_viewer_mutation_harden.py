@@ -432,26 +432,26 @@ def test_retrieve_q_defaults_to_the_empty_string(vclient: TestClient) -> None:
 
 @pytest.mark.unit
 def test_the_retrieve_kind_vocabulary_is_the_full_declared_set() -> None:
-    """The union as it is declared TODAY — which is not the same as what the route serves.
+    """The union as it is declared today — now matched by what the route serves.
 
-    Asserted against the declared ``Literal`` rather than by request, and the
-    gap between the two is the point: ``timeline`` is in the union and in the
-    page's ``<select>`` (``viewer.py:102``), and a request for it does not
-    answer. The route calls ``explain_retrieve`` without ``since``/``until``,
-    which that function requires for this kind
-    (``parallax/retrieve.py:1206-1210``), so a user clicking a shipped
-    dropdown entry gets a 500. That is a pre-existing production defect, NOT
-    fixed here because this story is tests-only — it is carried as a deferred
-    finding, and it is tracked executably by
-    ``test_kind_timeline_is_offered_by_the_page_but_cannot_be_served`` below
-    rather than by this docstring alone.
+    Asserted against the declared ``Literal`` rather than by request.
+    ``timeline`` is in the union and in the page's ``<select>``
+    (``viewer.py:102``); a request for it used to always 500 because the
+    route called ``explain_retrieve`` without ``since``/``until``, which that
+    function requires for this kind (``parallax/retrieve.py:1206-1210``), and
+    the page's own form had no way to supply them. Both halves of that defect
+    are fixed now: ``viewer_retrieve`` forwards ``since``/``until`` (missing
+    either is a 422 naming them) and the page's retrieve tab has matching
+    ``since``/``until`` inputs — see
+    ``test_kind_timeline_is_offered_by_the_page_and_can_be_served`` below,
+    which replaced the strict-xfail that used to track this as a deferred
+    finding.
 
-    So this assertion pins current declared state, not a healthy contract, and
-    the two tests move together. If the defect is resolved by DROPPING
-    ``timeline`` from the ``Literal`` and the ``<select>``, this set shrinks
-    and the marked test goes with it; if it is resolved by forwarding the
-    window, this set is unchanged and the marker comes off. What must not
-    happen is the union quietly losing a value the page still offers.
+    This assertion pins the declared set unchanged: the defect was resolved
+    by forwarding the window rather than by dropping ``timeline`` from the
+    ``Literal`` and the ``<select>``, so the union is exactly what it was
+    before. What must not happen is the union quietly losing a value the page
+    still offers.
     """
     import typing
 
@@ -465,33 +465,39 @@ def test_the_retrieve_kind_vocabulary_is_the_full_declared_set() -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "pre-existing defect, deferred (this story is tests-only): viewer_retrieve "
-        "does not forward since/until, which explain_retrieve requires for "
-        "kind='timeline', so the option the page's <select> offers cannot be served. "
-        "strict=True turns this into a failure the moment it is fixed."
-    ),
-)
-def test_kind_timeline_is_offered_by_the_page_but_cannot_be_served(
+def test_kind_timeline_is_offered_by_the_page_and_can_be_served(
     vclient: TestClient
 ) -> None:
-    """The seventh kind, held open as a tracked defect instead of as prose.
+    """The seventh kind: no longer a tracked defect, now a genuine round trip.
 
-    Without this marker the diff records the bug only in docstrings: nothing
-    fails if it regresses further, and nothing flips green when someone fixes
-    it. The assertion below is therefore the HEALTHY behaviour — a 200, like
-    the other six kinds — and the marker carries the whole statement. Today it
-    xfails; on the day the route forwards the window it xpasses, strict mode
-    fails the suite, and that is what forces this marker and the deferred-
-    finding note above to be retired together.
+    This replaces the prior strict-xfail (which pinned a 500 as the expected,
+    unhealthy state). Two things had to be true before the dropdown's
+    ``timeline`` option stopped lying: the route must forward ``since``/
+    ``until`` to ``explain_retrieve``, AND the page's own retrieve form must
+    have controls to supply them — a route that accepts the params is not
+    enough if nothing on the page can ever populate them. Both are checked
+    here: the shipped HTML exposes ``since``/``until`` inputs, and a request
+    built the way the page's own ``loadRetrieve()`` builds it (user_id, kind,
+    q, since, until — see ``viewer.py``) answers 200 with a real timeline
+    trace, not just a 200 for some other kind.
     """
+    html = vclient.get("/viewer/").text
+    assert 'id="rt-since"' in html, "retrieve tab must offer a since input"
+    assert 'id="rt-until"' in html, "retrieve tab must offer an until input"
+
     resp = vclient.get(
-        "/viewer/retrieve.json", params={"user_id": "u1", "kind": "timeline", "q": "x"}
+        "/viewer/retrieve.json",
+        params={
+            "user_id": "u1",
+            "kind": "timeline",
+            "q": "x",
+            "since": "2026-04-20T00:00:00Z",
+            "until": "2026-04-22T00:00:00Z",
+        },
     )
 
     assert resp.status_code == 200
+    assert resp.json()["kind"] == "timeline"
 
 
 @pytest.mark.integration
@@ -500,10 +506,11 @@ def test_every_exercisable_kind_answers_and_unknown_kinds_are_rejected(
 ) -> None:
     """The six kinds the route can actually serve, plus the closed-set check.
 
-    ``timeline`` is deliberately absent — it is covered by the strict-xfail
-    test directly above, which is where the defect is tracked. An unrecognised
-    kind must be a 422 at the boundary rather than reaching the retrieval
-    layer.
+    ``timeline`` is deliberately absent — it requires ``since``/``until``,
+    which this loop's bare params don't supply, so it is covered separately by
+    ``test_kind_timeline_is_offered_by_the_page_and_can_be_served`` above. An
+    unrecognised kind must be a 422 at the boundary rather than reaching the
+    retrieval layer.
     """
     for kind in ("by_entity", "recent", "file", "decision", "bug", "entity"):
         resp = vclient.get(

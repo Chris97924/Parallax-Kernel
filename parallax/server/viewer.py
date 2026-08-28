@@ -17,7 +17,7 @@ import dataclasses
 import sqlite3
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from parallax.retrieve import RetrievalTrace, claims_by_user, explain_retrieve
@@ -264,6 +264,12 @@ def viewer_retrieve(
         "by_entity", "recent", "file", "decision", "bug", "entity", "timeline"
     ] = Query("by_entity", description="retrieval kind"),
     user_id: str = Query(..., min_length=1, max_length=128),
+    since: str | None = Query(
+        None, description="ISO-8601 window start; required for kind=timeline"
+    ),
+    until: str | None = Query(
+        None, description="ISO-8601 window end; required for kind=timeline"
+    ),
     conn: sqlite3.Connection = _CONN_DEP,
 ) -> dict[str, Any]:
     """Run explain_retrieve and return serialized RetrievalTrace, scoped.
@@ -278,6 +284,12 @@ def viewer_retrieve(
             in favour of the authenticated principal (a disagreement is
             logged as a leak attempt). In single-token / open mode it is
             used as-is, and is required.
+        since: ISO-8601 window start, forwarded to ``explain_retrieve``.
+            Required (together with ``until``) when ``kind=timeline``;
+            ignored for every other kind.
+        until: ISO-8601 window end, forwarded to ``explain_retrieve``.
+            Required (together with ``since``) when ``kind=timeline``;
+            ignored for every other kind.
         conn: Injected DB connection.
 
     Returns:
@@ -290,14 +302,35 @@ def viewer_retrieve(
         retrieve over its OWN data; trusting the request-supplied
         ``user_id`` was an IDOR that explained any user's retrieval to any
         valid-token holder.
+
+        ``kind=timeline`` used to always raise an uncaught ``ValueError``
+        inside :func:`parallax.retrieve.explain_retrieve` (since/until were
+        never accepted or forwarded here) -> unhandled exception -> 500.
+        Missing ``since``/``until`` is now rejected explicitly as a 422, and
+        any other ``ValueError`` raised by ``explain_retrieve`` (e.g. an
+        unparseable ISO timestamp, or ``since`` after ``until``) is also
+        translated to a 422 instead of propagating as a 500.
     """
     resolved_user_id = current_user_id(request, user_id)
     # Normalize the UI alias "by_entity" → "entity"
     resolved_kind = "entity" if kind == "by_entity" else kind
-    trace: RetrievalTrace = explain_retrieve(
-        conn,
-        kind=resolved_kind,
-        user_id=resolved_user_id,
-        query_text=q,
-    )
+    if resolved_kind == "timeline" and (since is None or until is None):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "viewer_retrieve(kind='timeline'): since and until query "
+                "params are required"
+            ),
+        )
+    try:
+        trace: RetrievalTrace = explain_retrieve(
+            conn,
+            kind=resolved_kind,
+            user_id=resolved_user_id,
+            query_text=q,
+            since=since,
+            until=until,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return dataclasses.asdict(trace)

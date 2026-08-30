@@ -2,9 +2,15 @@
 
 Two scenarios:
 
-* Mid-write crash: child process writes rows in a tight loop printing
-  ``ok i`` after each commit. Parent reads stdout until at least 100
-  commits land, then ``terminate()`` s. The recovery path actually
+* Mid-write crash: child process writes rows one at a time, each
+  gated by an explicit ``go``/``ok`` handshake over stdin/stdout (see
+  ``_child_writer_script``). Parent drives the handshake until at
+  least 100 commits land, then withholds the next ``go`` and
+  ``terminate()`` s — at that instant the child is guaranteed to be
+  parked in its stdin ``readline()``, not mid-commit or mid-print, so
+  the parent's count of acknowledged commits is exact by construction
+  (see ``_child_writer_script`` docstring for why a free-running child
+  could not offer that guarantee). The recovery path actually
   exercised is WAL replay on reopen — 100 small rows do NOT generate
   enough WAL pages (~20-25 KB) to cross the
   ``wal_autocheckpoint=200`` pages (~1.6 MB) threshold mid-run, so
@@ -19,7 +25,10 @@ Two scenarios:
 * Mid-bootstrap crash: child opens audit_db (which runs
   ``CREATE TABLE IF NOT EXISTS`` + schema_version INSERT OR IGNORE)
   and idles. Parent terminates after the child confirms bootstrap.
-  Parent re-opens — bootstrap must be idempotent and succeed.
+  Parent re-opens — bootstrap must be idempotent and succeed. This
+  scenario is a single one-shot event (bootstrap, then idle) with no
+  repeated commit/observe cycle, so it is not subject to the race
+  described above and needs no handshake.
 """
 
 from __future__ import annotations
@@ -42,15 +51,39 @@ _MIN_COMMITTED_BEFORE_KILL = 100  # ≥ ~1 WAL frame batch; exercises recovery
 
 
 def _child_writer_script(db_path: pathlib.Path) -> str:
-    """Child bootstraps + writes rows as fast as possible.
+    """Child writes one row per ``go`` line read from stdin.
 
     Each ``ok i`` line prints AFTER ``write_audit_row`` returns from a
-    successful COMMIT. Therefore parent's ``max(ok i)`` is the exact
-    high-water mark of acknowledged commits. Rows are written in order
-    starting at i=0, so rows 0..max are all committed; any further row
-    (max+1 or beyond) either committed before COMMIT returned or did
-    not — and the assertion ``count == max+1`` is the strict atomicity
-    check that catches partial-commit bugs.
+    successful COMMIT — so far this matches the original design.
+    What changed: the child no longer free-runs. It blocks in
+    ``sys.stdin.readline()`` *before* starting each row, and only
+    begins the next commit once the parent has sent another ``go``.
+
+    Why this was necessary: the previous version wrote rows in a tight
+    loop with no gate, relying on the parent's read-then-terminate
+    timing to bound the count. But COMMIT-durable and
+    print-flushed-to-the-pipe are two independent OS-level events with
+    a real (if usually tiny) gap between them — a child that gets
+    preempted after ``write_audit_row`` returns but before the
+    ``sys.stdout.write``/``flush`` for that row's ``ok i`` line can be
+    ``terminate()``-d in that gap: the row is durably committed but
+    its acknowledgment never reached the parent. Under an idle machine
+    this window is sub-millisecond and essentially never observed
+    (25/25 clean runs locally); under load (verified by running 16
+    CPU-bound busy-loops on this 20-core host alongside the test, 30
+    iterations) it reproduced in 12/30 runs, always as ``count ==
+    max_committed + 2`` — exactly one extra committed-but-unannounced
+    row, consistent with the single-threaded child having at most one
+    row "in flight" across that gap at kill time.
+
+    The handshake removes the gap from the parent's decision entirely:
+    the child cannot start row i+1's commit until it has read a fresh
+    ``go``, so once the parent has read row i's ``ok`` line and simply
+    withholds the next ``go``, the child is provably parked — not
+    mid-commit, not mid-print — before the parent calls
+    ``terminate()``. Rows are written in order starting at i=0, so
+    rows 0..max are all committed; the assertion ``count == max+1`` is
+    the strict atomicity check that catches partial-commit bugs.
     """
     return textwrap.dedent(
         f"""
@@ -64,6 +97,15 @@ def _child_writer_script(db_path: pathlib.Path) -> str:
         try:
             i = 0
             while True:
+                # Deterministic handshake: block here until the parent
+                # sends an explicit go-ahead. The parent only advances
+                # this once it has read the previous row's "ok" line,
+                # so this child is never mid-commit / mid-print at the
+                # instant the parent decides to stop sending "go" and
+                # terminates instead.
+                signal = sys.stdin.readline()
+                if not signal:
+                    break
                 row = canonicalize_row({{
                     "claim_id": f"0193e2b1-0001-7000-8000-{{i:012x}}",
                     "envelope_message_id": str(uuid.uuid4()),
@@ -141,16 +183,32 @@ class TestCrashMidWrite:
 
         proc = subprocess.Popen(
             [sys.executable, str(script)],
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,  # line-buffered
         )
         assert proc.stdout is not None
+        assert proc.stdin is not None
 
+        # Deterministic go/ok handshake (see _child_writer_script's
+        # docstring for why a free-running child cannot give an exact
+        # count under scheduling pressure). The parent drives one
+        # commit at a time: send "go", read the resulting "ok i" line,
+        # repeat. Once _MIN_COMMITTED_BEFORE_KILL commits are
+        # acknowledged, the parent simply stops sending "go" — the
+        # child is then guaranteed to be blocked in its stdin
+        # readline(), never mid-commit, so terminate() below cannot
+        # race an unannounced commit.
         max_seen = -1
         deadline = time.time() + 30.0
         while time.time() < deadline and max_seen < (_MIN_COMMITTED_BEFORE_KILL - 1):
+            try:
+                proc.stdin.write("go\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                break  # child died; count assertion below reports it with stderr
             line = proc.stdout.readline()
             if not line:
                 break
@@ -165,7 +223,10 @@ class TestCrashMidWrite:
             proc.wait(timeout=5)
 
         # Drain remaining buffered stdout so the high-water mark is the
-        # MAX of in-band + post-terminate buffered rows. Capture any
+        # MAX of in-band + post-terminate buffered rows. With the
+        # handshake above this should always be empty (the child never
+        # writes without a "go" it did not receive), but the drain is
+        # kept as a defensive belt-and-braces check. Capture any
         # non-``ok`` lines (e.g. child-side tracebacks) so a count
         # mismatch surfaces the underlying child error instead of a
         # cryptic numeric diff.

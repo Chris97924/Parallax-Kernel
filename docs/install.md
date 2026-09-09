@@ -70,6 +70,6 @@ Parallax requires **Python 3.11 or later**. GitHub Actions CI runs on Python 3.1
 |---|---|---|
 | `[dev]` | pytest, ruff, hypothesis, coverage | Development and testing |
 | `[server]` | FastAPI, uvicorn | Running `parallax serve` |
-| `[extract]` | httpx, anthropic | Shadow-write claim extraction |
+| `[extract]` | httpx | Shadow-write claim extraction |
 | `[cloud]` | boto3 | S3-backed backup/restore |
 | `[llm]` | google-genai | Calling Gemini models via `parallax.llm.call` / longmemeval eval |

@@ -666,3 +666,206 @@ def test_stop_reason_is_persisted_and_replayed(
     stored = json.loads(_rows(isolated_cache)[0][2])
     assert stored["stop_reason"] == "stop"
     assert "_cached" not in stored
+
+
+# ---------------------------------------------------------------------------
+# r2 — the four minors the independent verifier raised against round 1
+# ---------------------------------------------------------------------------
+
+
+class _OllamaStatusResponse:
+    """Minimal ``httpx.Response`` stand-in carrying only a status and a body."""
+
+    def __init__(self, status: int) -> None:
+        self.status_code = status
+        self.text = "boom"
+
+    def raise_for_status(self) -> None:
+        raise httpx.HTTPStatusError("err", request=None, response=None)
+
+    def json(self) -> dict[str, Any]:  # pragma: no cover - never reached
+        return {}
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (500, LLMTransientError),
+        (501, LLMTransientError),
+        (502, LLMTransientError),
+        (503, LLMTransientError),
+        (504, LLMTransientError),
+        (505, LLMTransientError),
+        (507, LLMTransientError),
+        (529, LLMTransientError),
+        (400, LLMCallError),
+    ],
+)
+def test_all_5xx_statuses_are_transient(
+    status: int, expected: type[Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every 5xx reaches the fallback, not just the five anyone thought to list.
+
+    Round 1 classified transience off a closed set {408, 425, 500, 502, 503,
+    504, 529}. A 501, 505, 507, 508 or 511 fell through to a bare
+    ``LLMCallError``: tenacity still retried it, so the failure looked handled,
+    but ``call()`` catches only ``RateLimitError`` and ``LLMTransientError``, so
+    the configured ``fallback_model`` was structurally unreachable for those
+    codes. The parametrization walks the raw status through ``_call_ollama``'s
+    real classification rather than asserting set membership, so a refactor that
+    reintroduces an enumeration fails here.
+
+    529 is included because round 1 never exercised it through the status path
+    at all — its fallback test injected an already-constructed
+    ``LLMTransientError``, so nothing walked raw status -> classification.
+    400 is the control: a malformed request is not fixed by waiting.
+    """
+    monkeypatch.delenv("PARALLAX_OLLAMA_THINK", raising=False)
+    monkeypatch.setattr(
+        httpx, "post", lambda *_a, _s=status, **_kw: _OllamaStatusResponse(_s)
+    )
+
+    with pytest.raises(expected) as exc_info:
+        call_mod._call_ollama(
+            "ollama:qwen3.6:latest", MESSAGES, temperature=0.0, max_output_tokens=8
+        )
+
+    assert type(exc_info.value) is expected, f"status {status}"
+    # The consequence, not just the class: only a transient reaches the fallback.
+    assert isinstance(exc_info.value, (RateLimitError, LLMTransientError)) is (
+        expected is LLMTransientError
+    )
+    assert call_mod._is_transient_status(status) is (expected is LLMTransientError)
+
+
+@pytest.mark.parametrize(
+    ("message", "is_rate_limit"),
+    [
+        # Digits that merely CONTAIN 429 -- a request id, a longer number, a
+        # token count. None of these is a status.
+        ("provider failed on req-4290", False),
+        ("sequence 14291 rejected", False),
+        ("budget exceeded: tokens=4290", False),
+        # The shapes a provider actually uses to state the status.
+        ("HTTP 429 Too Many Requests", True),
+        ("upstream returned status 429", True),
+        ("rate_limit_error: slow down", True),
+    ],
+)
+def test_rate_limit_probe_is_word_bounded(message: str, is_rate_limit: bool) -> None:
+    """The last-resort text probe must not read digits out of a request id.
+
+    ``_classify_provider_error`` word-bounds the transient status codes for
+    exactly this reason, but round 1 left the rate-limit fallback as a bare
+    ``429`` substring test. An opaque provider exception whose message carried a
+    request id like ``req-4290`` was therefore classified ``RateLimitError``,
+    which is not merely a mislabel: it makes a permanent failure look like a
+    capacity event, so it is retried three times and then answered by the
+    fallback model instead of surfacing.
+
+    Only the last-resort path is exercised here -- a bare ``RuntimeError``
+    carries no status attribute and no known SDK type, so classification falls
+    all the way through to the text.
+    """
+    classified = call_mod._classify_provider_error(RuntimeError(message))
+
+    assert isinstance(classified, RateLimitError) is is_rate_limit, message
+    if not is_rate_limit:
+        # It must not be laundered into the other retry class either.
+        assert type(classified) is LLMCallError
+
+
+def test_legacy_cache_row_replays_with_stop_reason_unknown(
+    isolated_cache: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row written before ``stop_reason`` existed still replays with the key.
+
+    ``call()`` documents ``stop_reason`` as always present, and every row
+    written from now on carries it -- but ``~/.parallax/llm_cache.sqlite`` is a
+    persistent file full of rows written before this change. Handing those back
+    unchanged makes the contract true only for a cache that has been wiped, so
+    the first consumer to subscript ``result['stop_reason']`` would KeyError on
+    a replay and not on a live call. The row is seeded directly through SQLite
+    so the test cannot be satisfied by anything the write path does.
+    """
+    conn = call_mod._connect_cache()
+    try:
+        prompt_hash = _hash_prompt("gemini-2.5-flash", MESSAGES, None, None, 0.0, 2048)
+        legacy = {
+            "text": "an answer from before stop_reason existed",
+            "raw": {},
+            "model": "gemini-2.5-flash",
+            "prompt_tokens": 11,
+            "completion_tokens": 22,
+        }
+        assert "stop_reason" not in legacy
+        conn.execute(
+            "INSERT INTO llm_cache (model, prompt_hash, response_json, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "gemini-2.5-flash",
+                prompt_hash,
+                json.dumps(legacy),
+                "2026-01-01T00:00:00",
+            ),
+        )
+    finally:
+        conn.close()
+
+    def never(model: str, _messages: list[dict], **_kw: Any) -> dict[str, Any]:
+        raise AssertionError(f"cache miss: {model} was dispatched")
+
+    monkeypatch.setattr(call_mod, "_dispatch", never)
+
+    result = call("gemini-2.5-flash", MESSAGES)
+
+    assert result["_cached"] is True
+    assert result["stop_reason"] == "unknown"
+    assert result["text"] == "an answer from before stop_reason existed"
+    assert result["prompt_tokens"] == 11
+    # Normalizing the replay must not rewrite the stored row.
+    stored = json.loads(_rows(isolated_cache)[0][2])
+    assert "stop_reason" not in stored
+
+
+@pytest.mark.parametrize("stop_reason", ["blocked", "length"])
+def test_blocked_or_length_stop_with_empty_text_names_stop_reason(
+    stop_reason: str,
+    isolated_cache: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_sleep: list[float],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The COMMON blocked case is empty text, and it must say so.
+
+    A prompt-level Gemini block returns no candidate, so ``text`` is empty; a
+    budget eaten by a hidden reasoning field returns ``length`` the same way.
+    Both therefore hit the empty-text guard BEFORE ``call()`` ever evaluates its
+    stop-reason branch, which meant round 1's operator-visible signal for the
+    single most common real block was the generic "empty response text" --
+    while the branch that names the reason was only reachable for the rarer
+    blocked-response-that-still-carries-text shape.
+
+    Safety is unchanged either way (nothing is cached); what this asserts is
+    that the reason survives into the message and the WARNING, so an operator
+    reading a log can tell a refusal from a broken decode.
+    """
+    monkeypatch.setattr(
+        call_mod,
+        "_dispatch",
+        lambda model, _m, **_kw: _ok(model, text="", stop_reason=stop_reason),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="parallax.llm.call"):
+        with pytest.raises(LLMCallError) as exc_info:
+            call("gemini-2.5-flash", MESSAGES)
+
+    assert stop_reason in str(exc_info.value), (
+        f"the exception must name the stop reason, got {exc_info.value!s}"
+    )
+    assert "gemini-2.5-flash" in str(exc_info.value)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(stop_reason in m and "gemini-2.5-flash" in m for m in warnings), (
+        f"expected a WARNING naming the stop reason, got {warnings!r}"
+    )
+    assert _rows(isolated_cache) == [], "an empty blocked/length answer is not cached"

@@ -134,9 +134,27 @@ class RateLimitError(RuntimeError):
 
 # ---------- Error classification (type first, text last) ---------------------
 
-#: HTTP statuses that mean "the request was fine, try again later". 429 is
+#: Non-5xx HTTP statuses that mean "the request was fine, try again later".
+#: The 5xx range is covered wholesale by :func:`_is_transient_status`; 429 is
 #: handled separately because it maps to :class:`RateLimitError`.
-_TRANSIENT_STATUS: frozenset[int] = frozenset({408, 425, 500, 502, 503, 504, 529})
+_TRANSIENT_NON_5XX_STATUS: frozenset[int] = frozenset({408, 425})
+
+
+def _is_transient_status(status: int | None) -> bool:
+    """True for a status that means "retry this same request later".
+
+    EVERY 5xx counts, not an enumerated subset. The previous closed set
+    ({500, 502, 503, 504, 529}) silently demoted the codes nobody thought to
+    list — 501, 505, 507, 508, 511 — to a hard :class:`LLMCallError`, which
+    tenacity still retried but which could never reach ``fallback_model``. A
+    server-side status is a server-side status: the request was well formed, so
+    the answer is "try again, and fall back if trying again does not help".
+    429 is deliberately excluded — it is a rate limit, not a server fault, and
+    maps to :class:`RateLimitError` (which reaches the same fallback branch).
+    """
+    if status is None or status == 429:
+        return False
+    return 500 <= status <= 599 or status in _TRANSIENT_NON_5XX_STATUS
 
 #: ``google.genai`` error class names, matched on the CLASS rather than on the
 #: message so a prose change upstream cannot silently reclassify a failure.
@@ -149,14 +167,22 @@ _GENAI_RATE_LIMIT_ERROR_NAMES: frozenset[str] = frozenset(
 )
 
 #: Last-resort text probe for providers that raise an opaque exception type and
-#: put the status in the message. Status codes are word-bounded so a token count
-#: or a request id cannot masquerade as a 503.
+#: put the status in the message. Status codes are word-bounded HERE AND in
+#: :data:`_RATE_LIMIT_TEXT_RE`, so a token count or a request id that merely
+#: contains the digits (``tokens=5030``, ``req-4290``) cannot masquerade as a
+#: 503 or a 429.
 _TRANSIENT_TEXT_RE = re.compile(
     r"\b(?:500|502|503|504|529)\b"
     r"|unavailable|overloaded|deadline exceeded|timed out|timeout"
     r"|connection (?:reset|refused|error|aborted)",
     re.IGNORECASE,
 )
+
+#: Word-bounded companion for the rate-limit last resort. Bare ``"429" in msg``
+#: read ``req-4290``, ``14291`` and ``tokens=4290`` as rate limits; the
+#: boundaries are what make ``HTTP 429`` and ``status 429`` the only shapes that
+#: still match.
+_RATE_LIMIT_TEXT_RE = re.compile(r"\b429\b")
 
 
 def _exception_status_code(exc: BaseException) -> int | None:
@@ -206,11 +232,16 @@ def _classify_provider_error(exc: BaseException, *, message: str | None = None) 
     """Map a provider exception onto this module's error contract.
 
     TYPE first (PA-PARALLAX-F5). An SDK's own error classes and the HTTP status
-    they carry are authoritative, so a provider changing its error prose, or a
-    request id that happens to contain ``429``, cannot flip the classification —
-    which is the decision that determines whether ``fallback_model`` is ever
-    reached. The substring probe survives only as a LAST RESORT, for providers
-    that raise a bare ``RuntimeError`` with the status in its text.
+    they carry are authoritative, so a provider changing its error prose cannot
+    flip the classification — which is the decision that determines whether
+    ``fallback_model`` is ever reached. The text probe survives only as a LAST
+    RESORT, for providers that raise a bare ``RuntimeError`` with the status in
+    its message, and its status codes are WORD-BOUNDED: a request id or a token
+    count that merely contains the digits (``req-4290``, ``tokens=4290``) is not
+    read as a rate limit, while a message stating ``HTTP 429`` still is. The
+    prose alternatives (``resource_exhausted``, ``rate limit``, ``rate_limit``)
+    are substring checks by design — they have no digit-collision to guard
+    against.
 
     ``message`` overrides the text of the returned exception (used to keep the
     ``ollama request failed: …`` context) without changing how the *incoming*
@@ -221,7 +252,7 @@ def _classify_provider_error(exc: BaseException, *, message: str | None = None) 
     status = _exception_status_code(exc)
     if status == 429:
         return RateLimitError(msg)
-    if status in _TRANSIENT_STATUS:
+    if _is_transient_status(status):
         return LLMTransientError(msg)
 
     name = type(exc).__name__
@@ -235,7 +266,12 @@ def _classify_provider_error(exc: BaseException, *, message: str | None = None) 
         return LLMTransientError(msg)
 
     low = msg.lower()
-    if "429" in msg or "resource_exhausted" in low or "rate limit" in low or "rate_limit" in low:
+    if (
+        _RATE_LIMIT_TEXT_RE.search(msg)
+        or "resource_exhausted" in low
+        or "rate limit" in low
+        or "rate_limit" in low
+    ):
         return RateLimitError(msg)
     if _TRANSIENT_TEXT_RE.search(msg):
         return LLMTransientError(msg)
@@ -665,7 +701,7 @@ def _call_ollama(
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
         detail = f"ollama HTTP {resp.status_code}: {resp.text[:200]}"
-        if resp.status_code in _TRANSIENT_STATUS:
+        if _is_transient_status(resp.status_code):
             raise LLMTransientError(detail) from exc
         raise LLMCallError(detail) from exc
 
@@ -769,16 +805,29 @@ def _dispatch_with_retry(
         # PA-PARALLAX-F3: raising (rather than returning) keeps the empty answer
         # out of llm_cache AND gives the provider the two remaining tenacity
         # attempts — a blocked or budget-eaten generation is often transient.
+        stop_reason = result["stop_reason"]
+        if stop_reason in _UNCACHEABLE_STOP_REASONS:
+            # This guard runs BEFORE call()'s stop-reason branch, and empty text
+            # is the COMMON real shape of both uncacheable reasons: a
+            # prompt-level safety block returns no candidate at all, and a
+            # budget eaten by a hidden reasoning field returns ``length`` with
+            # nothing visible. Without naming the reason here the operator would
+            # only ever see "empty response" for the case the module exists to
+            # make legible.
+            detail = (
+                f"{model} response {stop_reason} (stop_reason={stop_reason}), "
+                f"empty text (prompt_hash={prompt_hash})"
+            )
+        else:
+            detail = f"empty response text from {model} (prompt_hash={prompt_hash})"
         logger.warning(
             "empty response text from model=%s prompt_hash=%s stop_reason=%s "
             "— not cached",
             model,
             prompt_hash or "(unhashed)",
-            result["stop_reason"],
+            stop_reason,
         )
-        raise LLMCallError(
-            f"empty response text from {model} (prompt_hash={prompt_hash})"
-        )
+        raise LLMCallError(detail)
     return result
 
 
@@ -798,11 +847,15 @@ def call(
     ``stop_reason``, ``_cached``.
 
     ``stop_reason`` is normalized to ``stop`` / ``length`` / ``blocked`` /
-    ``unknown`` for every backend. A ``length`` or ``blocked`` response is
-    returned to the caller but deliberately NOT cached: it is a partial answer,
-    and caching it would replay the truncation forever with no signal
-    (PA-PARALLAX-F4). An empty response is not cached either — it raises so
-    tenacity retries (PA-PARALLAX-F3).
+    ``unknown`` for every backend, on a cache hit as well as on a live call. A
+    ``length`` or ``blocked`` response that CARRIES TEXT is returned to the
+    caller but deliberately NOT cached: it is a partial answer, and caching it
+    would replay the truncation forever with no signal (PA-PARALLAX-F4). An
+    empty response is not cached either, and does not return at all — it raises
+    so tenacity retries (PA-PARALLAX-F3). The two rules meet in the common case:
+    a ``blocked`` or ``length`` response with EMPTY text raises an
+    ``LLMCallError`` that names the stop reason, so it reaches the caller as an
+    exception rather than as a readable ``result['stop_reason']``.
 
     Concurrency: the read-miss → dispatch → write sequence happens inside a
     single ``_db_lock`` span with a re-check after the (blocking) lock is
@@ -823,6 +876,11 @@ def call(
             cached = _cache_get(conn, prompt_hash)
             if cached is not None:
                 cached = dict(cached)
+                # Rows written before stop_reason existed replay without the
+                # key. The return contract says it is always present, so a
+                # legacy row is normalized on the way out rather than handed
+                # back one key short of a live response.
+                cached.setdefault("stop_reason", "unknown")
                 cached["_cached"] = True
                 return cached
 

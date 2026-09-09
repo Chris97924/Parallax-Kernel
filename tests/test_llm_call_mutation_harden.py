@@ -794,7 +794,10 @@ def test_an_empty_cached_response_is_still_a_cache_hit(
     result = call_mod.call("gemini-pro", MESSAGES)
 
     assert dispatched == []
-    assert result == {"_cached": True}
+    # Exact, so a truthiness mutation still fails here. The one extra key is the
+    # r2 normalization of a legacy row: the hit path setdefaults ``stop_reason``
+    # so a pre-change row replays with the key ``call()``'s contract promises.
+    assert result == {"_cached": True, "stop_reason": "unknown"}
 
 
 @pytest.mark.unit

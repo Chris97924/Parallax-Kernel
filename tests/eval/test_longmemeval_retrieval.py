@@ -229,6 +229,9 @@ class _FakeGeminiResult:
     text: str = "MOCK"
     prompt_tokens: int = 0
     output_tokens: int = 0
+    # Mirrors the real GeminiResult.cached that pipeline.run_one now records on
+    # every AnswerRecord (PA-PARALLAX-F9).
+    cached: bool = False
 
 
 def test_run_one_returns_error_when_retrieval_empty(

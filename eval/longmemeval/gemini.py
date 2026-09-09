@@ -19,6 +19,11 @@ class GeminiResult:
     prompt_tokens: int
     output_tokens: int
     model: str
+    #: True when :func:`parallax.llm.call.call` served this from ``llm_cache``
+    #: instead of a provider. Without it every replay is counted as spend and
+    #: the eval line's cost numbers are "tokens the prompt WOULD cost", not
+    #: tokens actually billed (PA-PARALLAX-F9).
+    cached: bool = False
 
 
 def call(
@@ -46,4 +51,5 @@ def call(
         prompt_tokens=int(result.get("prompt_tokens", 0) or 0),
         output_tokens=int(result.get("completion_tokens", 0) or 0),
         model=result.get("model", model),
+        cached=bool(result.get("_cached", False)),
     )

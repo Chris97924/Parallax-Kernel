@@ -64,6 +64,14 @@ class AnswerRecord:
     judge_output_tokens: int
     answer_model: str
     judge_model: str
+    # Whether each of the two LLM calls behind this record was a cache replay
+    # rather than a live provider call (PA-PARALLAX-F9). One flag per call
+    # because the answer and the judge hit the cache independently — a sweep
+    # that varies retrieval params replays every dump-arm answer while still
+    # judging live. Defaulted so ``eval/longmemeval/rejudge.py`` and any
+    # already-written jsonl keep constructing/loading records unchanged.
+    answer_cached: bool = False
+    judge_cached: bool = False
 
 
 def build_answer_prompt(q: Question, transcript: str) -> str:
@@ -190,6 +198,8 @@ def run_one(
             judge_output_tokens=0,
             answer_model=answer_model,
             judge_model=judge_model,
+            answer_cached=ans.cached,
+            judge_cached=False,
         )
 
     try:
@@ -211,6 +221,8 @@ def run_one(
             judge_output_tokens=jr.output_tokens,
             answer_model=answer_model,
             judge_model=judge_model,
+            answer_cached=ans.cached,
+            judge_cached=jr.cached,
         )
 
     return AnswerRecord(
@@ -228,6 +240,8 @@ def run_one(
         judge_output_tokens=jr.output_tokens,
         answer_model=answer_model,
         judge_model=judge_model,
+        answer_cached=ans.cached,
+        judge_cached=jr.cached,
     )
 
 

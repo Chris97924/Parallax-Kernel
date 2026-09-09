@@ -84,6 +84,12 @@ def _answer_and_judge(q, transcript, answer_model, judge_model):
         "judge_prompt_tokens": jr.prompt_tokens,
         "judge_output_tokens": jr.output_tokens,
         "transcript_chars": len(transcript),
+        # PA-PARALLAX-F9: the DUMP arm's transcript does not depend on top_k /
+        # max_chars, so every grid cell after the first replays it from
+        # llm_cache. Recording the replay per call is what lets the cost thesis
+        # be computed from tokens actually billed.
+        "answer_cached": ans.cached,
+        "judge_cached": jr.cached,
     }
 
 
@@ -107,6 +113,8 @@ def _run_one(q, answer_model, judge_model, top_k, max_chars):
             "judge_prompt_tokens": 0,
             "judge_output_tokens": 0,
             "transcript_chars": 0,
+            "answer_cached": False,
+            "judge_cached": False,
         }
     else:
         retr_rec = _answer_and_judge(q, retr_tx, answer_model, judge_model)
@@ -140,7 +148,28 @@ def _acc(records):
 
 
 def _arm_tokens(records):
+    """Answer-prompt tokens across every call in the arm — what the prompts weigh."""
     return sum(r["answer_prompt_tokens"] for r in records)
+
+
+def _arm_billed_tokens(records):
+    """Answer-prompt tokens for LIVE calls only — what a provider was billed for.
+
+    PA-PARALLAX-F9: the pre-registered read of this script is a COST thesis, so
+    the ratio it reports has to come from tokens actually spent. A replayed
+    dump-arm answer costs nothing and must not inflate the numerator.
+    """
+    return sum(
+        0 if r.get("answer_cached") else r["answer_prompt_tokens"] for r in records
+    )
+
+
+def _arm_replays(records):
+    """How many of the arm's LLM calls (answer + judge) were cache replays."""
+    return sum(
+        int(bool(r.get("answer_cached"))) + int(bool(r.get("judge_cached")))
+        for r in records
+    )
 
 
 def main(argv=None):
@@ -162,7 +191,7 @@ def main(argv=None):
 
     load_dotenv("E:/Workspace/Parallax/.env")
     # Only Gemini answer/judge models need a Gemini key. Local (ollama:/local:)
-    # or Claude runs must not be blocked by an absent GEMINI_API_KEY.
+    # runs must not be blocked by an absent GEMINI_API_KEY.
     needs_gemini = args.answer_model.startswith("gemini-") or args.judge_model.startswith(
         "gemini-"
     )
@@ -213,7 +242,14 @@ def main(argv=None):
     retr_acc, rc, rn = _acc(retr_recs)
     dump_tok = _arm_tokens(dump_recs)
     retr_tok = _arm_tokens(retr_recs)
-    ratio = dump_tok / max(1, retr_tok)
+    dump_billed = _arm_billed_tokens(dump_recs)
+    retr_billed = _arm_billed_tokens(retr_recs)
+    dump_replays = _arm_replays(dump_recs)
+    retr_replays = _arm_replays(retr_recs)
+    # The pre-registered read is a COST ratio, so it is computed from billed
+    # tokens (PA-PARALLAX-F9). Computed from prompted tokens it could not tell a
+    # genuine 10x retrieval saving from a caching artefact in either direction.
+    ratio = dump_billed / max(1, retr_billed)
     delta_pp = (retr_acc - dump_acc) * 100
 
     interesting = abs(delta_pp) <= 3.0 and ratio >= 10.0
@@ -229,6 +265,9 @@ def main(argv=None):
             "correct": dc,
             "graded": dn,
             "answer_prompt_tokens": dump_tok,
+            "tokens_prompted": dump_tok,
+            "tokens_billed": dump_billed,
+            "replay_count": dump_replays,
             "verdicts": dict(Counter(r["verdict"] for r in dump_recs)),
         },
         "retrieval": {
@@ -236,10 +275,15 @@ def main(argv=None):
             "correct": rc,
             "graded": rn,
             "answer_prompt_tokens": retr_tok,
+            "tokens_prompted": retr_tok,
+            "tokens_billed": retr_billed,
+            "replay_count": retr_replays,
             "verdicts": dict(Counter(r["verdict"] for r in retr_recs)),
         },
         "delta_pp": round(delta_pp, 2),
         "token_ratio_dump_over_retr": round(ratio, 2),
+        "token_ratio_basis": "tokens_billed (live calls only)",
+        "replay_count": dump_replays + retr_replays,
         "pre_registered_interesting": interesting,
         "pre_registered_read": "interesting iff |delta| <= 3pp AND token_ratio >= 10x",
         "elapsed_sec": round(time.time() - t0, 1),

@@ -18,13 +18,16 @@ Contract rules (ADR-006):
   codes), with a substring check on ``str(exc)`` only as a last resort:
   :class:`RateLimitError` for 429 / quota exhaustion, :class:`LLMTransientError`
   for capacity and transport failures (5xx, overloaded, timeouts, connection
-  errors), :class:`LLMConfigError` for deterministic misconfiguration.
+  errors), :class:`LLMPermanentError` for a provider that rejected the request
+  itself (any non-429 4xx: bad key, unknown model, malformed body),
+  :class:`LLMConfigError` for deterministic misconfiguration.
 * Tenacity retries the transient classes a few times with a 5s..60s exponential
-  backoff; :class:`LLMConfigError` is excluded, so a missing key or an unknown
-  prefix surfaces on the first attempt with no sleep. Only when retries are
-  exhausted do we fall through to the ``fallback_model`` branch, which fires for
+  backoff; :class:`LLMConfigError` and :class:`LLMPermanentError` are excluded,
+  so a missing key, an unknown prefix or a 401/404 from the provider surfaces on
+  the first attempt with no sleep. Only when retries are exhausted do we fall
+  through to the ``fallback_model`` branch, which fires for
   :class:`RateLimitError` and :class:`LLMTransientError` and never for a config
-  error.
+  error or a permanent rejection.
 * Fallback results are stored under a fallback-keyed hash so re-issuing the
   original call (e.g. once the primary model's quota is back) does not return
   the fallback model's answer masquerading as the primary model's.
@@ -101,6 +104,28 @@ class LLMTransientError(LLMCallError):
     """
 
 
+class LLMPermanentError(LLMCallError):
+    """A provider rejected the REQUEST — any non-429 4xx (400, 401, 403, 404,
+    422, …): an invalid API key, an unknown model, a malformed body.
+
+    Excluded from the retry predicate for the same reason
+    :class:`LLMConfigError` is: the server already read the request and said no,
+    so the identical request cannot start working after a 5s backoff — three
+    attempts only charge the operator ~10s per call to be told the same thing.
+    It is a distinct class rather than a ``LLMConfigError`` because the
+    misconfiguration is the PROVIDER's answer, not something this process could
+    detect before dispatching, and because ``except LLMConfigError`` callers
+    mean "my env is wrong", not "the provider refused". Never caught by the
+    ``fallback_model`` branch either — a second model cannot fix a malformed
+    request, and 401/404 on the primary usually means the same key or the same
+    typo'd family is behind the fallback too.
+
+    408 and 425 stay :class:`LLMTransientError` (see
+    :data:`_TRANSIENT_NON_5XX_STATUS`): those are the two 4xx statuses that mean
+    "the request was fine, try it again".
+    """
+
+
 def _gemini_keys() -> list[str]:
     """Return deduplicated Gemini API keys from configured env vars."""
     seen: set[str] = set()
@@ -155,6 +180,21 @@ def _is_transient_status(status: int | None) -> bool:
     if status is None or status == 429:
         return False
     return 500 <= status <= 599 or status in _TRANSIENT_NON_5XX_STATUS
+
+
+def _is_permanent_status(status: int | None) -> bool:
+    """True for a status that means "this request will never succeed".
+
+    Every 4xx except 429 (a rate limit, retried) and the two transient ones
+    (408 request timeout, 425 too early). An invalid key (401), a revoked one
+    (403), an unknown model (404) and a malformed body (400/422) are all the
+    server's verdict on the request we sent, so waiting cannot change the
+    answer — they map to :class:`LLMPermanentError`, which the retry predicate
+    excludes and the fallback branch does not catch.
+    """
+    if status is None or status == 429:
+        return False
+    return 400 <= status <= 499 and status not in _TRANSIENT_NON_5XX_STATUS
 
 #: ``google.genai`` error class names, matched on the CLASS rather than on the
 #: message so a prose change upstream cannot silently reclassify a failure.
@@ -254,6 +294,11 @@ def _classify_provider_error(exc: BaseException, *, message: str | None = None) 
         return RateLimitError(msg)
     if _is_transient_status(status):
         return LLMTransientError(msg)
+    if _is_permanent_status(status):
+        # The status the provider PUT ON THE WIRE beats every heuristic below:
+        # a 400 whose prose happens to mention a timeout is still a rejected
+        # request, and retrying it three times cannot make it well formed.
+        return LLMPermanentError(msg)
 
     name = type(exc).__name__
     if (type(exc).__module__ or "").startswith("google."):
@@ -703,6 +748,10 @@ def _call_ollama(
         detail = f"ollama HTTP {resp.status_code}: {resp.text[:200]}"
         if _is_transient_status(resp.status_code):
             raise LLMTransientError(detail) from exc
+        if _is_permanent_status(resp.status_code):
+            # A 404 from Ollama is the everyday case: the tag was never pulled
+            # on GB10. Retrying it three times sleeps 10s to be told the same.
+            raise LLMPermanentError(detail) from exc
         raise LLMCallError(detail) from exc
 
     try:
@@ -762,14 +811,21 @@ def _dispatch(
 
 
 def _is_retryable(exc: BaseException) -> bool:
-    """Retry predicate: transient failures yes, deterministic config no.
+    """Retry predicate: transient failures yes, deterministic rejections no.
 
     ``LLMConfigError`` is excluded (PA-PARALLAX-F6) — a missing key, an absent
     SDK or an unknown prefix cannot be fixed by waiting, so retrying it only
     charges the operator two 5s backoff windows per call before showing the
-    same message.
+    same message. ``LLMPermanentError`` is excluded for the same reason on the
+    provider's side of the wire: a non-429 4xx (invalid key, unknown model,
+    malformed request) is the server's verdict on THIS request, and the
+    identical request will collect the identical 4xx twice more.
+
+    A plain ``LLMCallError`` stays retryable, and deliberately so: it is what
+    the empty-response guard raises (PA-PARALLAX-F3), where the two remaining
+    attempts are the whole point.
     """
-    if isinstance(exc, LLMConfigError):
+    if isinstance(exc, (LLMConfigError, LLMPermanentError)):
         return False
     return isinstance(exc, (LLMCallError, RateLimitError))
 
@@ -898,7 +954,10 @@ def call(
                 # PA-PARALLAX-F5: capacity events reach the fallback whether the
                 # provider called them 429 or 503/overloaded/timeout. A
                 # LLMConfigError is NOT caught here — falling back cannot fix a
-                # missing key or an unknown prefix, it only hides it.
+                # missing key or an unknown prefix, it only hides it. Neither is
+                # a LLMPermanentError: a second model cannot fix a malformed
+                # request, and the 401/403 that rejected the primary is usually
+                # the same key the fallback would present.
                 if fallback_model is None:
                     raise
                 logger.warning(

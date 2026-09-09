@@ -164,6 +164,34 @@ def _arm_billed_tokens(records):
     )
 
 
+def _arm_output_tokens(records):
+    """Completion tokens across every call in the arm (answer + judge).
+
+    Both calls, unlike the prompt metrics above: the pre-registered read is
+    about how big the ANSWER prompt gets, but output spend is whatever the
+    provider generated on this arm, and the judge generates on every question.
+    """
+    return sum(
+        r.get("answer_output_tokens", 0) + r.get("judge_output_tokens", 0)
+        for r in records
+    )
+
+
+def _arm_billed_output_tokens(records):
+    """Completion tokens for LIVE calls only (r3).
+
+    The billed counterpart of :func:`_arm_output_tokens`, netting out replays
+    per call the way :func:`_arm_billed_tokens` does for the prompt side. A
+    replayed answer generated no tokens THIS run no matter what its record says
+    the original call produced.
+    """
+    return sum(
+        (0 if r.get("answer_cached") else r.get("answer_output_tokens", 0))
+        + (0 if r.get("judge_cached") else r.get("judge_output_tokens", 0))
+        for r in records
+    )
+
+
 def _arm_replays(records):
     """How many of the arm's LLM calls (answer + judge) were cache replays."""
     return sum(
@@ -244,6 +272,10 @@ def main(argv=None):
     retr_tok = _arm_tokens(retr_recs)
     dump_billed = _arm_billed_tokens(dump_recs)
     retr_billed = _arm_billed_tokens(retr_recs)
+    dump_out = _arm_output_tokens(dump_recs)
+    retr_out = _arm_output_tokens(retr_recs)
+    dump_out_billed = _arm_billed_output_tokens(dump_recs)
+    retr_out_billed = _arm_billed_output_tokens(retr_recs)
     dump_replays = _arm_replays(dump_recs)
     retr_replays = _arm_replays(retr_recs)
     # The pre-registered read is a COST ratio, so it is computed from billed
@@ -267,6 +299,8 @@ def main(argv=None):
             "answer_prompt_tokens": dump_tok,
             "tokens_prompted": dump_tok,
             "tokens_billed": dump_billed,
+            "tokens_out": dump_out,
+            "tokens_out_billed": dump_out_billed,
             "replay_count": dump_replays,
             "verdicts": dict(Counter(r["verdict"] for r in dump_recs)),
         },
@@ -277,12 +311,20 @@ def main(argv=None):
             "answer_prompt_tokens": retr_tok,
             "tokens_prompted": retr_tok,
             "tokens_billed": retr_billed,
+            "tokens_out": retr_out,
+            "tokens_out_billed": retr_out_billed,
             "replay_count": retr_replays,
             "verdicts": dict(Counter(r["verdict"] for r in retr_recs)),
         },
         "delta_pp": round(delta_pp, 2),
         "token_ratio_dump_over_retr": round(ratio, 2),
         "token_ratio_basis": "tokens_billed (live calls only)",
+        "tokens_basis": (
+            "tokens_billed (answer prompts) + tokens_out_billed (answer + judge "
+            "completions) count LIVE calls only, cache replays excluded; "
+            "answer_prompt_tokens / tokens_prompted / tokens_out count every "
+            "call, replays included"
+        ),
         "replay_count": dump_replays + retr_replays,
         "pre_registered_interesting": interesting,
         "pre_registered_read": "interesting iff |delta| <= 3pp AND token_ratio >= 10x",

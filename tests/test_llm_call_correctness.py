@@ -24,6 +24,7 @@ import logging
 import pathlib
 import sqlite3
 import sys
+import time
 import types as pytypes
 from typing import Any
 
@@ -35,6 +36,7 @@ import parallax.llm.call as call_mod
 from parallax.llm.call import (
     LLMCallError,
     LLMConfigError,
+    LLMPermanentError,
     LLMTransientError,
     RateLimitError,
     _hash_prompt,
@@ -426,8 +428,8 @@ def test_transient_classified_by_exception_type_for_ollama_http(
     ``_call_ollama`` reads the status off the response rather than off the
     message, so this is the same type-first rule expressed at the transport
     layer. Both classes reach the fallback branch in ``call()``; a 4xx that is
-    not 429 stays a hard ``LLMCallError`` because retrying a malformed request
-    only wastes the budget.
+    not 429 is a ``LLMPermanentError`` (r3) — retrying a malformed request only
+    wastes the budget, and falling back cannot make it well formed either.
     """
 
     class _Resp:
@@ -449,7 +451,7 @@ def test_transient_classified_by_exception_type_for_ollama_http(
         (502, LLMTransientError),
         (503, LLMTransientError),
         (504, LLMTransientError),
-        (400, LLMCallError),
+        (400, LLMPermanentError),
     ):
         monkeypatch.setattr(httpx, "post", lambda *_a, _s=status, **_kw: _Resp(_s))
         with pytest.raises(expected) as exc_info:
@@ -639,6 +641,14 @@ def test_exception_hierarchy() -> None:
     assert call_mod._is_retryable(LLMConfigError("no key")) is False
     assert call_mod._is_retryable(ValueError("bug")) is False
 
+    # r3: the provider's own refusal joins the non-retryable side, without
+    # becoming a LLMConfigError — callers matching that class mean "MY env is
+    # wrong", which is not what a 404 for an unknown model says.
+    assert issubclass(LLMPermanentError, LLMCallError)
+    assert not issubclass(LLMPermanentError, LLMConfigError)
+    assert not issubclass(LLMConfigError, LLMPermanentError)
+    assert call_mod._is_retryable(LLMPermanentError("404 unknown model")) is False
+
 
 # ---------------------------------------------------------------------------
 # F3 + F4 + F9 — what actually lands in the cache
@@ -698,7 +708,7 @@ class _OllamaStatusResponse:
         (505, LLMTransientError),
         (507, LLMTransientError),
         (529, LLMTransientError),
-        (400, LLMCallError),
+        (400, LLMPermanentError),
     ],
 )
 def test_all_5xx_statuses_are_transient(
@@ -718,7 +728,9 @@ def test_all_5xx_statuses_are_transient(
     529 is included because round 1 never exercised it through the status path
     at all — its fallback test injected an already-constructed
     ``LLMTransientError``, so nothing walked raw status -> classification.
-    400 is the control: a malformed request is not fixed by waiting.
+    400 is the control: a malformed request is not fixed by waiting, so it
+    classifies as ``LLMPermanentError`` (r3) and reaches neither the retry nor
+    the fallback.
     """
     monkeypatch.delenv("PARALLAX_OLLAMA_THINK", raising=False)
     monkeypatch.setattr(
@@ -869,3 +881,106 @@ def test_blocked_or_length_stop_with_empty_text_names_stop_reason(
         f"expected a WARNING naming the stop reason, got {warnings!r}"
     )
     assert _rows(isolated_cache) == [], "an empty blocked/length answer is not cached"
+
+
+# ---------------------------------------------------------------------------
+# r3 — a non-429 4xx is the provider refusing the REQUEST, not a blip
+# ---------------------------------------------------------------------------
+
+
+class _ProviderStatusError(Exception):
+    """Opaque provider exception carrying only an HTTP status, as SDKs do."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status_code = status
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+def test_permanent_4xx_not_retried(
+    status: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invalid key, an unknown model or a malformed body costs ONE attempt.
+
+    Round 2 classified every non-429 4xx as a bare ``LLMCallError``, and the
+    retry predicate excluded only ``LLMConfigError`` — so a 401 from a rotated
+    key, or a 404 for a model tag that was never pulled on GB10, was dispatched
+    three times with two 5s sleeps between them before surfacing. None of those
+    requests can recover with backoff: the server read the request and rejected
+    it, so the second and third attempts are the identical request collecting
+    the identical refusal.
+
+    Both provider paths are walked from the raw status rather than from an
+    already-constructed exception (Gemini's classifier, Ollama's response), and
+    the retry POLICY is exercised through ``_dispatch_with_retry`` with the real
+    ``time.sleep`` monkeypatched — so a regression that reinstates the retry
+    fails on the sleep log instead of quietly costing 10s per call.
+    """
+    # Gemini path: the SDK exception's status is authoritative.
+    classified = call_mod._classify_provider_error(_ProviderStatusError("nope", status))
+    assert type(classified) is LLMPermanentError
+
+    # Ollama path: the status is read off the response.
+    monkeypatch.delenv("PARALLAX_OLLAMA_THINK", raising=False)
+    monkeypatch.setattr(
+        httpx, "post", lambda *_a, _s=status, **_kw: _OllamaStatusResponse(_s)
+    )
+    with pytest.raises(LLMPermanentError):
+        call_mod._call_ollama(
+            "ollama:qwen3.6:latest", MESSAGES, temperature=0.0, max_output_tokens=8
+        )
+
+    # The consequence: one attempt, no sleep.
+    slept: list[float] = []
+    attempts: list[str] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: slept.append(seconds))
+
+    def refused(model: str, _messages: list[dict], **_kw: Any) -> dict[str, Any]:
+        attempts.append(model)
+        raise call_mod._classify_provider_error(_ProviderStatusError("nope", status))
+
+    monkeypatch.setattr(call_mod, "_dispatch", refused)
+
+    with pytest.raises(LLMPermanentError):
+        call_mod._dispatch_with_retry(
+            "gemini-2.5-flash", MESSAGES, temperature=0.0, max_output_tokens=8
+        )
+
+    assert len(attempts) == 1, f"HTTP {status} must not be retried"
+    assert slept == [], f"HTTP {status} must not sleep before failing"
+    assert call_mod._is_retryable(classified) is False
+
+
+def test_permanent_4xx_not_fallback(
+    isolated_cache: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_sleep: list[float],
+) -> None:
+    """A refused request must not be re-issued against ``fallback_model``.
+
+    The fallback exists to survive a capacity event on the primary model. A
+    401/403 is the same API key the fallback would present, and a 400 is the
+    same malformed body — so falling back cannot succeed; it can only double
+    the cost of the failure and, worse, hide a broken configuration behind a
+    quietly-degraded run whose answers all came from the cheaper model.
+
+    Asserted on the two things that would show it: the fallback model is never
+    dispatched, and the permanent error is what escapes ``call()``.
+    """
+    attempts = {"primary": 0, "fallback": 0}
+
+    def refused(model: str, _messages: list[dict], **_kw: Any) -> dict[str, Any]:
+        if model == "gemini-2.5-pro":
+            attempts["primary"] += 1
+            raise LLMPermanentError("gemini HTTP 404: model not found")
+        attempts["fallback"] += 1
+        return _ok(model)
+
+    monkeypatch.setattr(call_mod, "_dispatch", refused)
+
+    with pytest.raises(LLMPermanentError):
+        call("gemini-2.5-pro", MESSAGES, fallback_model="gemini-2.5-flash")
+
+    assert attempts == {"primary": 1, "fallback": 0}
+    assert no_sleep == []
+    assert _rows(isolated_cache) == [], "a refused request caches nothing"

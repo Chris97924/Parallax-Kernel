@@ -215,3 +215,148 @@ def test_answer_record_cached_flags_default_to_live(cached: bool):
     assert rec.judge_cached is cached
     assert _record().answer_cached is False
     assert _record().judge_cached is False
+
+
+# ---------------------------------------------------------------------------
+# r3 — the flags survive a re-judge, and output tokens are billed too
+# ---------------------------------------------------------------------------
+
+
+def _rejudge_src(**overrides: Any) -> dict[str, Any]:
+    src: dict[str, Any] = {
+        "question_id": "q1",
+        "question_type": "single-session-user",
+        "question": "What did I say?",
+        "gold": "tea",
+        "prediction": "tea",
+        "turns_ingested": 3,
+        "answer_prompt_tokens": 1000,
+        "answer_output_tokens": 10,
+        "answer_model": "gemini-2.5-pro",
+        "answer_cached": True,
+    }
+    src.update(overrides)
+    return src
+
+
+def test_rejudge_preserves_cache_flags(monkeypatch):
+    """A re-judged row must report ITS judge call and keep the source's answer.
+
+    ``_rejudge_one`` copies every other ``answer_*`` field verbatim — it does
+    not re-issue the answer — but it built ``AnswerRecord`` without either flag,
+    so both defaulted to False. The re-judged jsonl therefore said "live" for
+    every replayed call in it: the source row's ``answer_cached`` was dropped on
+    the floor, and a judge call served straight out of ``llm_cache`` (the normal
+    case when a re-judge is re-run, or run twice with the same judge model) was
+    counted as spend. Any cost number computed downstream from the re-judged
+    file was then wrong in the one direction that flatters the run.
+    """
+    import eval.longmemeval.rejudge as rejudge
+
+    def _judge(cached: bool):
+        return lambda **_kw: GeminiResult(
+            text="CORRECT\nlooks right",
+            prompt_tokens=100,
+            output_tokens=5,
+            model="gemini-3.1-pro-preview",
+            cached=cached,
+        )
+
+    # A replayed judge call on a row whose answer was itself a replay.
+    monkeypatch.setattr(rejudge, "call", _judge(True))
+    rec = rejudge._rejudge_one(_rejudge_src(), "gemini-3.1-pro-preview")
+    assert rec.verdict == "CORRECT"
+    assert rec.judge_cached is True, "the judge flag must come from the judge call"
+    assert rec.answer_cached is True, "the source answer's flag must survive"
+
+    # A live judge call on a live source answer: both False, no free lunch.
+    monkeypatch.setattr(rejudge, "call", _judge(False))
+    live = rejudge._rejudge_one(
+        _rejudge_src(answer_cached=False), "gemini-3.1-pro-preview"
+    )
+    assert live.judge_cached is False
+    assert live.answer_cached is False
+
+    # The source flag is the ANSWER's, not the source judge's: a re-judge issues
+    # a new judge call, so the old row's judge_cached must not be carried over.
+    monkeypatch.setattr(rejudge, "call", _judge(False))
+    stale = rejudge._rejudge_one(
+        _rejudge_src(judge_cached=True), "gemini-3.1-pro-preview"
+    )
+    assert stale.judge_cached is False
+
+    # A pre-flag jsonl row has neither key; and a failed judge call is not a
+    # replay. Both stay on the conservative default.
+    def _boom(**_kw):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(rejudge, "call", _boom)
+    legacy_src = _rejudge_src()
+    legacy_src.pop("answer_cached")
+    legacy = rejudge._rejudge_one(legacy_src, "gemini-3.1-pro-preview")
+    assert legacy.verdict == "ERROR"
+    assert legacy.answer_cached is False
+    assert legacy.judge_cached is False
+
+
+def test_summary_output_tokens_exclude_replays(monkeypatch, tmp_path):
+    """Completion tokens are billed too, so replays must be netted out of them.
+
+    Round 2 discounted replays on the PROMPT side only. ``tokens_out`` kept
+    summing the cached answer and judge completions, so a fully replayed run
+    reported zero input spend beside a full output bill — a shape no provider
+    invoice can have, and the more expensive half of the two per token. Both
+    runners now carry a live-only ``tokens_out_billed`` beside the all-calls
+    ``tokens_out``, and both summaries name which fields exclude replays.
+    """
+    records = [
+        _record(question_id="a", answer_cached=False, judge_cached=False),
+        _record(question_id="b", answer_cached=True, judge_cached=True),
+    ]
+
+    summary = run_mod._summarize(records)
+
+    # _record() carries 10 answer + 5 judge completion tokens.
+    assert summary["tokens_out"] == 2 * (10 + 5), "every call still counts here"
+    assert summary["tokens_out_billed"] == 15, "the replayed record generated nothing"
+    assert summary["tokens_billed"] == 1100
+    assert "tokens_out_billed" in summary["tokens_basis"]
+
+    # Half-replayed: only the live side of the record is billed.
+    half = run_mod._summarize([_record(answer_cached=True, judge_cached=False)])
+    assert half["tokens_out"] == 15
+    assert half["tokens_out_billed"] == 5
+
+    # run_retrieval_vs_dump's arm helpers, same rule.
+    arm = [
+        {"answer_prompt_tokens": 500, "answer_output_tokens": 40,
+         "judge_output_tokens": 20, "answer_cached": True, "judge_cached": True},
+        {"answer_prompt_tokens": 500, "answer_output_tokens": 40,
+         "judge_output_tokens": 20, "answer_cached": False, "judge_cached": False},
+    ]
+    assert rvd._arm_output_tokens(arm) == 120
+    assert rvd._arm_billed_output_tokens(arm) == 60
+
+    # And the fields actually reach that runner's summary file.
+    dump = {"verdict": "CORRECT", "answer_prompt_tokens": 10_000,
+            "answer_output_tokens": 40, "judge_output_tokens": 20,
+            "answer_cached": True, "judge_cached": True}
+    retr = {"verdict": "CORRECT", "answer_prompt_tokens": 500,
+            "answer_output_tokens": 40, "judge_output_tokens": 20,
+            "answer_cached": False, "judge_cached": False}
+    monkeypatch.setattr(rvd, "load_dotenv", lambda *_a, **_kw: None)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setattr(rvd, "iter_questions", lambda *_a, **_kw: [_question()])
+    monkeypatch.setattr(rvd, "_run_one", lambda *_a, **_kw: (dump, retr))
+
+    out = tmp_path / "slice.jsonl"
+    assert rvd.main(["--limit", "1", "--out", str(out)]) == 0
+
+    import json
+
+    written = json.loads(out.with_suffix(".summary.json").read_text(encoding="utf-8"))
+    assert written["dump"]["tokens_out"] == 60
+    assert written["dump"]["tokens_out_billed"] == 0
+    assert written["retrieval"]["tokens_out"] == 60
+    assert written["retrieval"]["tokens_out_billed"] == 60
+    assert "tokens_out_billed" in written["tokens_basis"]

@@ -4,21 +4,39 @@ Contract rules (ADR-006):
 
 * Every LLM call in Parallax goes through :func:`call`.
 * Cache key is deterministic over ``(model, messages, response_schema)`` —
-  or the caller-supplied ``cache_key`` when they want to pin a run. The
+  or the caller-supplied ``cache_key`` **plus a digest of the rendered
+  messages** when they want to pin a run. A pin names the RUN; it never
+  replaces the payload identity, so a prompt edit or a change in the rendered
+  evidence still invalidates the entry (PA-PARALLAX-F2). The
   response-affecting generation options (``temperature`` and the output-token
   budget) also join the key for EVERY backend, since they change the response for
   the same ``(model, messages, schema)``. ``ollama:`` / ``local:`` models fold
   them in via the normalized provider identity (which additionally covers the base
   URL and ``PARALLAX_OLLAMA_THINK`` state — see ``_ollama_provider_identity``);
-  gemini / claude fold them in via ``_generation_options_identity``.
-* 429 / rate-limit raises :class:`RateLimitError`; tenacity retries it a few
-  times with a 5s..60s exponential backoff. Only when retries are exhausted
-  do we fall through to the ``fallback_model`` branch.
+  the API backends fold them in via ``_generation_options_identity``.
+* Errors are classified by exception TYPE first (SDK error classes, HTTP status
+  codes), with a substring check on ``str(exc)`` only as a last resort:
+  :class:`RateLimitError` for 429 / quota exhaustion, :class:`LLMTransientError`
+  for capacity and transport failures (5xx, overloaded, timeouts, connection
+  errors), :class:`LLMPermanentError` for a provider that rejected the request
+  itself (any non-429 4xx: bad key, unknown model, malformed body),
+  :class:`LLMConfigError` for deterministic misconfiguration.
+* Tenacity retries the transient classes a few times with a 5s..60s exponential
+  backoff; :class:`LLMConfigError` and :class:`LLMPermanentError` are excluded,
+  so a missing key, an unknown prefix or a 401/404 from the provider surfaces on
+  the first attempt with no sleep. Only when retries are exhausted do we fall
+  through to the ``fallback_model`` branch, which fires for
+  :class:`RateLimitError` and :class:`LLMTransientError` and never for a config
+  error or a permanent rejection.
 * Fallback results are stored under a fallback-keyed hash so re-issuing the
   original call (e.g. once the primary model's quota is back) does not return
   the fallback model's answer masquerading as the primary model's.
-* All provider-specific HTTP stays in ``_call_gemini`` / ``_call_anthropic`` /
-  ``_call_ollama``. Callers see a uniform ``dict`` return shape.
+* Every backend surfaces a normalized top-level ``stop_reason`` — one of
+  ``stop`` / ``length`` / ``blocked`` / ``unknown``. A truncated or blocked
+  response is logged at WARNING and NOT cached; an empty response is logged and
+  raised so tenacity retries instead of caching ``''`` forever.
+* All provider-specific HTTP stays in ``_call_gemini`` / ``_call_ollama``.
+  Callers see a uniform ``dict`` return shape.
 * Local models served by Ollama (GB10) route through ``_call_ollama`` when the
   model name carries an ``ollama:`` / ``local:`` prefix; no API key is required.
 """
@@ -30,13 +48,15 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sqlite3
+import sys
 import threading
 import time
 
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -56,7 +76,54 @@ _key_idx: int = 0
 
 
 class LLMCallError(RuntimeError):
-    """Raised when an LLM call fails in a non-retryable way."""
+    """Base class for every failure raised by this module.
+
+    Kept as the base so existing ``except LLMCallError`` callers keep catching
+    the two more specific classes below.
+    """
+
+
+class LLMConfigError(LLMCallError):
+    """A deterministic misconfiguration — missing API key, SDK not importable,
+    unsupported model prefix.
+
+    Excluded from the retry predicate (PA-PARALLAX-F6): retrying cannot fix a
+    typo'd model name or an unset env var, and three attempts with a 5s floor
+    only delay the operator's feedback by ~10s per call.
+    """
+
+
+class LLMTransientError(LLMCallError):
+    """A capacity or transport failure a retry can plausibly resolve — 5xx,
+    ``UNAVAILABLE`` / overloaded, read timeouts, connection errors.
+
+    Distinct from :class:`RateLimitError` (which stays a 429-only signal) but
+    treated the same way by :func:`call`: retried by tenacity, and once the
+    retries are exhausted it reaches the ``fallback_model`` branch
+    (PA-PARALLAX-F5).
+    """
+
+
+class LLMPermanentError(LLMCallError):
+    """A provider rejected the REQUEST — any non-429 4xx (400, 401, 403, 404,
+    422, …): an invalid API key, an unknown model, a malformed body.
+
+    Excluded from the retry predicate for the same reason
+    :class:`LLMConfigError` is: the server already read the request and said no,
+    so the identical request cannot start working after a 5s backoff — three
+    attempts only charge the operator ~10s per call to be told the same thing.
+    It is a distinct class rather than a ``LLMConfigError`` because the
+    misconfiguration is the PROVIDER's answer, not something this process could
+    detect before dispatching, and because ``except LLMConfigError`` callers
+    mean "my env is wrong", not "the provider refused". Never caught by the
+    ``fallback_model`` branch either — a second model cannot fix a malformed
+    request, and 401/404 on the primary usually means the same key or the same
+    typo'd family is behind the fallback too.
+
+    408 and 425 stay :class:`LLMTransientError` (see
+    :data:`_TRANSIENT_NON_5XX_STATUS`): those are the two 4xx statuses that mean
+    "the request was fine, try it again".
+    """
 
 
 def _gemini_keys() -> list[str]:
@@ -79,7 +146,7 @@ def _next_gemini_key() -> str:
     global _key_idx
     keys = _gemini_keys()
     if not keys:
-        raise LLMCallError("no Gemini API key configured")
+        raise LLMConfigError("no Gemini API key configured")
     key = keys[_key_idx % len(keys)]
     _key_idx += 1
     return key
@@ -88,6 +155,216 @@ def _next_gemini_key() -> str:
 class RateLimitError(RuntimeError):
     """Raised on 429 / RESOURCE_EXHAUSTED. Retried inside tenacity; if retries
     are exhausted, the caller falls back to ``fallback_model``."""
+
+
+# ---------- Error classification (type first, text last) ---------------------
+
+#: Non-5xx HTTP statuses that mean "the request was fine, try again later".
+#: The 5xx range is covered wholesale by :func:`_is_transient_status`; 429 is
+#: handled separately because it maps to :class:`RateLimitError`.
+_TRANSIENT_NON_5XX_STATUS: frozenset[int] = frozenset({408, 425})
+
+
+def _is_transient_status(status: int | None) -> bool:
+    """True for a status that means "retry this same request later".
+
+    EVERY 5xx counts, not an enumerated subset. The previous closed set
+    ({500, 502, 503, 504, 529}) silently demoted the codes nobody thought to
+    list — 501, 505, 507, 508, 511 — to a hard :class:`LLMCallError`, which
+    tenacity still retried but which could never reach ``fallback_model``. A
+    server-side status is a server-side status: the request was well formed, so
+    the answer is "try again, and fall back if trying again does not help".
+    429 is deliberately excluded — it is a rate limit, not a server fault, and
+    maps to :class:`RateLimitError` (which reaches the same fallback branch).
+    """
+    if status is None or status == 429:
+        return False
+    return 500 <= status <= 599 or status in _TRANSIENT_NON_5XX_STATUS
+
+
+def _is_permanent_status(status: int | None) -> bool:
+    """True for a status that means "this request will never succeed".
+
+    Every 4xx except 429 (a rate limit, retried) and the two transient ones
+    (408 request timeout, 425 too early). An invalid key (401), a revoked one
+    (403), an unknown model (404) and a malformed body (400/422) are all the
+    server's verdict on the request we sent, so waiting cannot change the
+    answer — they map to :class:`LLMPermanentError`, which the retry predicate
+    excludes and the fallback branch does not catch.
+    """
+    if status is None or status == 429:
+        return False
+    return 400 <= status <= 499 and status not in _TRANSIENT_NON_5XX_STATUS
+
+#: ``google.genai`` error class names, matched on the CLASS rather than on the
+#: message so a prose change upstream cannot silently reclassify a failure.
+_GENAI_TRANSIENT_ERROR_NAMES: frozenset[str] = frozenset(
+    {"ServerError", "ServiceUnavailable", "InternalServerError", "DeadlineExceeded",
+     "Unavailable"}
+)
+_GENAI_RATE_LIMIT_ERROR_NAMES: frozenset[str] = frozenset(
+    {"ResourceExhausted", "TooManyRequests"}
+)
+
+#: Last-resort text probe for providers that raise an opaque exception type and
+#: put the status in the message. Status codes are word-bounded HERE AND in
+#: :data:`_RATE_LIMIT_TEXT_RE`, so a token count or a request id that merely
+#: contains the digits (``tokens=5030``, ``req-4290``) cannot masquerade as a
+#: 503 or a 429.
+_TRANSIENT_TEXT_RE = re.compile(
+    r"\b(?:500|502|503|504|529)\b"
+    r"|unavailable|overloaded|deadline exceeded|timed out|timeout"
+    r"|connection (?:reset|refused|error|aborted)",
+    re.IGNORECASE,
+)
+
+#: Word-bounded companion for the rate-limit last resort. Bare ``"429" in msg``
+#: read ``req-4290``, ``14291`` and ``tokens=4290`` as rate limits; the
+#: boundaries are what make ``HTTP 429`` and ``status 429`` the only shapes that
+#: still match.
+_RATE_LIMIT_TEXT_RE = re.compile(r"\b429\b")
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    """Best-effort HTTP status carried by a provider exception.
+
+    ``google.genai.errors.APIError`` exposes ``.code``; ``httpx.HTTPStatusError``
+    carries ``.response.status_code``; several SDKs use ``.status_code``. Reading
+    the attribute is what makes classification type-driven rather than a guess at
+    the message's wording.
+    """
+    for attr in ("status_code", "code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, bool):  # a flag, not a status
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _is_httpx_transient(exc: BaseException) -> bool:
+    """True for httpx transport failures (timeout, connect, protocol).
+
+    ``sys.modules`` is read rather than imported: an httpx exception instance
+    cannot exist unless httpx is already imported, so an absent module is a
+    definitive "not an httpx error" and costs no import.
+    """
+    httpx = sys.modules.get("httpx")
+    if httpx is None:
+        return False
+    transient = tuple(
+        cls
+        for cls in (
+            getattr(httpx, "TimeoutException", None),
+            getattr(httpx, "ConnectError", None),
+            getattr(httpx, "ReadError", None),
+            getattr(httpx, "RemoteProtocolError", None),
+        )
+        if isinstance(cls, type)
+    )
+    return bool(transient) and isinstance(exc, transient)
+
+
+def _classify_provider_error(exc: BaseException, *, message: str | None = None) -> Exception:
+    """Map a provider exception onto this module's error contract.
+
+    TYPE first (PA-PARALLAX-F5). An SDK's own error classes and the HTTP status
+    they carry are authoritative, so a provider changing its error prose cannot
+    flip the classification — which is the decision that determines whether
+    ``fallback_model`` is ever reached. The text probe survives only as a LAST
+    RESORT, for providers that raise a bare ``RuntimeError`` with the status in
+    its message, and its status codes are WORD-BOUNDED: a request id or a token
+    count that merely contains the digits (``req-4290``, ``tokens=4290``) is not
+    read as a rate limit, while a message stating ``HTTP 429`` still is. The
+    prose alternatives (``resource_exhausted``, ``rate limit``, ``rate_limit``)
+    are substring checks by design — they have no digit-collision to guard
+    against.
+
+    ``message`` overrides the text of the returned exception (used to keep the
+    ``ollama request failed: …`` context) without changing how the *incoming*
+    exception is classified.
+    """
+    msg = str(exc) if message is None else message
+
+    status = _exception_status_code(exc)
+    if status == 429:
+        return RateLimitError(msg)
+    if _is_transient_status(status):
+        return LLMTransientError(msg)
+    if _is_permanent_status(status):
+        # The status the provider PUT ON THE WIRE beats every heuristic below:
+        # a 400 whose prose happens to mention a timeout is still a rejected
+        # request, and retrying it three times cannot make it well formed.
+        return LLMPermanentError(msg)
+
+    name = type(exc).__name__
+    if (type(exc).__module__ or "").startswith("google."):
+        if name in _GENAI_RATE_LIMIT_ERROR_NAMES:
+            return RateLimitError(msg)
+        if name in _GENAI_TRANSIENT_ERROR_NAMES:
+            return LLMTransientError(msg)
+
+    if _is_httpx_transient(exc):
+        return LLMTransientError(msg)
+
+    low = msg.lower()
+    if (
+        _RATE_LIMIT_TEXT_RE.search(msg)
+        or "resource_exhausted" in low
+        or "rate limit" in low
+        or "rate_limit" in low
+    ):
+        return RateLimitError(msg)
+    if _TRANSIENT_TEXT_RE.search(msg):
+        return LLMTransientError(msg)
+    return LLMCallError(msg)
+
+
+# ---------- Stop-reason normalization ----------------------------------------
+
+#: The four values every backend's ``stop_reason`` is collapsed to. ``length``
+#: and ``blocked`` are the two that mean "this answer is not the whole answer",
+#: so :func:`call` refuses to cache them (PA-PARALLAX-F4).
+_UNCACHEABLE_STOP_REASONS: frozenset[str] = frozenset({"length", "blocked"})
+
+_STOP_REASON_ALIASES: dict[str, str] = {
+    # normal completion
+    "stop": "stop",
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "complete": "stop",
+    "finish_reason_stop": "stop",
+    # hit the output-token ceiling
+    "length": "length",
+    "max_tokens": "length",
+    "max_output_tokens": "length",
+    # refused / filtered by the provider
+    "safety": "blocked",
+    "recitation": "blocked",
+    "blocklist": "blocked",
+    "prohibited_content": "blocked",
+    "spii": "blocked",
+    "image_safety": "blocked",
+    "content_filter": "blocked",
+    "refusal": "blocked",
+}
+
+
+def _normalize_stop_reason(raw: object) -> str:
+    """Collapse a provider finish/done reason to the four-value contract.
+
+    Enum members (``google.genai``'s ``FinishReason``) are read via ``.name`` so
+    the value does not depend on the SDK's ``__str__``; anything unrecognized —
+    including ``None`` — is ``"unknown"`` rather than being optimistically read
+    as a clean stop.
+    """
+    if raw is None:
+        return "unknown"
+    key = str(getattr(raw, "name", raw)).strip().lower()
+    return _STOP_REASON_ALIASES.get(key, "unknown")
 
 
 _DEFAULT_CACHE_PATH = pathlib.Path.home() / ".parallax" / "llm_cache.sqlite"
@@ -127,7 +404,7 @@ def _connect_cache() -> sqlite3.Connection:
 
 def _generation_options_identity(temperature: float, max_output_tokens: int) -> str:
     """Normalized, response-affecting generation options folded into the cache key
-    for the API backends (gemini, claude) whose request payload carries them.
+    for the API backends (gemini) whose request payload carries them.
 
     Same invariant #87 established for ollama (cache key == request payload):
     ``temperature`` and the output-token budget both change the model's response
@@ -145,6 +422,18 @@ def _generation_options_identity(temperature: float, max_output_tokens: int) -> 
     return f"opts={json.dumps(opts, sort_keys=True)}"
 
 
+def _messages_digest(messages: list[dict]) -> str:
+    """SHA-256 over the rendered messages.
+
+    ``sort_keys=True`` keeps the digest independent of dict insertion order, so
+    two halves of the codebase that build the same message with the keys in a
+    different order still land on one cache entry.
+    """
+    return hashlib.sha256(
+        json.dumps(messages, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def _hash_prompt(
     model: str,
     messages: list[dict],
@@ -157,7 +446,12 @@ def _hash_prompt(
     # existing 4-arg callers keep working; call() always passes them explicitly
     # so the key matches the dispatch config.
     if cache_key is not None:
-        raw = f"{model}::{cache_key}"
+        # PA-PARALLAX-F2: a pin names the RUN's identity for reporting; it must
+        # not REPLACE the payload identity. With the messages folded in, editing
+        # a system prompt, re-rendering different evidence text, or crossing
+        # midnight into a new ``today`` all invalidate the entry instead of
+        # replaying a pre-edit answer forever under the same pin.
+        raw = f"{model}::{cache_key}::msgs={_messages_digest(messages)}"
     else:
         msg_blob = json.dumps(messages, sort_keys=True, ensure_ascii=False)
         schema_blob = json.dumps(response_schema or {}, sort_keys=True)
@@ -170,7 +464,7 @@ def _hash_prompt(
     # knob). The ollama identity bundles the generation options together with those
     # extra dimensions — its exact byte form is kept intact so #87's existing cache
     # rows stay reachable — so it stays a single self-contained component; every
-    # other backend (gemini, claude) folds in the generation options here.
+    # other backend folds in the generation options here.
     if model.startswith(_OLLAMA_PREFIXES):
         raw = f"{raw}::{_ollama_provider_identity(temperature, max_output_tokens)}"
     else:
@@ -238,7 +532,7 @@ def _call_gemini(
         from google import genai  # type: ignore[import-not-found]
         from google.genai import types as gtypes  # type: ignore[import-not-found]
     except Exception as exc:
-        raise LLMCallError(f"google-genai SDK not importable: {exc}") from exc
+        raise LLMConfigError(f"google-genai SDK not importable: {exc}") from exc
 
     api_key = _next_gemini_key()
 
@@ -252,10 +546,7 @@ def _call_gemini(
     try:
         resp = client.models.generate_content(model=model, contents=user, config=config)
     except Exception as exc:
-        msg = str(exc)
-        if any(s in msg for s in ("429", "RESOURCE_EXHAUSTED")):
-            raise RateLimitError(msg) from exc
-        raise LLMCallError(msg) from exc
+        raise _classify_provider_error(exc) from exc
 
     usage = getattr(resp, "usage_metadata", None)
     pt = int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
@@ -266,56 +557,25 @@ def _call_gemini(
         "model": model,
         "prompt_tokens": pt,
         "completion_tokens": ot,
+        "stop_reason": _gemini_stop_reason(resp),
     }
 
 
-def _call_anthropic(
-    model: str,
-    messages: list[dict],
-    *,
-    temperature: float,
-    max_output_tokens: int,
-) -> dict:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise LLMCallError("ANTHROPIC_API_KEY not set; cannot use Claude fallback")
-    try:
-        import anthropic  # type: ignore[import-not-found]
-    except Exception as exc:  # pragma: no cover
-        raise LLMCallError(f"anthropic SDK not importable: {exc}") from exc
+def _gemini_stop_reason(resp: object) -> str:
+    """Normalized stop reason for a Gemini response (PA-PARALLAX-F4).
 
-    client = anthropic.Anthropic(api_key=api_key)
-    system_parts = [m["content"] for m in messages if m.get("role") == "system"]
-    user_messages = [
-        {"role": m.get("role", "user"), "content": m.get("content", "")}
-        for m in messages
-        if m.get("role") != "system"
-    ]
-    try:
-        resp = client.messages.create(
-            model=model,
-            messages=user_messages,
-            system="\n\n".join(system_parts) if system_parts else None,
-            temperature=temperature,
-            max_tokens=max_output_tokens,
-        )
-    except Exception as exc:
-        msg = str(exc)
-        low = msg.lower()
-        if "429" in msg or "rate_limit" in low or "rate limit" in low:
-            raise RateLimitError(msg) from exc
-        raise LLMCallError(msg) from exc
-
-    text = "".join(
-        getattr(block, "text", "") for block in getattr(resp, "content", [])
-    )
-    return {
-        "text": text,
-        "raw": {"stop_reason": getattr(resp, "stop_reason", None)},
-        "model": model,
-        "prompt_tokens": getattr(resp.usage, "input_tokens", 0),
-        "completion_tokens": getattr(resp.usage, "output_tokens", 0),
-    }
+    A prompt-level block is reported on ``prompt_feedback.block_reason`` and
+    leaves the candidate list empty, so it is checked first; otherwise the first
+    candidate's ``finish_reason`` decides. Both were previously visible only as a
+    truncated ``repr`` inside ``raw``, which nothing read — so a ``MAX_TOKENS``
+    cut was indistinguishable from a complete answer.
+    """
+    block = getattr(getattr(resp, "prompt_feedback", None), "block_reason", None)
+    if block:
+        return "blocked"
+    candidates = getattr(resp, "candidates", None) or []
+    finish = getattr(candidates[0], "finish_reason", None) if candidates else None
+    return _normalize_stop_reason(finish)
 
 
 # ---------- Local (Ollama) provider -----------------------------------------
@@ -418,7 +678,7 @@ def _ollama_provider_identity(temperature: float, max_output_tokens: int) -> str
       is byte-identical regardless of the timeout.
 
     Scope note: this folds generation options into the OLLAMA identity alongside
-    the endpoint + think dimensions. Gemini / claude fold the SAME generation
+    the endpoint + think dimensions. The API backends fold the SAME generation
     options into their key via :func:`_generation_options_identity`; this helper
     keeps its exact byte form so #87's existing ollama cache rows stay reachable.
     """
@@ -450,7 +710,7 @@ def _call_ollama(
     try:
         import httpx  # type: ignore[import]
     except Exception as exc:  # pragma: no cover - httpx is a declared dep
-        raise LLMCallError(f"httpx not importable: {exc}") from exc
+        raise LLMConfigError(f"httpx not importable: {exc}") from exc
 
     base_url = _ollama_base_url()
     served_model = _strip_ollama_prefix(model)
@@ -474,16 +734,25 @@ def _call_ollama(
     try:
         resp = httpx.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
     except httpx.HTTPError as exc:
-        raise LLMCallError(f"ollama request failed: {exc}") from exc
+        # Type-first: a read timeout or a refused connection to GB10 is a
+        # transient capacity event, not a permanent failure of the request.
+        raise _classify_provider_error(
+            exc, message=f"ollama request failed: {exc}"
+        ) from exc
 
     if resp.status_code == 429:
         raise RateLimitError(f"ollama 429: {resp.text[:200]}")
     try:
         resp.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise LLMCallError(
-            f"ollama HTTP {resp.status_code}: {resp.text[:200]}"
-        ) from exc
+        detail = f"ollama HTTP {resp.status_code}: {resp.text[:200]}"
+        if _is_transient_status(resp.status_code):
+            raise LLMTransientError(detail) from exc
+        if _is_permanent_status(resp.status_code):
+            # A 404 from Ollama is the everyday case: the tag was never pulled
+            # on GB10. Retrying it three times sleeps 10s to be told the same.
+            raise LLMPermanentError(detail) from exc
+        raise LLMCallError(detail) from exc
 
     try:
         body = resp.json()
@@ -501,7 +770,13 @@ def _call_ollama(
         "model": model,
         "prompt_tokens": int(body.get("prompt_eval_count", 0) or 0),
         "completion_tokens": int(body.get("eval_count", 0) or 0),
+        "stop_reason": _normalize_stop_reason(body.get("done_reason")),
     }
+
+
+#: Model-name prefixes ``_dispatch`` knows how to route. Named in the
+#: unsupported-prefix error so a typo'd model reports its own fix.
+_SUPPORTED_PREFIXES: tuple[str, ...] = ("gemini-", *_OLLAMA_PREFIXES)
 
 
 def _dispatch(
@@ -518,13 +793,6 @@ def _dispatch(
             temperature=temperature,
             max_output_tokens=max_output_tokens,
         )
-    if model.startswith("claude-"):
-        return _call_anthropic(
-            model,
-            messages,
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-        )
     if model.startswith(_OLLAMA_PREFIXES):
         return _call_ollama(
             model,
@@ -532,13 +800,40 @@ def _dispatch(
             temperature=temperature,
             max_output_tokens=max_output_tokens,
         )
-    raise LLMCallError(f"unsupported model prefix: {model}")
+    # The claude- arm and its adapter were removed 2026-09-09 (PA-PARALLAX-F7):
+    # the SDK they lazy-imported was never a declared dependency, so the branch
+    # could not run on any supported install. A claude-* model now fails here,
+    # immediately and by name, instead of after three retries and 10s of sleep.
+    raise LLMConfigError(
+        f"unsupported model prefix: {model} "
+        f"(supported prefixes: {', '.join(_SUPPORTED_PREFIXES)})"
+    )
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry predicate: transient failures yes, deterministic rejections no.
+
+    ``LLMConfigError`` is excluded (PA-PARALLAX-F6) — a missing key, an absent
+    SDK or an unknown prefix cannot be fixed by waiting, so retrying it only
+    charges the operator two 5s backoff windows per call before showing the
+    same message. ``LLMPermanentError`` is excluded for the same reason on the
+    provider's side of the wire: a non-429 4xx (invalid key, unknown model,
+    malformed request) is the server's verdict on THIS request, and the
+    identical request will collect the identical 4xx twice more.
+
+    A plain ``LLMCallError`` stays retryable, and deliberately so: it is what
+    the empty-response guard raises (PA-PARALLAX-F3), where the two remaining
+    attempts are the whole point.
+    """
+    if isinstance(exc, (LLMConfigError, LLMPermanentError)):
+        return False
+    return isinstance(exc, (LLMCallError, RateLimitError))
 
 
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=5, max=60),
-    retry=retry_if_exception_type((LLMCallError, RateLimitError)),
+    retry=retry_if_exception(_is_retryable),
     reraise=True,
 )
 def _dispatch_with_retry(
@@ -547,13 +842,49 @@ def _dispatch_with_retry(
     *,
     temperature: float,
     max_output_tokens: int,
+    prompt_hash: str | None = None,
 ) -> dict:
-    return _dispatch(
+    """Dispatch once, validate the response, and let tenacity handle the rest.
+
+    ``prompt_hash`` is carried purely for the operator-facing WARNING: an empty
+    response is a silent failure whose only trace used to be a permanently
+    cached ``''``, and the hash is what makes the offending row findable.
+    """
+    result = _dispatch(
         model,
         messages,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
     )
+    result.setdefault("stop_reason", "unknown")
+    if not (result.get("text") or "").strip():
+        # PA-PARALLAX-F3: raising (rather than returning) keeps the empty answer
+        # out of llm_cache AND gives the provider the two remaining tenacity
+        # attempts — a blocked or budget-eaten generation is often transient.
+        stop_reason = result["stop_reason"]
+        if stop_reason in _UNCACHEABLE_STOP_REASONS:
+            # This guard runs BEFORE call()'s stop-reason branch, and empty text
+            # is the COMMON real shape of both uncacheable reasons: a
+            # prompt-level safety block returns no candidate at all, and a
+            # budget eaten by a hidden reasoning field returns ``length`` with
+            # nothing visible. Without naming the reason here the operator would
+            # only ever see "empty response" for the case the module exists to
+            # make legible.
+            detail = (
+                f"{model} response {stop_reason} (stop_reason={stop_reason}), "
+                f"empty text (prompt_hash={prompt_hash})"
+            )
+        else:
+            detail = f"empty response text from {model} (prompt_hash={prompt_hash})"
+        logger.warning(
+            "empty response text from model=%s prompt_hash=%s stop_reason=%s "
+            "— not cached",
+            model,
+            prompt_hash or "(unhashed)",
+            stop_reason,
+        )
+        raise LLMCallError(detail)
+    return result
 
 
 def call(
@@ -569,7 +900,18 @@ def call(
     """Unified LLM call. Returns a dict with keys:
 
     ``text``, ``raw``, ``model``, ``prompt_tokens``, ``completion_tokens``,
-    ``_cached``.
+    ``stop_reason``, ``_cached``.
+
+    ``stop_reason`` is normalized to ``stop`` / ``length`` / ``blocked`` /
+    ``unknown`` for every backend, on a cache hit as well as on a live call. A
+    ``length`` or ``blocked`` response that CARRIES TEXT is returned to the
+    caller but deliberately NOT cached: it is a partial answer, and caching it
+    would replay the truncation forever with no signal (PA-PARALLAX-F4). An
+    empty response is not cached either, and does not return at all — it raises
+    so tenacity retries (PA-PARALLAX-F3). The two rules meet in the common case:
+    a ``blocked`` or ``length`` response with EMPTY text raises an
+    ``LLMCallError`` that names the stop reason, so it reaches the caller as an
+    exception rather than as a readable ``result['stop_reason']``.
 
     Concurrency: the read-miss → dispatch → write sequence happens inside a
     single ``_db_lock`` span with a re-check after the (blocking) lock is
@@ -590,6 +932,11 @@ def call(
             cached = _cache_get(conn, prompt_hash)
             if cached is not None:
                 cached = dict(cached)
+                # Rows written before stop_reason existed replay without the
+                # key. The return contract says it is always present, so a
+                # legacy row is normalized on the way out rather than handed
+                # back one key short of a live response.
+                cached.setdefault("stop_reason", "unknown")
                 cached["_cached"] = True
                 return cached
 
@@ -599,22 +946,26 @@ def call(
                     messages,
                     temperature=temperature,
                     max_output_tokens=max_output_tokens,
+                    prompt_hash=prompt_hash,
                 )
                 store_hash = prompt_hash
                 store_model = model
-            except RateLimitError:
+            except (RateLimitError, LLMTransientError) as exc:
+                # PA-PARALLAX-F5: capacity events reach the fallback whether the
+                # provider called them 429 or 503/overloaded/timeout. A
+                # LLMConfigError is NOT caught here — falling back cannot fix a
+                # missing key or an unknown prefix, it only hides it. Neither is
+                # a LLMPermanentError: a second model cannot fix a malformed
+                # request, and the 401/403 that rejected the primary is usually
+                # the same key the fallback would present.
                 if fallback_model is None:
                     raise
                 logger.warning(
-                    "rate-limited on %s; falling back to %s", model, fallback_model
-                )
-                result = _dispatch_with_retry(
+                    "%s on %s; falling back to %s",
+                    type(exc).__name__,
+                    model,
                     fallback_model,
-                    messages,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
                 )
-                result["fallback_from"] = model
                 # Store the fallback response under a fallback-specific hash so a
                 # later call with the primary model does NOT return the Flash
                 # answer labelled as Pro. This keeps fallback results cheap to
@@ -628,8 +979,26 @@ def call(
                     max_output_tokens,
                 )
                 store_model = fallback_model
+                result = _dispatch_with_retry(
+                    fallback_model,
+                    messages,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    prompt_hash=store_hash,
+                )
+                result["fallback_from"] = model
 
             result["_cached"] = False
+            stop_reason = result.get("stop_reason", "unknown")
+            if stop_reason in _UNCACHEABLE_STOP_REASONS:
+                logger.warning(
+                    "stop_reason=%s from model=%s prompt_hash=%s — response "
+                    "returned but NOT cached (partial answer)",
+                    stop_reason,
+                    store_model,
+                    store_hash,
+                )
+                return result
 
             _cache_put(
                 conn,

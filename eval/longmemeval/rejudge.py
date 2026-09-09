@@ -88,11 +88,16 @@ def _rejudge_one(src: dict, judge_model: str) -> AnswerRecord:
         )
         verdict, reason = parse_verdict(jr.text)
         judge_pt, judge_ot = jr.prompt_tokens, jr.output_tokens
+        # PA-PARALLAX-F9 (r3): the judge call this record describes is THIS
+        # call, so its replay flag is the one the caching layer just reported.
+        # Defaulting it to False marked every replayed re-judge as live spend.
+        judge_cached = jr.cached
     except Exception as exc:  # noqa: BLE001
         logger.exception("rejudge failed for %s", src["question_id"])
         verdict = "ERROR"
         reason = f"rejudge exception: {str(exc)[:240]}"
         judge_pt = judge_ot = 0
+        judge_cached = False
 
     return AnswerRecord(
         question_id=src["question_id"],
@@ -109,6 +114,12 @@ def _rejudge_one(src: dict, judge_model: str) -> AnswerRecord:
         judge_output_tokens=judge_ot,
         answer_model=src.get("answer_model", ""),
         judge_model=judge_model,
+        # The answer is COPIED from the source row, not re-issued, so its cache
+        # flag is a property of the source record and has to be carried across
+        # verbatim — the rest of the answer_* fields already are. A row written
+        # before the flag existed has no key and stays conservative (False).
+        answer_cached=bool(src.get("answer_cached", False)),
+        judge_cached=judge_cached,
     )
 
 

@@ -64,12 +64,22 @@ def answer(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    # PA-PARALLAX-F2: the pin must cover the evidence CONTENT and the date, not
+    # just the hit ids. A retrieval change that grows hit ``c1``'s text from one
+    # sentence to a paragraph keeps the id, and ``Today is …`` changes at
+    # midnight — under an id-only key both replay the answer computed from the
+    # older, thinner evidence (or from yesterday). ``parallax.llm.call`` folds
+    # the rendered messages in as well, so the system prompt is covered too.
     ev_hash = hashlib.sha256(
         json.dumps(
-            [h.get("id", "") for h in evidence.hits], sort_keys=True
+            [
+                [h.get("id", ""), h.get("text", ""), h.get("created_at", "")]
+                for h in evidence.hits
+            ],
+            ensure_ascii=False,
         ).encode("utf-8")
     ).hexdigest()[:16]
-    cache_key = f"answer::{question_id or question}::{ev_hash}"
+    cache_key = f"answer::{question_id or question}::{ev_hash}::{today}"
     result = call(
         model,
         messages,

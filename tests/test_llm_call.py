@@ -93,7 +93,7 @@ def isolated_cache(tmp_path, monkeypatch):
 def test_cache_miss_then_hit(isolated_cache, monkeypatch):
     calls: list[tuple] = []
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         calls.append((model, tuple(m["content"] for m in messages)))
         return {
             "text": "hello",
@@ -117,9 +117,17 @@ def test_cache_miss_then_hit(isolated_cache, monkeypatch):
 
 
 def test_cache_key_override(isolated_cache, monkeypatch):
+    """A pin makes the key independent of the schema, NOT of the payload.
+
+    Before PA-PARALLAX-F2 a pinned key ignored ``messages`` entirely, so a
+    prompt edit under the same pin replayed the pre-edit answer forever. The
+    pin's surviving job is to give one run one identity: the same pin with the
+    same messages is still a single cache entry (asserted below), while
+    different messages under that pin now re-dispatch.
+    """
     call_count = {"n": 0}
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         call_count["n"] += 1
         return {
             "text": "same-key",
@@ -131,17 +139,23 @@ def test_cache_key_override(isolated_cache, monkeypatch):
 
     monkeypatch.setattr(call_module, "_dispatch_with_retry", fake_dispatch)
 
-    a = call("gemini-2.5-flash", [{"role": "user", "content": "A"}], cache_key="k1")
-    b = call("gemini-2.5-flash", [{"role": "user", "content": "B"}], cache_key="k1")
+    msgs = [{"role": "user", "content": "A"}]
+    a = call("gemini-2.5-flash", msgs, cache_key="k1")
+    b = call("gemini-2.5-flash", msgs, cache_key="k1", response_schema={"type": "object"})
     assert a["_cached"] is False
-    assert b["_cached"] is True
+    assert b["_cached"] is True, "the pin must absorb a schema change"
     assert call_count["n"] == 1
+
+    # Different messages under the SAME pin are a different request now.
+    c = call("gemini-2.5-flash", [{"role": "user", "content": "B"}], cache_key="k1")
+    assert c["_cached"] is False, "a pinned key must not replace the payload identity"
+    assert call_count["n"] == 2
 
 
 def test_fallback_on_rate_limit(isolated_cache, monkeypatch):
     call_count = {"primary": 0, "fallback": 0}
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         if model == "gemini-2.5-pro":
             call_count["primary"] += 1
             raise RateLimitError("429 simulated")
@@ -173,7 +187,7 @@ def test_concurrent_calls_dedupe(isolated_cache, monkeypatch):
     dispatches = {"n": 0}
     gate = threading.Event()
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         dispatches["n"] += 1
         # Make the first dispatch slow enough that the other threads have a
         # chance to race. Without the _db_lock fix, they would each dispatch.
@@ -216,7 +230,7 @@ def test_fallback_not_cached_under_primary_key(isolated_cache, monkeypatch):
     """Primary 429 → fallback success must NOT leave a row under primary's hash."""
     call_seq = {"primary": 0, "fallback": 0}
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         if model == "gemini-2.5-pro":
             call_seq["primary"] += 1
             raise RateLimitError("429")
@@ -243,7 +257,7 @@ def test_fallback_not_cached_under_primary_key(isolated_cache, monkeypatch):
 
     # Now "primary quota returns": next call to the primary model must NOT
     # be served from the cached fallback answer.
-    def fake_dispatch_ok(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch_ok(model, messages, *, temperature, max_output_tokens, **_kw):
         call_seq["primary"] += 1
         return {
             "text": "pro-answer",
@@ -288,7 +302,7 @@ def test_ratelimit_retry_before_fallback(isolated_cache, monkeypatch):
     """RateLimitError is retried inside tenacity; fallback only if retries exhaust."""
     attempts = {"n": 0, "fallback": 0}
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         if model == "gemini-2.5-pro":
             attempts["n"] += 1
             if attempts["n"] < 3:
@@ -539,21 +553,27 @@ def test_ollama_think_toggle_busts_cache(isolated_cache, clean_ollama_env):
     replay a stale cache entry — the knob changes the response, so it must be
     part of the cache identity.
 
-    Regression for codex PR #87 finding: a think-unset run can cache an
-    empty-content answer (reasoning ate the whole num_predict budget); rerunning
-    with PARALLAX_OLLAMA_THINK=0 previously returned that stale empty answer
-    because the cache key ignored the think setting.
+    Regression for codex PR #87 finding: a think-unset run can cache a
+    reasoning-polluted answer (the hidden thinking phase ate the num_predict
+    budget); rerunning with PARALLAX_OLLAMA_THINK=0 previously returned that
+    stale answer because the cache key ignored the think setting.
+
+    The think-unset answer is a truncated leftover rather than the empty string
+    the original #87 report described: since PA-PARALLAX-F3 an empty response is
+    never cached at all (it raises so tenacity retries), so an empty first run
+    could not demonstrate a stale REPLAY. The cache-identity property under test
+    is unchanged.
     """
     mp = clean_ollama_env
     dispatched: list[str] = []
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         think = os.environ.get("PARALLAX_OLLAMA_THINK", "").strip().lower()
         dispatched.append(think)
         # Mirror the real think-dependent behaviour: with think unset the hidden
-        # reasoning phase consumes the budget and content comes back empty; with
-        # think=0 the model answers directly.
-        text = "42" if think in call_module._FALSEY else ""
+        # reasoning phase consumes most of the budget and the answer is cut
+        # short; with think=0 the model answers directly.
+        text = "42" if think in call_module._FALSEY else "<thinking> 6 times 7 is"
         return {
             "text": text,
             "raw": {},
@@ -566,10 +586,10 @@ def test_ollama_think_toggle_busts_cache(isolated_cache, clean_ollama_env):
 
     msgs = [{"role": "user", "content": "what is 6*7?"}]
 
-    # First run: think unset -> empty content, cached under the think-unset key.
+    # First run: think unset -> cut-short content, cached under the unset key.
     first = call("ollama:qwen3.6:latest", msgs)
     assert first["_cached"] is False
-    assert first["text"] == ""
+    assert first["text"] == "<thinking> 6 times 7 is"
 
     # Operator sets PARALLAX_OLLAMA_THINK=0 and reruns the SAME model/messages.
     mp.setenv("PARALLAX_OLLAMA_THINK", "0")
@@ -604,7 +624,7 @@ def test_hash_prompt_think_only_affects_ollama(clean_ollama_env):
 
     # Backward compat: for non-ollama models the think env is irrelevant, so the
     # hash is identical whether or not PARALLAX_OLLAMA_THINK is set — existing
-    # gemini/claude cache rows keyed before this change stay reachable.
+    # gemini cache rows keyed before this change stay reachable.
     mp.delenv("PARALLAX_OLLAMA_THINK", raising=False)
     g_unset = _hash_prompt("gemini-2.5-flash", msgs, None, None)
     mp.setenv("PARALLAX_OLLAMA_THINK", "true")
@@ -623,7 +643,7 @@ def test_ollama_base_url_toggle_busts_cache(isolated_cache, clean_ollama_env):
     mp = clean_ollama_env
     seen_urls: list[str] = []
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         url = call_module._ollama_base_url()
         seen_urls.append(url)
         # Different endpoints can serve different weights -> different answers.
@@ -696,7 +716,7 @@ def test_ollama_generation_options_toggle_busts_cache(isolated_cache, clean_olla
     mp = clean_ollama_env
     seen: list[tuple] = []
 
-    def fake_dispatch(model, messages, *, temperature, max_output_tokens):
+    def fake_dispatch(model, messages, *, temperature, max_output_tokens, **_kw):
         seen.append((temperature, max_output_tokens))
         # Larger budget -> fuller answer; different temperature -> different text.
         return {
@@ -736,7 +756,7 @@ def test_ollama_generation_options_toggle_busts_cache(isolated_cache, clean_olla
 
 def test_hash_prompt_generation_options_in_ollama_identity(clean_ollama_env):
     """Generation options join the ollama cache identity; equivalent numeric
-    inputs (0 == 0.0) collapse. (Gemini/claude fold the same options in via a
+    inputs (0 == 0.0) collapse. (The API backends fold the same options in via a
     parallel path — see test_hash_prompt_generation_options_in_api_backends.)
     """
     msgs = [{"role": "user", "content": "q"}]
@@ -751,10 +771,10 @@ def test_hash_prompt_generation_options_in_ollama_identity(clean_ollama_env):
     assert _hash_prompt(m, msgs, None, None, 0, 8) == base
 
 
-@pytest.mark.parametrize("model", ["gemini-2.5-flash", "claude-sonnet-4-5"])
+@pytest.mark.parametrize("model", ["gemini-2.5-flash", "gemini-3.1-pro-preview"])
 def test_hash_prompt_generation_options_in_api_backends(model: str) -> None:
     """Generation options (temperature, max_output_tokens) join the cache key for
-    the gemini/claude backends too — closing the #87 follow-up gap where API-backend
+    the API backends too — closing the #87 follow-up gap where API-backend
     keys ignored the generation knobs their requests actually send.
 
     Invariant (cache key == request payload): the same ``(model, messages, schema)``

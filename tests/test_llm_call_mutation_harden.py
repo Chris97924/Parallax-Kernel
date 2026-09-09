@@ -6,6 +6,13 @@ applied to a pristine tree one at a time against that suite.
 Tally — applied 80 / killed by the pre-existing suite 39 / killed by the tests
 below 41 / equivalent (excluded) 0 / unaddressed 0.
 
+2026-09-09 (PA-PARALLAX-F7): the Claude backend and its ``claude-`` dispatch arm
+were deleted from the module, so the test that asserted its missing-key message
+and the fabricated-SDK injector it used went with it. The rate-limit-wording case
+survives against the Gemini adapter, which exercises the same last-resort text
+probe. Two mutants from the original wave (that key guard's message, that SDK's
+import-error wording) no longer have code to mutate.
+
 What the existing suite could not see
 -------------------------------------
 ``test_llm_call.py`` is a strong suite about ONE property: that a config knob
@@ -36,11 +43,11 @@ the key, the request or the stored row actually CONTAIN:
 * **The provider adapters are only driven down their happy path.** The message
   role split, the join separator, and the substrings that classify a provider
   error as a rate limit (which decides whether the fallback model is ever
-  reached) have no adversarial input; neither SDK is installed in this
+  reached) have no adversarial input; the Gemini SDK is not installed in this
   environment, so those paths need injected stand-ins to reach at all.
 * **``_dispatch``'s prefix table is only fed models that match.** ``"gemini"``
-  and ``"claude"`` without their hyphens must be UNSUPPORTED, and the
-  fall-through must raise rather than return an empty result.
+  without its hyphen — and, since 2026-09-09, ``"claude-"`` in any form — must be
+  UNSUPPORTED, and the fall-through must raise rather than return an empty result.
 
 Expected values are literals throughout — 64 hex characters, 3 attempts, 5.0
 seconds, 2048 tokens, 300.0, and the exact identity strings. Deriving an
@@ -233,12 +240,18 @@ def test_an_empty_cache_key_still_pins_the_entry() -> None:
     """``is not None``, not truthiness: ``""`` is a pin, not an absence.
 
     A caller passing ``cache_key=""`` — a run label that came back empty from a
-    config lookup — means "one entry for this model". Under truthiness the call
-    silently reverts to message-derived keying, so a sweep that meant to reuse
-    one cached answer starts dispatching per prompt.
+    config lookup — means "one entry for this model and payload". Under
+    truthiness the call silently reverts to the schema-bearing message-derived
+    key, so a sweep that meant to reuse one cached answer starts dispatching per
+    requested schema.
+
+    The two calls differ only in ``response_schema``, which the pinned branch
+    deliberately does not carry: the messages themselves are held identical
+    because since 2026-09-09 they DO join a pinned key (PA-PARALLAX-F2), so
+    varying them here would prove nothing about ``is not None``.
     """
-    a = call_mod._hash_prompt("gemini-pro", [{"role": "user", "content": "A"}], None, "")
-    b = call_mod._hash_prompt("gemini-pro", [{"role": "user", "content": "B"}], None, "")
+    a = call_mod._hash_prompt("gemini-pro", MESSAGES, {"type": "object"}, "")
+    b = call_mod._hash_prompt("gemini-pro", MESSAGES, {"type": "array"}, "")
 
     assert a == b
 
@@ -416,22 +429,6 @@ def _install_fake_genai(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None
     monkeypatch.setitem(sys.modules, "google.genai.types", types_mod)
 
 
-def _install_fake_anthropic(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
-    """Inject a minimal ``anthropic`` whose messages.create raises ``exc``."""
-    mod = pytypes.ModuleType("anthropic")
-
-    class _Messages:
-        def create(self, **_kw: Any) -> Any:
-            raise exc
-
-    class _Anthropic:
-        def __init__(self, **_kw: Any) -> None:
-            self.messages = _Messages()
-
-    mod.Anthropic = _Anthropic  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "anthropic", mod)
-
-
 @pytest.mark.unit
 def test_gemini_resource_exhausted_is_a_rate_limit_not_a_hard_error(
     monkeypatch: pytest.MonkeyPatch,
@@ -456,39 +453,27 @@ def test_gemini_resource_exhausted_is_a_rate_limit_not_a_hard_error(
     "message",
     ["rate limit exceeded", "rate_limit_error", "RATE_LIMIT exceeded", "HTTP 429"],
 )
-def test_anthropic_rate_limit_wording_is_matched_case_insensitively(
+def test_rate_limit_wording_is_matched_case_insensitively(
     monkeypatch: pytest.MonkeyPatch, message: str
 ) -> None:
     """Three spellings and a status code, all case-insensitive.
 
-    Providers change error prose without notice, which is why the check is a
-    union of substrings rather than one. Two of the four cases below are
-    invisible to any test using a single canonical message: the spaced
+    Providers change error prose without notice, which is why the last-resort
+    text probe is a union of substrings rather than one. Two of the four cases
+    below are invisible to any test using a single canonical message: the spaced
     ``"rate limit"`` variant, and an upper-cased body that only matches once
     ``msg.lower()`` has run.
+
+    The probe is reached only when the exception carries no status code and no
+    recognizable SDK class — a bare ``RuntimeError``, as here. Classification by
+    TYPE is asserted separately in
+    ``tests/test_llm_call_correctness.py::test_transient_classified_by_exception_type``.
     """
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    _install_fake_anthropic(monkeypatch, RuntimeError(message))
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    _install_fake_genai(monkeypatch, RuntimeError(message))
 
     with pytest.raises(RateLimitError):
-        call_mod._call_anthropic("claude-x", MESSAGES, temperature=0.0, max_output_tokens=8)
-
-
-@pytest.mark.unit
-def test_a_missing_anthropic_key_fails_with_a_message_that_names_the_variable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The guard exists so the failure names its own fix.
-
-    Without it the call proceeds and fails somewhere inside the SDK — an
-    import error or an auth error whose text does not mention the env var the
-    operator has to set. The assertion is on the message because the exception
-    TYPE is ``LLMCallError`` either way.
-    """
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
-    with pytest.raises(LLMCallError, match="ANTHROPIC_API_KEY not set"):
-        call_mod._call_anthropic("claude-x", MESSAGES, temperature=0.0, max_output_tokens=8)
+        call_mod._call_gemini("gemini-pro", MESSAGES, temperature=0.0, max_output_tokens=8)
 
 
 # ---------------------------------------------------------------------------
@@ -597,23 +582,29 @@ def test_the_ollama_request_deadline_defaults_to_five_minutes(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("model", ["gemini", "claude", "geminipro", "claudeish", "mistral-7b"])
+@pytest.mark.parametrize(
+    "model",
+    ["gemini", "claude", "claude-sonnet-4-5", "geminipro", "claudeish", "mistral-7b"],
+)
 def test_models_outside_the_prefix_table_are_rejected_by_name(
     monkeypatch: pytest.MonkeyPatch, model: str
 ) -> None:
-    """The hyphen is part of each prefix, and the fall-through RAISES.
+    """The hyphen is part of the prefix, and the fall-through RAISES.
 
-    ``"gemini"`` and ``"claude"`` without their hyphens are not model names;
-    loosening either prefix routes them into a provider adapter that fails
-    later with an unrelated message. And returning an empty dict instead of
-    raising on the fall-through is worse than either: ``call()`` would cache
-    ``{}`` as a successful response and every subsequent request for that
-    model would replay an empty answer from the cache with ``_cached: True``.
+    ``"gemini"`` without its hyphen is not a model name; loosening the prefix
+    routes it into a provider adapter that fails later with an unrelated
+    message. And returning an empty dict instead of raising on the fall-through
+    is worse: ``call()`` would cache ``{}`` as a successful response and every
+    subsequent request for that model would replay an empty answer from the
+    cache with ``_cached: True``.
+
+    ``claude-sonnet-4-5`` is here because a fully-formed Claude model id is the
+    live regression for the 2026-09-09 branch removal — it must land on the
+    fall-through, not on a dispatch arm.
 
     The assertion is on the MESSAGE, since every one of these paths ends in
     ``LLMCallError`` one way or another.
     """
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
@@ -803,7 +794,10 @@ def test_an_empty_cached_response_is_still_a_cache_hit(
     result = call_mod.call("gemini-pro", MESSAGES)
 
     assert dispatched == []
-    assert result == {"_cached": True}
+    # Exact, so a truthiness mutation still fails here. The one extra key is the
+    # r2 normalization of a legacy row: the hit path setdefaults ``stop_reason``
+    # so a pre-change row replays with the key ``call()``'s contract promises.
+    assert result == {"_cached": True, "stop_reason": "unknown"}
 
 
 @pytest.mark.unit

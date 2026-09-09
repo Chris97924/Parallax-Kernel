@@ -84,6 +84,26 @@ def _summarize(records: list[AnswerRecord]) -> dict:
     accuracy = verdicts["CORRECT"] / total if total else 0.0
     tokens_in = sum(r.answer_prompt_tokens + r.judge_prompt_tokens for r in records)
     tokens_out = sum(r.answer_output_tokens + r.judge_output_tokens for r in records)
+    # PA-PARALLAX-F9: a cache replay costs nothing, so counting it as spend
+    # inflates every cost number in the eval line. ``tokens_prompted`` is what
+    # the prompts weighed (all calls); ``tokens_billed`` is what a provider was
+    # actually asked to read (live calls only); ``replay_count`` says how many
+    # of the 2N calls behind these records were served from llm_cache.
+    tokens_billed = sum(
+        (0 if r.answer_cached else r.answer_prompt_tokens)
+        + (0 if r.judge_cached else r.judge_prompt_tokens)
+        for r in records
+    )
+    # r3: output tokens are billed too, and at a higher rate than input. Netting
+    # replays out of the prompt side only left ``tokens_out`` summing cached
+    # completions, so a fully replayed run reported zero input spend beside a
+    # full output bill — a shape no provider invoice can have.
+    tokens_out_billed = sum(
+        (0 if r.answer_cached else r.answer_output_tokens)
+        + (0 if r.judge_cached else r.judge_output_tokens)
+        for r in records
+    )
+    replay_count = sum(int(r.answer_cached) + int(r.judge_cached) for r in records)
     return {
         "total": total,
         "accuracy": accuracy,
@@ -91,6 +111,15 @@ def _summarize(records: list[AnswerRecord]) -> dict:
         "by_type": {k: dict(v) for k, v in by_type.items()},
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
+        "tokens_prompted": tokens_in,
+        "tokens_billed": tokens_billed,
+        "tokens_out_billed": tokens_out_billed,
+        "replay_count": replay_count,
+        "tokens_basis": (
+            "tokens_billed + tokens_out_billed count LIVE calls only "
+            "(cache replays excluded); tokens_in / tokens_out / tokens_prompted "
+            "count every call, replays included"
+        ),
     }
 
 

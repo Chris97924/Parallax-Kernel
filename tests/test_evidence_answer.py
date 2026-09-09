@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 import parallax.answer.evidence as evidence_module
+import parallax.llm.call as call_module
 from parallax.answer.evidence import answer
 from parallax.retrieval.contracts import INSUFFICIENT_EVIDENCE, RetrievalEvidence
 
@@ -115,3 +118,111 @@ def test_cache_key_includes_evidence_content(monkeypatch):
     assert len(set(seen)) == 3, f"expected 3 distinct cache keys, got {seen!r}"
     # Same question_id prefix, distinct suffixes.
     assert all(k.startswith("answer::qid-1::") for k in seen)
+
+
+# ---------------------------------------------------------------------------
+# PA-PARALLAX-F2 — the pinned key must track the payload, not just the hit ids
+#
+# These three drive the REAL parallax.llm.call.call() against a tmp_path cache
+# (only the provider dispatch is faked), because the property under test is the
+# end-to-end cache identity: evidence.answer's cache_key plus the messages
+# digest call() folds in. Asserting on the key string alone would pass for a
+# key that changes but is never consulted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def cached_answer_probe(tmp_path, monkeypatch):
+    """Isolate the LLM cache in tmp_path and count live dispatches.
+
+    Never points at ``~/.parallax/llm_cache.sqlite``: these tests write rows,
+    and the developer cache is shared with real runs.
+    """
+    monkeypatch.setenv("PARALLAX_LLM_CACHE", str(tmp_path / "cache.sqlite"))
+    dispatched: list[str] = []
+
+    def fake_dispatch(model, _messages, **_kw):
+        dispatched.append(model)
+        return {
+            "text": f"answer-{len(dispatched)}",
+            "raw": {},
+            "model": model,
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "stop_reason": "stop",
+        }
+
+    monkeypatch.setattr(call_module, "_dispatch", fake_dispatch)
+    return dispatched
+
+
+def test_pinned_key_changes_when_evidence_text_changes(cached_answer_probe):
+    """Same hit ids, different hit TEXT must re-dispatch.
+
+    A retrieval change that grows hit ``c1``'s snippet from one sentence to a
+    paragraph keeps the id, so an id-only pin replayed the answer computed from
+    the old, thinner evidence — with no signal that the new evidence was never
+    read. The pre-fix ``ev_hash`` covered ``[h["id"] for h in hits]`` only, so
+    this is the exact case ``test_cache_key_includes_evidence_content`` above
+    advertised in its docstring but did not cover (it varied ids).
+    """
+    thin = _evidence([{"id": "c1", "text": "Chris likes tea.", "created_at": "2026-04-01"}])
+    thick = _evidence(
+        [{"id": "c1", "text": "Chris likes tea, especially oolong.", "created_at": "2026-04-01"}]
+    )
+
+    first = answer(thin, "What does Chris like?", question_id="qid-1", today="2026-09-09")
+    second = answer(thick, "What does Chris like?", question_id="qid-1", today="2026-09-09")
+
+    assert len(cached_answer_probe) == 2, "different evidence text must be a cache MISS"
+    assert first.answer != second.answer
+
+    # Re-issuing the identical evidence is still a HIT, or the pin would have
+    # stopped being a cache at all.
+    answer(thin, "What does Chris like?", question_id="qid-1", today="2026-09-09")
+    assert len(cached_answer_probe) == 2
+
+
+def test_pinned_key_changes_when_today_changes(cached_answer_probe):
+    """A new ``Today is …`` must re-dispatch.
+
+    The system prompt exists to support relative-time deduction ("last Tuesday"),
+    so a run that crosses midnight — or is re-run next week — replaying
+    yesterday's date silently answers the wrong question with full confidence.
+    """
+    ev = _evidence()
+
+    answer(ev, "When is the appointment?", question_id="qid-1", today="2026-09-09")
+    answer(ev, "When is the appointment?", question_id="qid-1", today="2026-09-10")
+
+    assert len(cached_answer_probe) == 2, "a new today must be a cache MISS"
+
+    answer(ev, "When is the appointment?", question_id="qid-1", today="2026-09-09")
+    assert len(cached_answer_probe) == 2, "the same today must still hit"
+
+
+def test_pinned_key_changes_when_system_prompt_changes(cached_answer_probe, monkeypatch):
+    """Editing the prompt must invalidate the cache.
+
+    This is the failure that hides its own experiment: you edit the abstain
+    wording to fix over-abstention, re-run the eval, get byte-identical results,
+    and conclude the wording does not matter. The pin covers the ids and the
+    date; the system prompt reaches the key through the messages digest that
+    ``parallax.llm.call._hash_prompt`` folds into every pinned key.
+    """
+    ev = _evidence()
+    kwargs = {"question_id": "qid-1", "today": "2026-09-09"}
+
+    answer(ev, "Q?", **kwargs)
+    assert len(cached_answer_probe) == 1
+
+    answer(ev, "Q?", **kwargs)
+    assert len(cached_answer_probe) == 1, "an unchanged prompt must still hit"
+
+    monkeypatch.setattr(
+        evidence_module,
+        "SYSTEM_PROMPT_BASE",
+        evidence_module.SYSTEM_PROMPT_BASE + "\nPrefer the most recent evidence.\n",
+    )
+    answer(ev, "Q?", **kwargs)
+    assert len(cached_answer_probe) == 2, "a prompt edit must be a cache MISS"

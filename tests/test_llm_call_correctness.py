@@ -420,6 +420,48 @@ def test_transient_classified_by_exception_type(
     )
 
 
+@pytest.mark.parametrize(
+    ("exc_cls", "transient"),
+    [
+        # TimeoutException subclasses.
+        (httpx.ConnectTimeout, True),
+        (httpx.ReadTimeout, True),
+        (httpx.WriteTimeout, True),
+        (httpx.PoolTimeout, True),
+        # NetworkError subclasses.
+        (httpx.ConnectError, True),
+        (httpx.ReadError, True),
+        (httpx.WriteError, True),
+        (httpx.CloseError, True),
+        # The peer broke the protocol, or the proxy in between failed.
+        (httpx.RemoteProtocolError, True),
+        (httpx.ProxyError, True),
+        # Bugs in the request THIS side built: retrying cannot fix them.
+        (httpx.LocalProtocolError, False),
+        (httpx.UnsupportedProtocol, False),
+    ],
+)
+def test_httpx_transport_errors_classified_by_hierarchy(
+    exc_cls: type[Exception], transient: bool
+) -> None:
+    """httpx's own class hierarchy decides, not a hand-picked list of leaves.
+
+    The old list named four classes, so ``WriteError``, ``CloseError`` and
+    ``ProxyError`` — transport failures a retry can resolve — never reached
+    ``fallback_model``. The shared ``TransportError`` base is not the answer
+    either: it would make ``LocalProtocolError`` and ``UnsupportedProtocol``
+    (a malformed request, an unsupported URL scheme) transient too.
+
+    The message is deliberately neutral so the text probe cannot rescue a
+    misclassified type — the TYPE is what is under test.
+    """
+    exc = exc_cls("transport failure")
+
+    assert call_mod._is_httpx_transient(exc) is transient
+    classified = call_mod._classify_provider_error(exc)
+    assert type(classified) is (LLMTransientError if transient else LLMCallError)
+
+
 def test_transient_classified_by_exception_type_for_ollama_http(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

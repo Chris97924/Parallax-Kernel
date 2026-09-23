@@ -246,7 +246,15 @@ def _exception_status_code(exc: BaseException) -> int | None:
 
 
 def _is_httpx_transient(exc: BaseException) -> bool:
-    """True for httpx transport failures (timeout, connect, protocol).
+    """True for httpx transport failures a retry can plausibly resolve.
+
+    Decided by httpx's own hierarchy, not a hand-picked list of leaf classes:
+    every ``TimeoutException`` and every ``NetworkError`` (connect, read, write,
+    close), plus ``RemoteProtocolError`` (the peer broke the protocol) and
+    ``ProxyError``. NOT the shared ``TransportError`` base: that would also
+    make ``LocalProtocolError`` and ``UnsupportedProtocol`` transient, and
+    those are bugs in the request this side built (a malformed header, an
+    unsupported URL scheme) that no retry or fallback model can fix.
 
     ``sys.modules`` is read rather than imported: an httpx exception instance
     cannot exist unless httpx is already imported, so an absent module is a
@@ -259,9 +267,9 @@ def _is_httpx_transient(exc: BaseException) -> bool:
         cls
         for cls in (
             getattr(httpx, "TimeoutException", None),
-            getattr(httpx, "ConnectError", None),
-            getattr(httpx, "ReadError", None),
+            getattr(httpx, "NetworkError", None),
             getattr(httpx, "RemoteProtocolError", None),
+            getattr(httpx, "ProxyError", None),
         )
         if isinstance(cls, type)
     )

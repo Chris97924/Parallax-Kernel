@@ -299,6 +299,49 @@ def test_rejudge_preserves_cache_flags(monkeypatch):
     assert legacy.judge_cached is False
 
 
+def test_rejudge_unparseable_verdict_keeps_the_calls_cost_facts(monkeypatch):
+    """A judge reply that will not parse was still a judge call.
+
+    ``_rejudge_one`` read ``jr.cached`` only after ``parse_verdict`` succeeded,
+    and its except branch reset the flag to False and the tokens to 0. A judge
+    reply served out of ``llm_cache`` whose text could not be parsed was
+    therefore billed as a live call, while a live one that could not be parsed
+    dropped the tokens it really spent. Only a raise from the call ITSELF means
+    no judge call happened.
+    """
+    import eval.longmemeval.rejudge as rejudge
+
+    def _judge(cached: bool):
+        return lambda **_kw: GeminiResult(
+            text="MAYBE\nhard to say",
+            prompt_tokens=100,
+            output_tokens=5,
+            model="gemini-3.1-pro-preview",
+            cached=cached,
+        )
+
+    # A replayed, unparseable judge reply on a replayed answer: nothing billed.
+    monkeypatch.setattr(rejudge, "call", _judge(True))
+    rec = rejudge._rejudge_one(_rejudge_src(), "gemini-3.1-pro-preview")
+    assert rec.verdict == "ERROR"
+    assert rec.judge_cached is True, "a replay is a replay whether or not it parses"
+    assert (rec.judge_prompt_tokens, rec.judge_output_tokens) == (100, 5)
+    summary = run_mod._summarize([rec])
+    assert summary["tokens_billed"] == 0
+    assert summary["tokens_out_billed"] == 0
+    assert summary["replay_count"] == 2
+
+    # A live, unparseable judge reply: its tokens were spent and are billed.
+    monkeypatch.setattr(rejudge, "call", _judge(False))
+    live = rejudge._rejudge_one(_rejudge_src(), "gemini-3.1-pro-preview")
+    assert live.verdict == "ERROR"
+    assert live.judge_cached is False
+    assert (live.judge_prompt_tokens, live.judge_output_tokens) == (100, 5)
+    live_summary = run_mod._summarize([live])
+    assert live_summary["tokens_billed"] == 100
+    assert live_summary["tokens_out_billed"] == 5
+
+
 def test_summary_output_tokens_exclude_replays(monkeypatch, tmp_path):
     """Completion tokens are billed too, so replays must be netted out of them.
 

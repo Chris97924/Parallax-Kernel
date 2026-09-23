@@ -79,6 +79,10 @@ def _rejudge_one(src: dict, judge_model: str) -> AnswerRecord:
         answer_session_ids=(),
     )
     prediction = src.get("prediction", "") or ""
+    # What the record says when the call ITSELF raises: no judge call happened,
+    # so nothing was spent and nothing was replayed.
+    judge_pt = judge_ot = 0
+    judge_cached = False
     try:
         jr: GeminiResult = call(
             model=judge_model,
@@ -86,18 +90,19 @@ def _rejudge_one(src: dict, judge_model: str) -> AnswerRecord:
             system=JUDGE_SYSTEM,
             max_output_tokens=256,
         )
-        verdict, reason = parse_verdict(jr.text)
+        # Read the call's cost facts BEFORE parsing its text: a reply that
+        # fails ``parse_verdict`` was still produced — billed if live, free if
+        # replayed — so the except branch below must not undo them.
         judge_pt, judge_ot = jr.prompt_tokens, jr.output_tokens
         # PA-PARALLAX-F9 (r3): the judge call this record describes is THIS
         # call, so its replay flag is the one the caching layer just reported.
         # Defaulting it to False marked every replayed re-judge as live spend.
         judge_cached = jr.cached
+        verdict, reason = parse_verdict(jr.text)
     except Exception as exc:  # noqa: BLE001
         logger.exception("rejudge failed for %s", src["question_id"])
         verdict = "ERROR"
         reason = f"rejudge exception: {str(exc)[:240]}"
-        judge_pt = judge_ot = 0
-        judge_cached = False
 
     return AnswerRecord(
         question_id=src["question_id"],

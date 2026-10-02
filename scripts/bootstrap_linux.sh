@@ -28,12 +28,15 @@ die() { printf '\n\033[1;31m[parallax-bootstrap] ERROR:\033[0m %s\n' "$*" >&2; e
 # cannot bypass the check.
 UV_MIN="0.9.17"
 UV_BIN="$(command -v uv)" || die "uv not found. Install uv >= $UV_MIN first: https://docs.astral.sh/uv/"
-[[ "$UV_BIN" == /* ]] || UV_BIN="$(cd "$(dirname "$UV_BIN")" && pwd)/$(basename "$UV_BIN")"
+[[ "$UV_BIN" == /* ]] || UV_BIN="$(CDPATH= cd -- "$(dirname -- "$UV_BIN")" >/dev/null && pwd)/$(basename -- "$UV_BIN")"
 UV_OUT="$("$UV_BIN" --version 2>/dev/null)" && UV_RC=0 || UV_RC=$?
 UV_VER="$(awk 'NR == 1 {print $2}' <<<"$UV_OUT")"
 if [[ "$UV_RC" -ne 0 || ! "$UV_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   UV_ERR="$("$UV_BIN" --version 2>&1 >/dev/null || true)"
-  die "\`$UV_BIN --version\` exited $UV_RC without a plain release version x.y.z (stdout: '$UV_OUT'; stderr: '$UV_ERR'). uv >= $UV_MIN is required; pre-release and local builds such as 0.9.17rc1 or 0.12.18+3 are refused."
+  if [[ "$UV_RC" -eq 0 ]]; then WHY="printed no plain release version x.y.z"
+  elif [[ "$UV_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then WHY="printed version $UV_VER but exited with status $UV_RC"
+  else WHY="exited with status $UV_RC without a plain release version x.y.z"; fi
+  die "\`$UV_BIN --version\` $WHY (stdout: '$UV_OUT'; stderr: '$UV_ERR'). uv >= $UV_MIN is required; pre-release and local builds such as 0.9.17rc1 or 0.12.18+3 are refused."
 fi
 version_ge() { # numeric x.y.z comparison: is $1 >= $2 ?
   local -a a b
@@ -64,10 +67,12 @@ else
     # An existing clone is updated in one state only: origin is $REPO_URL, HEAD
     # is on $BRANCH and the tracked files are clean; then only by fast-forward.
     # Every other state stops before the clone is changed (a fetch may update
-    # refs/remotes/origin/$BRANCH, nothing else). No branch is created or switched.
+    # refs/remotes/origin/$BRANCH and FETCH_HEAD, nothing else). No branch is
+    # created or switched.
     stop_clone() { die "existing clone $REPO_DIR: $1. Run this script from a fresh directory, or bring the clone to a clean $BRANCH by hand and re-run."; }
-    ORIGIN_URL="$(git -C "$REPO_DIR" config --get remote.origin.url)" || stop_clone "it has no origin remote"
-    [[ "$ORIGIN_URL" == "$REPO_URL" ]] || stop_clone "origin is $ORIGIN_URL, not $REPO_URL"
+    ORIGIN_URLS="$(git -C "$REPO_DIR" remote get-url --all origin 2>/dev/null)" || stop_clone "it has no origin remote"
+    BAD_URL="$(grep -vxF -- "$REPO_URL" <<<"$ORIGIN_URLS" | head -n 1 || true)"
+    [[ -z "$BAD_URL" ]] || stop_clone "origin fetches from $BAD_URL (after git's URL rewriting), not $REPO_URL"
     CUR_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD)" || stop_clone "HEAD is detached"
     [[ "$CUR_BRANCH" == "$BRANCH" ]] || stop_clone "it is on branch $CUR_BRANCH, not $BRANCH"
     DIRTY="$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" || stop_clone "git status failed"
@@ -75,12 +80,18 @@ else
     for lock in "refs/heads/$BRANCH.lock" HEAD.lock index.lock; do
       [[ ! -e "$REPO_DIR/.git/$lock" ]] || stop_clone "lock file .git/$lock exists (another git process, or a stale lock)"
     done
+    for op in MERGE_HEAD rebase-apply rebase-merge CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+      [[ ! -e "$REPO_DIR/.git/$op" ]] || stop_clone "an unfinished git operation is in progress (.git/$op exists)"
+    done
     say "repo already cloned at $REPO_DIR, fast-forwarding $BRANCH"
     git -C "$REPO_DIR" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" \
       || stop_clone "fetching $BRANCH from origin failed"
-    git -C "$REPO_DIR" merge-base --is-ancestor HEAD "origin/$BRANCH" \
+    git -C "$REPO_DIR" merge-base --is-ancestor HEAD "refs/remotes/origin/$BRANCH" \
       || stop_clone "$BRANCH has commits that are not on origin/$BRANCH, so it is not a fast-forward"
-    git -C "$REPO_DIR" merge --ff-only "origin/$BRANCH" || stop_clone "fast-forward of $BRANCH failed"
+    git -C "$REPO_DIR" merge --ff-only --no-overwrite-ignore "refs/remotes/origin/$BRANCH" \
+      || stop_clone "fast-forward of $BRANCH failed"
+  elif [[ -e "$REPO_DIR" ]]; then
+    die "$REPO_DIR exists but is not a git clone this script can use (no .git directory). Run this script from a fresh directory, or move $REPO_DIR away and re-run."
   else
     say "cloning $REPO_URL (branch $BRANCH)"
     git clone -b "$BRANCH" --depth 1 "$REPO_URL" "$REPO_DIR"

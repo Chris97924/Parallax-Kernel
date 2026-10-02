@@ -97,3 +97,7 @@ select = ["E", "F", "I", "UP", "B"]
 # defaults; B008 flags it as a function call in defaults. Treat it as an
 # immutable call so the documented FastAPI pattern stays lint-clean.
 extend-immutable-calls = ["fastapi.Depends"]
+
+[tool.uv]
+# Supply-chain cooldown: resolve only releases at least 7 days old.
+exclude-newer = "7 days"

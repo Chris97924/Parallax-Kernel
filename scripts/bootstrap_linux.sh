@@ -23,13 +23,18 @@ die() { printf '\n\033[1;31m[parallax-bootstrap] ERROR:\033[0m %s\n' "$*" >&2; e
 # uv.lock is written with a relative exclude-newer cooldown ("7 days" in
 # pyproject.toml). uv older than 0.9.17 cannot parse it, ignores the lock and
 # resolves afresh, so refuse to continue with such a uv. The binary checked
-# here (UV_BIN) is the one used for the install, even after the venv is
-# activated, so a uv inside .venv/bin cannot bypass the check.
+# here (UV_BIN, made absolute) is the one used for the install, even after the
+# script changes directory or activates the venv, so a uv inside .venv/bin
+# cannot bypass the check.
 UV_MIN="0.9.17"
 UV_BIN="$(command -v uv)" || die "uv not found. Install uv >= $UV_MIN first: https://docs.astral.sh/uv/"
-UV_OUT="$("$UV_BIN" --version 2>&1)" || die "\`$UV_BIN --version\` failed (got: $UV_OUT); uv >= $UV_MIN is required"
-UV_VER="$(awk '{print $2}' <<<"$UV_OUT")"
-[[ "$UV_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "could not read a release version x.y.z from \`$UV_BIN --version\` (got: $UV_OUT); uv >= $UV_MIN is required"
+[[ "$UV_BIN" == /* ]] || UV_BIN="$(cd "$(dirname "$UV_BIN")" && pwd)/$(basename "$UV_BIN")"
+UV_OUT="$("$UV_BIN" --version 2>/dev/null)" && UV_RC=0 || UV_RC=$?
+UV_VER="$(awk 'NR == 1 {print $2}' <<<"$UV_OUT")"
+if [[ "$UV_RC" -ne 0 || ! "$UV_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  UV_ERR="$("$UV_BIN" --version 2>&1 >/dev/null || true)"
+  die "\`$UV_BIN --version\` exited $UV_RC without a plain release version x.y.z (stdout: '$UV_OUT'; stderr: '$UV_ERR'). uv >= $UV_MIN is required; pre-release and local builds such as 0.9.17rc1 or 0.12.18+3 are refused."
+fi
 version_ge() { # numeric x.y.z comparison: is $1 >= $2 ?
   local -a a b
   local i
@@ -56,23 +61,26 @@ if [[ -f pyproject.toml ]] && grep -q '^name = "parallax-kernel"' pyproject.toml
 else
   REPO_DIR="$(pwd)/parallax-kernel"
   if [[ -d "$REPO_DIR/.git" ]]; then
-    say "repo already cloned at $REPO_DIR, updating it to the latest $BRANCH"
-    # Explicit refspec: a clone made with `-b <other branch> --depth 1` only
-    # tracks that one branch. Local commits and changes are never discarded:
-    # anything that is not a clean switch plus fast-forward stops the script.
+    # An existing clone is updated in one state only: origin is $REPO_URL, HEAD
+    # is on $BRANCH and the tracked files are clean; then only by fast-forward.
+    # Every other state stops before the clone is changed (a fetch may update
+    # refs/remotes/origin/$BRANCH, nothing else). No branch is created or switched.
+    stop_clone() { die "existing clone $REPO_DIR: $1. Run this script from a fresh directory, or bring the clone to a clean $BRANCH by hand and re-run."; }
+    ORIGIN_URL="$(git -C "$REPO_DIR" config --get remote.origin.url)" || stop_clone "it has no origin remote"
+    [[ "$ORIGIN_URL" == "$REPO_URL" ]] || stop_clone "origin is $ORIGIN_URL, not $REPO_URL"
+    CUR_BRANCH="$(git -C "$REPO_DIR" symbolic-ref --quiet --short HEAD)" || stop_clone "HEAD is detached"
+    [[ "$CUR_BRANCH" == "$BRANCH" ]] || stop_clone "it is on branch $CUR_BRANCH, not $BRANCH"
+    DIRTY="$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" || stop_clone "git status failed"
+    [[ -z "$DIRTY" ]] || stop_clone "it has uncommitted changes"
+    for lock in "refs/heads/$BRANCH.lock" HEAD.lock index.lock; do
+      [[ ! -e "$REPO_DIR/.git/$lock" ]] || stop_clone "lock file .git/$lock exists (another git process, or a stale lock)"
+    done
+    say "repo already cloned at $REPO_DIR, fast-forwarding $BRANCH"
     git -C "$REPO_DIR" fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH" \
-      || die "could not fetch $BRANCH from origin into $REPO_DIR"
-    if git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
-      git -C "$REPO_DIR" checkout "$BRANCH" \
-        || die "could not switch $REPO_DIR to $BRANCH (local changes in the way?); commit or stash them, then re-run"
-      git -C "$REPO_DIR" merge --ff-only "origin/$BRANCH" \
-        || die "$BRANCH in $REPO_DIR cannot fast-forward to origin/$BRANCH (local commits or changes); nothing was discarded, resolve it by hand, then re-run"
-    else
-      git -C "$REPO_DIR" checkout --no-track -b "$BRANCH" "origin/$BRANCH" \
-        || die "could not switch $REPO_DIR to a new $BRANCH branch (local changes in the way?); commit or stash them, then re-run"
-    fi
-    [[ "$(git -C "$REPO_DIR" rev-parse HEAD)" == "$(git -C "$REPO_DIR" rev-parse "origin/$BRANCH")" ]] \
-      || die "$BRANCH in $REPO_DIR has local commits that are not on origin/$BRANCH; nothing was discarded, resolve it by hand, then re-run"
+      || stop_clone "fetching $BRANCH from origin failed"
+    git -C "$REPO_DIR" merge-base --is-ancestor HEAD "origin/$BRANCH" \
+      || stop_clone "$BRANCH has commits that are not on origin/$BRANCH, so it is not a fast-forward"
+    git -C "$REPO_DIR" merge --ff-only "origin/$BRANCH" || stop_clone "fast-forward of $BRANCH failed"
   else
     say "cloning $REPO_URL (branch $BRANCH)"
     git clone -b "$BRANCH" --depth 1 "$REPO_URL" "$REPO_DIR"

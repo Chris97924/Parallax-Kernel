@@ -13,19 +13,39 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/Chris97924/parallax-kernel.git"
-BRANCH="feat/adr-006-xcouncil-phase1"
+BRANCH="main-next"
 TARGET_DIR="${1:-./parallax-instance}"
 
 say() { printf '\n\033[1;36m[parallax-bootstrap]\033[0m %s\n' "$*"; }
 die() { printf '\n\033[1;31m[parallax-bootstrap] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# ---- 1. Python 3.11+ ---------------------------------------------------------
+# ---- 1. uv + Python 3.11+ ----------------------------------------------------
+# uv.lock is written with a relative exclude-newer cooldown ("7 days" in
+# pyproject.toml). uv older than 0.9.17 cannot parse it, ignores the lock and
+# resolves afresh, so refuse to continue with such a uv.
+UV_MIN="0.9.17"
+command -v uv >/dev/null 2>&1 || die "uv not found. Install uv >= $UV_MIN first: https://docs.astral.sh/uv/"
+UV_VER="$(uv --version | awk '{print $2}')"
+UV_VER="${UV_VER%%[!0-9.]*}"
+[[ "$UV_VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "could not read the uv version from: $(uv --version)"
+version_ge() { # numeric x.y.z comparison: is $1 >= $2 ?
+  local -a a b
+  local i
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    if (( 10#${a[i]} > 10#${b[i]} )); then return 0; fi
+    if (( 10#${a[i]} < 10#${b[i]} )); then return 1; fi
+  done
+  return 0
+}
+version_ge "$UV_VER" "$UV_MIN" || die "uv $UV_VER found, but uv >= $UV_MIN is required to read uv.lock. Upgrade uv: https://docs.astral.sh/uv/"
+
 if ! command -v python3 >/dev/null 2>&1; then
   die "python3 not found. Install Python 3.11+ first."
 fi
 PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3,11) else 0)')
 [[ "$PY_OK" == "1" ]] || die "Python >= 3.11 required (found $(python3 --version))."
-command -v uv >/dev/null 2>&1 || die "uv not found. Install uv first: https://docs.astral.sh/uv/"
 
 # ---- 2. Clone repo if not already inside it ---------------------------------
 if [[ -f pyproject.toml ]] && grep -q '^name = "parallax-kernel"' pyproject.toml 2>/dev/null; then
@@ -53,7 +73,11 @@ fi
 # shellcheck disable=SC1091
 . .venv/bin/activate
 say "installing parallax-kernel (editable) from uv.lock, runtime dependencies only"
-uv sync --locked
+# Inexact sync: versions come from uv.lock, but nothing already in .venv is
+# removed, so extras an operator added (e.g. server) survive a re-run. The dev
+# extra is not installed; tools left behind by an earlier bootstrap stay until
+# someone runs an exact `uv sync --locked` on purpose.
+uv sync --locked --inexact
 
 # ---- 4. Bootstrap DB + vault at TARGET_DIR ----------------------------------
 TARGET_DIR_ABS="$(cd "$(dirname "$TARGET_DIR")" && pwd)/$(basename "$TARGET_DIR")"

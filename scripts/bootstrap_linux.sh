@@ -4,8 +4,7 @@
 # there is no cross-host memory sharing until the v0.6 HTTP server ships.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Chris97924/parallax-kernel/feat/adr-006-xcouncil-phase1/scripts/bootstrap_linux.sh | bash
-# Or after cloning:
+# After cloning:
 #   bash scripts/bootstrap_linux.sh [TARGET_DIR]
 #
 # TARGET_DIR defaults to ./parallax-instance. The venv is created inside the
@@ -26,6 +25,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3,11) else 0)')
 [[ "$PY_OK" == "1" ]] || die "Python >= 3.11 required (found $(python3 --version))."
+command -v uv >/dev/null 2>&1 || die "uv not found. Install uv first: https://docs.astral.sh/uv/"
 
 # ---- 2. Clone repo if not already inside it ---------------------------------
 if [[ -f pyproject.toml ]] && grep -q '^name = "parallax-kernel"' pyproject.toml 2>/dev/null; then
@@ -52,9 +52,8 @@ if [[ ! -d .venv ]]; then
 fi
 # shellcheck disable=SC1091
 . .venv/bin/activate
-say "installing parallax-kernel (editable)"
-pip install --upgrade pip >/dev/null
-pip install -e '.[dev]'
+say "installing parallax-kernel (editable) from uv.lock, runtime dependencies only"
+uv sync --locked
 
 # ---- 4. Bootstrap DB + vault at TARGET_DIR ----------------------------------
 TARGET_DIR_ABS="$(cd "$(dirname "$TARGET_DIR")" && pwd)/$(basename "$TARGET_DIR")"

@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 load_dotenv("E:/Workspace/Parallax/.env")
 
 # Bootstrap env before any Parallax import
-os.environ.setdefault("PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434")
+os.environ.setdefault("PARALLAX_EMBEDDING_BASE_URL", "http://localhost:11434")
 # Mirror the embedding host for the answer/judge LLM calls unless the caller
 # routed them explicitly - parallax.llm.call checks PARALLAX_OLLAMA_BASE_URL
 # then OLLAMA_BASE_URL, so mirroring over either would hijack a deliberate

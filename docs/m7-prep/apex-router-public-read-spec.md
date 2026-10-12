@@ -422,7 +422,7 @@ These questions are deliberately deferred from this spec to the M7 implementatio
 
 ### 8.1 Q1 — Apex router = HTTP service or in-process Python lib?
 
-**Question**: Should the M7 Apex router be a long-running HTTP service (binding `parallax.chris-server.com/retrieve` or similar) OR an in-process Python module that callers `import` directly?
+**Question**: Should the M7 Apex router be a long-running HTTP service (binding `parallax.example.com/retrieve` or similar) OR an in-process Python module that callers `import` directly?
 
 **Recommendation**: **In-process Python lib, with the retrieve facade shim providing an optional HTTP loopback wrapper if external clients need it.**
 

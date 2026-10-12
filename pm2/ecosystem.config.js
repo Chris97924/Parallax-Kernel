@@ -5,7 +5,7 @@
 //   pm2 logs parallax
 //   pm2 stop parallax
 //
-// Designed for the ZenBook deploy (chris@192.168.1.111). Default ports match
+// Designed for the ZenBook deploy (<user>@<zenbook-host>). Default ports match
 // the runbook (`docs/lane-c/m2-rollout-runbook.md`).
 //
 // Log files:

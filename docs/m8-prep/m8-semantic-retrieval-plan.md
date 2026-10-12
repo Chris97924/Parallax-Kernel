@@ -7,7 +7,7 @@ LongMemEval harness — which the v0.6 burn proved too weak on multi-session
 questions (10–25%, a recall problem) — with a true hybrid retriever:
 **lexical (BM25-lite) + dense vector cosine, fused with Reciprocal Rank Fusion
 (RRF, k=60)**. Embedding model = `bge-m3` (1024-dim) served by the GB10 Ollama
-instance at `http://192.168.1.134:11434`.
+instance at `http://<ollama-host>:11434`.
 
 This document surveys the existing retrieval paths, fixes the storage/provider
 design to Parallax's SQLite/in-proc ecosystem, and specifies the flag, the
@@ -141,7 +141,7 @@ class EmbeddingProvider(Protocol):
   `parallax/extract/providers/openrouter.py:13`).
 * `dim = 1024`, model `bge-m3`.
 * Base URL from env `PARALLAX_EMBEDDING_BASE_URL`, default
-  `http://192.168.1.134:11434` (GB10). Calls `POST {base}/api/embeddings` (or
+  `http://<ollama-host>:11434` (GB10). Calls `POST {base}/api/embeddings` (or
   `/api/embed` for batch) with `{"model": "bge-m3", "prompt": text}`.
 * SSRF note (mirror `openrouter.py:26` docstring): `base_url` is operator
   config, not validated; pin in deployment.

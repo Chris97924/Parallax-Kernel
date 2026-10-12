@@ -47,7 +47,7 @@ latency_ms
 
 Shadow does **nothing** in production until both flags are set. Default state after merge: fully bypassed (zero overhead).
 
-**Where:** ZenBook (`chris@192.168.1.111`), Parallax v0.6 service env file. Per `project_parallax_zenbook_deploy` memory the deploy is a systemd unit; flag flips need a service restart-on-edit OR re-export inside the unit's environment file.
+**Where:** ZenBook (`<user>@<zenbook-host>`), Parallax v0.6 service env file. Per `project_parallax_zenbook_deploy` memory the deploy is a systemd unit; flag flips need a service restart-on-edit OR re-export inside the unit's environment file.
 
 **Who:** Chris flips the flag manually. Not part of CI / not auto-rolled.
 

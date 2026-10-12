@@ -589,12 +589,12 @@ def _gemini_stop_reason(resp: object) -> str:
 # ---------- Local (Ollama) provider -----------------------------------------
 
 #: Env vars selecting the Ollama base URL, checked in order. Operator config —
-#: a non-empty value wins. Default points at GB10.
+#: a non-empty value wins. Default is the local Ollama endpoint.
 _OLLAMA_BASE_URL_ENVS: tuple[str, ...] = (
     "PARALLAX_OLLAMA_BASE_URL",
     "OLLAMA_BASE_URL",
 )
-_DEFAULT_OLLAMA_BASE_URL = "http://192.168.1.134:11434"
+_DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 #: Routing prefixes that select the local Ollama provider. Stripped before the
 #: model name is sent on the wire; the original prefixed name is echoed back so
 #: cache keys and run reports stay stable.
@@ -609,7 +609,7 @@ def _ollama_base_url() -> str:
     the cache identity, so the two can never disagree about the endpoint.
 
     Env vars in :data:`_OLLAMA_BASE_URL_ENVS` are checked in order — the first
-    non-empty value wins — else the GB10 default. Normalization is deliberate so
+    non-empty value wins — else the localhost default. Normalization is deliberate so
     equivalent configs don't spuriously miss the cache: surrounding whitespace is
     stripped, trailing slashes removed, and the value lower-cased. Ollama base
     URLs are ``scheme://host:port`` (scheme + host + port are case-insensitive)
@@ -704,7 +704,7 @@ def _call_ollama(
     """Call a local model served by Ollama via ``POST /api/chat``.
 
     ``base_url`` comes from ``PARALLAX_OLLAMA_BASE_URL`` / ``OLLAMA_BASE_URL``
-    (operator config, default GB10) and is **not validated** — do not wire it to
+    (operator config, default localhost) and is **not validated** — do not wire it to
     untrusted input (SSRF). The ``ollama:`` / ``local:`` routing prefix is
     stripped from the model name before it is sent; the original prefixed name is
     returned in the ``model`` field so cache keys and reports stay stable.

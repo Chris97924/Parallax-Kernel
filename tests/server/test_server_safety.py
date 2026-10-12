@@ -60,7 +60,7 @@ class TestBindHostIsSafe:
         assert bind_host_is_safe(host) is True
 
     @pytest.mark.parametrize(
-        "host", ["0.0.0.0", "192.168.1.111", "parallax.example.com", "::"]
+        "host", ["0.0.0.0", "192.168.0.10", "parallax.example.com", "::"]
     )
     def test_public_variants_all_unsafe(self, host: str) -> None:
         assert bind_host_is_safe(host) is False

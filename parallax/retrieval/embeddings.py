@@ -6,7 +6,7 @@ Two backends speak the :class:`EmbeddingProvider` protocol:
   network. Used by every unit test and as the offline default so importing
   this module never makes a network call.
 * :class:`OllamaEmbeddingProvider` — ``httpx`` against an Ollama server serving
-  ``bge-m3`` (1024-dim). Base URL is operator config (env, default GB10).
+  ``bge-m3`` (1024-dim). Base URL is operator config (env, default localhost).
 
 :func:`get_embedding_provider` is the env-driven factory: it returns the stub
 unless ``PARALLAX_EMBEDDING_BASE_URL`` selects the live Ollama provider.
@@ -42,7 +42,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OLLAMA_BASE_URL = "http://192.168.1.134:11434"
+DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_EMBEDDING_MODEL = "bge-m3"
 STUB_DIM = 64
 BGE_M3_DIM = 1024

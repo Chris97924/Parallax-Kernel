@@ -27,7 +27,7 @@ Two layers, mirroring the rest of the M8 suite:
   evaluation. Run it with::
 
       PARALLAX_EMBEDDING_LIVE=1 \\
-      PARALLAX_EMBEDDING_BASE_URL=http://192.168.1.134:11434 \\
+      PARALLAX_EMBEDDING_BASE_URL=http://<ollama-host>:11434 \\
       pytest tests/eval/test_hybrid_vs_lexical_quality.py -m integration
 
 The live fixture strings were validated against live bge-m3 (2026-06-20): the
@@ -324,7 +324,7 @@ def test_live_bge_m3_hybrid_ranks_answer_above_lexical(monkeypatch):
     on GB10 the dense leg lifts the lexically-weak Rust row to rank 1, beating
     the lexical distractor that pure-lexical scoring placed first.
     """
-    base_url = os.environ.get("PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434")
+    base_url = os.environ.get("PARALLAX_EMBEDDING_BASE_URL", "http://localhost:11434")
     monkeypatch.setenv(SEMANTIC_RETRIEVAL_ENV, "1")
     monkeypatch.setenv(EMBEDDING_BASE_URL_ENV, base_url)
 
@@ -354,7 +354,7 @@ def test_live_bge_m3_hybrid_ranks_answer_above_lexical(monkeypatch):
 @pytest.mark.skipif(not _LIVE, reason="set PARALLAX_EMBEDDING_LIVE=1 to hit GB10 bge-m3")
 def test_live_bge_m3_hybrid_top1_selects_answer(monkeypatch):
     """Live ``top_k=1``: hybrid selects the answer row; lexical selects the distractor."""
-    base_url = os.environ.get("PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434")
+    base_url = os.environ.get("PARALLAX_EMBEDDING_BASE_URL", "http://localhost:11434")
     monkeypatch.setenv(SEMANTIC_RETRIEVAL_ENV, "1")
     monkeypatch.setenv(EMBEDDING_BASE_URL_ENV, base_url)
 

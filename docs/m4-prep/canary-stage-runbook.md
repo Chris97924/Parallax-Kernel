@@ -23,7 +23,7 @@ M4 canary = **shadow observer**：`parallax/canary_shadow.py` 對「已完成的
 
 - **不切流量**：每個 request 仍由 `DualReadRouter` 同時跑 primary(`RealMemoryRouter`) + secondary(`AphelionReadAdapter`)，**client 永遠收到 `result.primary`**。推進 stage = **觀察更多**，不是把更多真流量導去新路徑。
 - **stage 旋鈕** = `PARALLAX_CANARY_SHADOW_FRACTION` 環境變數（per-request `random.random() < fraction` 抽樣）。
-- **主機**：ZenBook `192.168.1.111`，single-user。`parallax-server` = **system service**（`/etc/systemd/system/parallax-server.service`，需 `sudo`）。
+- **主機**：ZenBook `<zenbook-host>`，single-user。`parallax-server` = **system service**（`/etc/systemd/system/parallax-server.service`，需 `sudo`）。
 
 ## 2. Stage 對應表（spec §3）
 

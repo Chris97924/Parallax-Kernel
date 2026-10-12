@@ -421,7 +421,7 @@ def test_call_ollama_strips_prefix_and_maps_tokens(clean_ollama_env):
     # Original prefixed name is preserved in the return for stable cache keys.
     assert out["model"] == "ollama:qwen3.6:latest"
     # Endpoint + default GB10 base URL.
-    assert captured["url"] == "http://192.168.1.134:11434/api/chat"
+    assert captured["url"] == "http://localhost:11434/api/chat"
     # Options + stream mapping.
     assert captured["json"]["options"]["num_predict"] == 128
     assert captured["json"]["options"]["temperature"] == 0.0
@@ -647,7 +647,7 @@ def test_ollama_base_url_toggle_busts_cache(isolated_cache, clean_ollama_env):
         url = call_module._ollama_base_url()
         seen_urls.append(url)
         # Different endpoints can serve different weights -> different answers.
-        text = "from-gb10" if "192.168.1.134" in url else "from-other"
+        text = "from-gb10" if "localhost" in url else "from-other"
         return {
             "text": text,
             "raw": {},
@@ -671,7 +671,7 @@ def test_ollama_base_url_toggle_busts_cache(isolated_cache, clean_ollama_env):
         "base-URL change did not bust the cache — stale endpoint answer replayed"
     )
     assert second["text"] == "from-other"
-    assert seen_urls == ["http://192.168.1.134:11434", "http://other-host:11434"]
+    assert seen_urls == ["http://localhost:11434", "http://other-host:11434"]
 
 
 def test_hash_prompt_base_url_in_ollama_identity(clean_ollama_env):

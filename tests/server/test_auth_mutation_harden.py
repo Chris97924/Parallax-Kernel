@@ -327,7 +327,7 @@ class TestBindHostIsSafe:
     def test_lookalike_hosts_are_unsafe(self, host: str) -> None:
         """Membership, not substring containment.
 
-        The pre-existing unsafe list ("0.0.0.0", "192.168.1.111", "::",
+        The pre-existing unsafe list ("0.0.0.0", "192.168.0.10", "::",
         "parallax.example.com") shares no substring with the allowlist, so a
         guard relaxed to ``any(h in host ...)`` passes it while waving through
         every public hostname that merely *contains* "localhost" or "::1".

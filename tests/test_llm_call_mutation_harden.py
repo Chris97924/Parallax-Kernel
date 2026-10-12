@@ -230,7 +230,7 @@ def test_the_ollama_provider_identity_is_a_stable_sorted_string(
     monkeypatch.delenv("PARALLAX_OLLAMA_THINK", raising=False)
 
     assert call_mod._ollama_provider_identity(0.0, 2048) == (
-        "base=http://192.168.1.134:11434|think=unset"
+        "base=http://localhost:11434|think=unset"
         '|opts={"num_predict": 2048, "temperature": 0.0}'
     )
 

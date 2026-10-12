@@ -8,7 +8,7 @@ existing marker in ``pyproject.toml``.
 Run explicitly::
 
     PARALLAX_EMBEDDING_LIVE=1 \\
-    PARALLAX_EMBEDDING_BASE_URL=http://192.168.1.134:11434 \\
+    PARALLAX_EMBEDDING_BASE_URL=http://<ollama-host>:11434 \\
     pytest tests/eval/test_longmemeval_live_smoke.py -m integration
 """
 
@@ -33,7 +33,7 @@ def test_bge_m3_returns_1024_dim_vector():
     from parallax.retrieval.embeddings import BGE_M3_DIM, OllamaEmbeddingProvider
 
     base_url = os.environ.get(
-        "PARALLAX_EMBEDDING_BASE_URL", "http://192.168.1.134:11434"
+        "PARALLAX_EMBEDDING_BASE_URL", "http://localhost:11434"
     )
     provider = OllamaEmbeddingProvider(base_url=base_url)
     vecs = provider.embed(["the user's favourite colour is teal"])

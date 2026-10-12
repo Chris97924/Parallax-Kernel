@@ -140,8 +140,10 @@ class EmbeddingProvider(Protocol):
 * `httpx` at module level (already a dep — `httpx==0.28.1` verified; mirrors
   `parallax/extract/providers/openrouter.py:13`).
 * `dim = 1024`, model `bge-m3`.
-* Base URL from env `PARALLAX_EMBEDDING_BASE_URL`, default
-  `http://<ollama-host>:11434` (GB10). Calls `POST {base}/api/embeddings` (or
+* Base URL from env `PARALLAX_EMBEDDING_BASE_URL`, e.g.
+  `http://<ollama-host>:11434` for GB10. Unset selects the offline stub
+  provider; `OllamaEmbeddingProvider` itself defaults to
+  `http://localhost:11434`. Calls `POST {base}/api/embeddings` (or
   `/api/embed` for batch) with `{"model": "bge-m3", "prompt": text}`.
 * SSRF note (mirror `openrouter.py:26` docstring): `base_url` is operator
   config, not validated; pin in deployment.

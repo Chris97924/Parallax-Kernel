@@ -131,6 +131,33 @@ class TestMicrosecondBoundary:
         assert s == "2024-06-15T12:00:00Z"
 
 
+class TestDateOnlyUntil:
+    """A date-only until must cover the whole UTC day, not just its first second."""
+
+    def test_same_day_window_includes_whole_day(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        _insert_event_at(conn, "2024-06-15T12:00:00.000000+00:00")
+        _insert_event_at(conn, "2024-06-15T23:59:59.999999+00:00")
+        hits = by_timeline(conn, user_id="u", since="2024-06-15", until="2024-06-15")
+        assert len(hits) == 2
+
+    def test_date_only_until_excludes_next_day(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        _insert_event_at(conn, "2024-06-16T00:00:00.000000+00:00")
+        hits = by_timeline(conn, user_id="u", since="2024-06-15", until="2024-06-15")
+        assert hits == []
+
+    def test_iso_normalize_date_only_until_is_end_of_day(self) -> None:
+        out = _iso_normalize("2024-06-15", kind="until")
+        assert out == "2024-06-15T23:59:59.999999+00:00"
+
+    def test_iso_normalize_date_only_since_is_midnight(self) -> None:
+        out = _iso_normalize("2024-06-15", kind="since")
+        assert out == "2024-06-15T00:00:00.000000+00:00"
+
+
 class TestNaiveTimestampLexCompare:
     """BUG 4 — naive stored ts must still participate correctly in window queries."""
 

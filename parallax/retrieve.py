@@ -409,6 +409,15 @@ def _parse_iso(ts: str) -> _dt.datetime:
     return _dt.datetime.fromisoformat(ts)
 
 
+def _is_date_only(ts: str) -> bool:
+    """True when ``ts`` is an ISO-8601 date with no time component."""
+    try:
+        _dt.date.fromisoformat(ts)
+    except ValueError:
+        return False
+    return True
+
+
 def _iso_normalize(ts: str, *, kind: str) -> str:
     """Normalize an ISO-8601 string to the exact form used by ``now_iso()``.
 
@@ -424,6 +433,10 @@ def _iso_normalize(ts: str, *, kind: str) -> str:
       second. Without this, ``now_iso()`` rows like
       ``"...T12:00:00.500000+00:00"`` fall OUTSIDE a query whose
       ``until="...T12:00:00Z"`` normalized naively (BUG 1).
+    * ``kind='until'`` with a date-only input (``"2026-10-26"``) expands to
+      the end of that UTC day, mirroring a date-only ``since`` that starts
+      at UTC midnight. Without this, ``since=until=<day>`` covered only the
+      first second of the day and dropped every event after it.
 
     ``kind`` is keyword-only and has no default: a silent miscall such as
     ``_iso_normalize(until_str)`` would apply ``since`` semantics to an
@@ -436,7 +449,9 @@ def _iso_normalize(ts: str, *, kind: str) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_dt.UTC)
     dt = dt.astimezone(_dt.UTC)
-    if kind == "until" and dt.microsecond == 0:
+    if kind == "until" and _is_date_only(ts):
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999_999)
+    elif kind == "until" and dt.microsecond == 0:
         dt = dt.replace(microsecond=999_999)
     # Force the ``.SSSSSS`` component so the lex-compared bound always has
     # the same layout as stored ``now_iso()`` rows (BUG 1/4).

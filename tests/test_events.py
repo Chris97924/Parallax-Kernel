@@ -54,6 +54,41 @@ class TestRecordEvent:
         # No row was written
         assert _events(conn) == []
 
+    def test_cross_tenant_target_rejected_like_orphan(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        foreign_id = ingest_claim(
+            conn, user_id="other", subject="x", predicate="y", object_="z"
+        )
+        before = len(_events(conn))
+        with pytest.raises(ValueError) as exc:
+            record_event(
+                conn,
+                user_id="u",
+                actor="system",
+                event_type="claim.state_changed",
+                target_kind="claim",
+                target_id=foreign_id,
+                payload=None,
+            )
+        # Same wording as a missing row, so callers can't probe another
+        # tenant's ids through the error.
+        assert str(exc.value) == (
+            f"orphan event rejected: ('claim', {foreign_id!r}) does not exist"
+        )
+        assert len(_events(conn)) == before
+        # The owner can still target it.
+        record_event(
+            conn,
+            user_id="other",
+            actor="system",
+            event_type="claim.state_changed",
+            target_kind="claim",
+            target_id=foreign_id,
+            payload=None,
+        )
+        assert len(_events(conn)) == before + 1
+
     def test_target_pair_must_be_consistent(self, conn: sqlite3.Connection) -> None:
         with pytest.raises(ValueError, match="must be provided together"):
             record_event(

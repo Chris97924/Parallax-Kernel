@@ -42,13 +42,21 @@ TargetKind = Literal["memory", "claim", "source", "decision"]
 
 
 def target_ref_exists(
-    conn: sqlite3.Connection, target_kind: str, target_id: str
+    conn: sqlite3.Connection,
+    target_kind: str,
+    target_id: str,
+    *,
+    user_id: str | None = None,
 ) -> bool:
     """Return True iff a row exists for ``(target_kind, target_id)``.
 
     Raises :class:`ValueError` when ``target_kind`` is not one of
     :data:`VALID_TARGET_KINDS`. ``target_id`` is compared by equality on the
     corresponding primary-key column; no wildcarding.
+
+    When ``user_id`` is given, the row must also belong to that user; a row
+    owned by another user counts as absent. Every target table carries a
+    ``user_id`` column.
 
     **Transaction isolation.** Under WAL-mode SQLite, a row returned as
     present here can be deleted by a concurrent writer before the caller's
@@ -64,8 +72,14 @@ def target_ref_exists(
             f"expected one of {sorted(VALID_TARGET_KINDS)}"
         ) from exc
 
-    row = conn.execute(
-        f"SELECT 1 FROM {table} WHERE {pk} = ? LIMIT 1",  # nosec B608: table+pk are fixed literals
-        (target_id,),
-    ).fetchone()
+    if user_id is None:
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE {pk} = ? LIMIT 1",  # nosec B608: table+pk are fixed literals
+            (target_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE {pk} = ? AND user_id = ? LIMIT 1",  # nosec B608: table+pk are fixed literals
+            (target_id, user_id),
+        ).fetchone()
     return row is not None

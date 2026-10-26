@@ -23,6 +23,7 @@ from parallax.migrations import migrate_to_latest
 REAL_MEMORY_MD = pathlib.Path(
     "C:/Users/user/.claude/projects/C--Users-user/memory/MEMORY.md"
 )
+REAL_MEMORY_REFERENCE_MD = REAL_MEMORY_MD.with_name("MEMORY-reference.md")
 
 
 @pytest.fixture()
@@ -214,16 +215,23 @@ class TestIngestMemoryMd:
         reason="Real MEMORY.md not present on this host",
     )
     def test_real_chris_memory_md(self, conn: sqlite3.Connection) -> None:
-        report = ingest_memory_md(
-            conn, memory_md_path=REAL_MEMORY_MD, user_id="chris"
-        )
+        # Since 2026-10-24 the Reference entries live in a sub-index next to
+        # MEMORY.md, so ingest it too when present.
+        index_paths = [REAL_MEMORY_MD]
+        if REAL_MEMORY_REFERENCE_MD.exists():
+            index_paths.append(REAL_MEMORY_REFERENCE_MD)
+        reports = [
+            ingest_memory_md(conn, memory_md_path=p, user_id="chris")
+            for p in index_paths
+        ]
         # S7: body-only regex filter — prose mentions of 'token' no longer
         # trigger the filter. All 10 companions should now be persisted.
-        total = report.cards_inserted + report.cards_updated
-        skipped = len(report.skipped_privacy)
+        total = sum(r.cards_inserted + r.cards_updated for r in reports)
+        skipped_privacy = [f for r in reports for f in r.skipped_privacy]
+        skipped = len(skipped_privacy)
         assert skipped == 0, (
             f"Expected 0 privacy-skipped cards after S7 fix, got {skipped}: "
-            f"{report.skipped_privacy}"
+            f"{skipped_privacy}"
         )
         assert total >= 10, f"Expected >=10 persisted cards, got {total}"
 

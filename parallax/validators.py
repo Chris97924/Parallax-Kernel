@@ -1,9 +1,8 @@
 """Reference-integrity validators for cross-table targets.
 
-Used by forthcoming event / decision writers to verify the
-``(target_kind, target_id)`` pair points at a real row before accepting a
-write. Kept as a stub helper -- no caller wires it yet; the public surface
-and tests are pinned so future integration has a stable contract to lean on.
+Used by :func:`parallax.events.record_event` to verify the
+``(target_kind, target_id)`` pair points at a real row owned by the writing
+user before accepting an event.
 """
 
 from __future__ import annotations

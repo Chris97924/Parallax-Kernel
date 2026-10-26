@@ -721,8 +721,8 @@ def by_decision(
         claim_rows = query(
             conn,
             f"SELECT claim_id, subject, predicate, object FROM claims "
-            f"WHERE claim_id IN ({placeholders})",
-            tuple(claim_ids),
+            f"WHERE user_id = ? AND claim_id IN ({placeholders})",
+            (user_id, *claim_ids),
         )
         for c in claim_rows:
             spo = f"{c['subject']} {c['predicate']} {c['object']}".strip()

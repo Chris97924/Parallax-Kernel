@@ -122,6 +122,48 @@ class TestByDecision:
         assert len(hits) == 1
         assert hits[0].entity_kind == "event"
 
+    def test_enrichment_does_not_leak_other_users_claim(
+        self, conn: sqlite3.Connection
+    ) -> None:
+        # record_event's orphan check is existence-only, so user "u" can
+        # point an event at user "other"'s claim. The title enrichment must
+        # stay inside u's tenant and never surface other's subject/predicate/object.
+        foreign_id = ingest_claim(
+            conn,
+            user_id="other",
+            subject="SecretProject",
+            predicate="budget",
+            object_="classified",
+        )
+        record_event(
+            conn,
+            user_id="u",
+            actor="system",
+            event_type="claim.state_changed",
+            target_kind="claim",
+            target_id=foreign_id,
+            payload={"from": "pending", "to": "confirmed"},
+        )
+        record_event(
+            conn,
+            user_id="other",
+            actor="system",
+            event_type="claim.state_changed",
+            target_kind="claim",
+            target_id=foreign_id,
+            payload={"from": "pending", "to": "confirmed"},
+        )
+
+        hits = by_decision(conn, user_id="u")
+        assert [h.title for h in hits] == [
+            f"claim.state_changed [claim:{foreign_id}]"
+        ]
+
+        owner_hits = by_decision(conn, user_id="other")
+        assert [h.title for h in owner_hits] == [
+            f"SecretProject budget classified — claim.state_changed [claim:{foreign_id}]"
+        ]
+
     def test_empty(self, conn: sqlite3.Connection) -> None:
         assert by_decision(conn, user_id="u") == []
 

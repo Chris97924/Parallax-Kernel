@@ -79,6 +79,31 @@ class TestTargetRefExists:
     def test_decision_missing(self, conn: sqlite3.Connection) -> None:
         assert target_ref_exists(conn, "decision", "dec-nope") is False
 
+    def test_user_id_scopes_lookup_to_owner(self, conn: sqlite3.Connection) -> None:
+        mid = ingest_memory(
+            conn, user_id="u", title="t", summary="s", vault_path="v.md"
+        )
+        cid = ingest_claim(
+            conn, user_id="u", subject="x", predicate="y", object_="z"
+        )
+        conn.execute(
+            """INSERT INTO decisions(decision_id, user_id, target_kind,
+                   target_id, action, actor, state, created_at)
+               VALUES ('dec-1', 'u', 'claim', ?, 'confirm', 'user', 'proposed', ?)""",
+            (cid, now_iso()),
+        )
+        conn.commit()
+        for kind, tid in (
+            ("memory", mid),
+            ("claim", cid),
+            ("source", "direct:u"),
+            ("decision", "dec-1"),
+        ):
+            assert target_ref_exists(conn, kind, tid, user_id="u") is True, kind
+            assert target_ref_exists(conn, kind, tid, user_id="other") is False, kind
+            # Omitting user_id keeps the unscoped existence check.
+            assert target_ref_exists(conn, kind, tid) is True, kind
+
     def test_unknown_kind_raises(self, conn: sqlite3.Connection) -> None:
         with pytest.raises(ValueError, match="unknown target_kind"):
             target_ref_exists(conn, "event", "e-1")

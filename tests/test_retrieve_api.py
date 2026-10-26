@@ -19,7 +19,7 @@ from parallax.retrieve import (
     by_timeline,
     recent_context,
 )
-from parallax.sqlite_store import connect
+from parallax.sqlite_store import Event, connect, insert_event, now_iso
 
 
 @pytest.fixture()
@@ -125,9 +125,10 @@ class TestByDecision:
     def test_enrichment_does_not_leak_other_users_claim(
         self, conn: sqlite3.Connection
     ) -> None:
-        # record_event's orphan check is existence-only, so user "u" can
-        # point an event at user "other"'s claim. The title enrichment must
-        # stay inside u's tenant and never surface other's subject/predicate/object.
+        # record_event now rejects cross-tenant targets, but rows written
+        # before that check can still point u's event at other's claim. The
+        # title enrichment must stay inside u's tenant and never surface
+        # other's subject/predicate/object.
         foreign_id = ingest_claim(
             conn,
             user_id="other",
@@ -135,14 +136,19 @@ class TestByDecision:
             predicate="budget",
             object_="classified",
         )
-        record_event(
+        insert_event(
             conn,
-            user_id="u",
-            actor="system",
-            event_type="claim.state_changed",
-            target_kind="claim",
-            target_id=foreign_id,
-            payload={"from": "pending", "to": "confirmed"},
+            Event(
+                event_id="01LEGACYCROSSTENANT0000000",
+                user_id="u",
+                actor="system",
+                event_type="claim.state_changed",
+                target_kind="claim",
+                target_id=foreign_id,
+                payload_json='{"from": "pending", "to": "confirmed"}',
+                approval_tier=None,
+                created_at=now_iso(),
+            ),
         )
         record_event(
             conn,

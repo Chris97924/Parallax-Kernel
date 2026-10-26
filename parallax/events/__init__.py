@@ -61,9 +61,10 @@ def record_event(
 
     When ``target_kind`` is one of :data:`VALID_TARGET_KINDS` and
     ``target_id`` is a non-empty string, the row referenced by
-    ``(target_kind, target_id)`` MUST exist or :class:`ValueError` is raised
-    (orphan rejection). System-level events with no target pass
-    ``target_kind=None`` and ``target_id=None``.
+    ``(target_kind, target_id)`` MUST exist and belong to ``user_id`` or
+    :class:`ValueError` is raised (orphan rejection; another user's row is
+    reported exactly like a missing one). System-level events with no target
+    pass ``target_kind=None`` and ``target_id=None``.
 
     The validator and the insert run on the same connection; callers MUST
     hold the surrounding transaction so the existence check and the insert
@@ -79,7 +80,7 @@ def record_event(
 
     if target_kind is not None and target_id is not None and target_id != "":
         if target_kind in VALID_TARGET_KINDS:
-            if not target_ref_exists(conn, target_kind, target_id):
+            if not target_ref_exists(conn, target_kind, target_id, user_id=user_id):
                 telemetry.emit_orphan_rejected(
                     _tlog,
                     user_id=user_id,

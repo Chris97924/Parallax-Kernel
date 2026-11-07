@@ -7,8 +7,9 @@ append-only event log, an explicit state machine for lifecycle transitions,
 and a deterministic search-index rebuild path.
 
 > The GitHub repo is named `parallax-kernel`. The Python package is imported
-> as `parallax`, so `pip install parallax-kernel` gives you
-> `from parallax import ...`.
+> as `parallax` (`from parallax import ...`). It is **not published on PyPI**:
+> the `parallax-kernel` name on PyPI belongs to an unrelated project, so
+> install from a clone (Quick Start below), not with `pip install parallax-kernel`.
 
 ## Quick Start
 
@@ -213,7 +214,7 @@ canonical store so divergence vs. the existing vault writer can be
 measured before any cut-over. Install with the extra:
 
 ```bash
-pip install 'parallax-kernel[extract]'
+pip install -e '.[extract]'   # from your clone
 ```
 
 Core install never imports `httpx` / `anthropic` — only the
